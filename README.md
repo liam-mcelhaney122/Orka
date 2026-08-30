@@ -1,43 +1,73 @@
 <p align="center">
-  <img src="logo.png" alt="Orka logo" width="120">
+  <img src="logo.png" alt="Orka logo" width="140">
 </p>
 
-# Orka
+<h1 align="center">Orka</h1>
+
+<p align="center">
+  <em>A fast, tabbed, multi-window file manager for macOS with first-class remote and git support.</em>
+</p>
+
+<p align="center">
+  <a href="https://github.com/liam-mcelhaney122/Orka/actions/workflows/ci.yml"><img src="https://github.com/liam-mcelhaney122/Orka/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <img src="https://img.shields.io/badge/macOS-26-blue" alt="macOS 26">
+  <img src="https://img.shields.io/badge/UI-SwiftUI-orange" alt="SwiftUI">
+  <img src="https://img.shields.io/badge/core-Rust-8b3103" alt="Rust core">
+  <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT license">
+</p>
+
+<p align="center">
+  <a href="https://github.com/liam-mcelhaney122/Orka/releases/latest"><strong>⬇ Download the latest release</strong></a>
+</p>
+
+---
 
 Orka is a File manager for MacOS that doesn't suck. It supports several different file locations (SFTP, SHH, S3, etc), has built in git support and branch viewing, and several other QoL features.
 
 ## Features
 
-- **Tabs and windows** — browser-style tabs with colors and session
+- 🗂 **Tabs and windows** — browser-style tabs with colors and session
   restore, multiple independent windows, and a "Move Tab to New Window"
   action. Files dragged onto a tab spring-load it.
-- **Two view modes** — a details list and an icon grid.
-- **Sidebar** — reorderable Favorites, mounted volumes with eject,
+- 👁 **Two view modes** — a details list and an icon grid.
+- 📌 **Sidebar** — reorderable Favorites, mounted volumes with eject,
   saved remote connections, lazy folder trees for Home and `/`, and the
   Trash.
-- **Remote locations** — SFTP, Dropbox, Google Drive, Azure Data Lake,
+- 🌐 **Remote locations** — SFTP, Dropbox, Google Drive, Azure Data Lake,
   and HTTP, behind one navigation model. Remote listings refresh after
   every job.
-- **File operations** — copy, move, duplicate, rename, new folder,
+- ⚙️ **File operations** — copy, move, duplicate, rename, new folder,
   compress (zip, tar, tar.gz) and extract, all running as cancelable
   background jobs with progress in the status bar.
-- **Trash** — move to Trash with undo, a Trash sidebar entry, and
+- 🗑 **Trash** — move to Trash with undo, a Trash sidebar entry, and
   Empty Trash. Remote deletes ask for confirmation instead, since
   servers have no trash.
-- **Undo/redo** — a journal in the Rust engine backs undo and redo for
+- ↩️ **Undo/redo** — a journal in the Rust engine backs undo and redo for
   file operations.
-- **Search** — type to filter the current folder live; press Return
+- 🔍 **Search** — type to filter the current folder live; press Return
   for a recursive search of the tree, with `*.ext` filtering.
-- **Folder sizes** — recursive totals in the Size column and the
+- 📊 **Folder sizes** — recursive totals in the Size column and the
   status bar, computed in the background and cached.
-- **Git awareness** — per-file git status in listings and a commit
+- 🌿 **Git awareness** — per-file git status in listings and a commit
   graph panel that can pop out into its own window.
-- **Quick Look** — press Space to preview, including remote files.
-- **Live updates** — local directories refresh through filesystem
+- ⚡️ **Quick Look** — press Space to preview, including remote files.
+- 🔄 **Live updates** — local directories refresh through filesystem
   events; no manual reloads.
-- **Quality of life** — breadcrumb path bar with direct path entry
+- ✨ **Quality of life** — breadcrumb path bar with direct path entry
   (⌘L), cut/copy/paste, drag and drop, hidden-file toggle, Get Info
   panel, and Open in Terminal.
+
+## Install
+
+1. Download and unzip the [latest release](https://github.com/liam-mcelhaney122/Orka/releases/latest), then move `Orka.app` to `/Applications`.
+2. The build is not notarized. On first launch, right-click the app and
+   choose **Open**, or clear the quarantine flag:
+   ```sh
+   xattr -dr com.apple.quarantine /Applications/Orka.app
+   ```
+3. Orka needs **Full Disk Access**. The app shows a gate screen on
+   launch that opens System Settings > Privacy & Security > Full Disk
+   Access for you; add Orka there and the gate closes on its own.
 
 ## Build Requirements
 
@@ -79,8 +109,6 @@ cd app && xcodegen
 The generated Swift bindings under `app/Generated/` are also not checked
 in. `scripts/build-rust.sh` (run automatically by the `just` recipes
 above) builds `liborka_ffi` and regenerates them from the same crate.
-
-## Full Disk Access
 
 ## License
 
