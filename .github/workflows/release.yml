@@ -1,0 +1,67 @@
+name: Release
+
+# A pushed v* tag builds the app and publishes a GitHub release with
+# the zipped Orka.app attached.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: macos-26
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Build Rust core and generate Swift bindings
+        run: ./scripts/build-rust.sh
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+        working-directory: app
+
+      - name: Run unit tests
+        run: |
+          xcodebuild test \
+            -project app/Orka.xcodeproj \
+            -scheme OrkaTests \
+            -destination 'platform=macOS'
+
+      - name: Build Orka app (Release)
+        run: |
+          xcodebuild \
+            -project app/Orka.xcodeproj \
+            -scheme Orka \
+            -configuration Release \
+            -derivedDataPath build/DerivedData \
+            build
+
+      - name: Zip the app
+        run: |
+          ditto -c -k --keepParent \
+            build/DerivedData/Build/Products/Release/Orka.app \
+            "Orka-${GITHUB_REF_NAME}.zip"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            "Orka-${GITHUB_REF_NAME}.zip" \
+            --title "Orka $GITHUB_REF_NAME" \
+            --generate-notes
