@@ -1,0 +1,28 @@
+name: Orka
+options:
+  deploymentTarget:
+    macOS: "26.0"
+targets:
+  Orka:
+    type: application
+    platform: macOS
+    sources:
+      - path: Orka
+        excludes:
+          - "orka-icon.svg"
+      - path: Generated
+        optional: true
+    info:
+      path: Orka/Info.plist
+      properties:
+        NSPrincipalClass: NSApplication
+        NSHumanReadableCopyright: ""
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.orka.app
+        SWIFT_VERSION: "5.9"
+        SWIFT_OBJC_BRIDGING_HEADER: Orka/Orka-Bridging-Header.h
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        LIBRARY_SEARCH_PATHS: "$(PROJECT_DIR)/../target/release"
+        OTHER_LDFLAGS: "-lorka_ffi"
+        CODE_SIGN_IDENTITY: "-"

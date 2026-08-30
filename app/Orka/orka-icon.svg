@@ -1,0 +1,141 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1254" height="1254" viewBox="0 0 1254 1254">
+  <defs>
+    <!-- Background plate: light falls from the top-left -->
+    <radialGradient id="plate" cx="0.25" cy="0.05" r="1.15">
+      <stop offset="0" stop-color="#363636"/>
+      <stop offset="0.45" stop-color="#1f1f1f"/>
+      <stop offset="1" stop-color="#0d0d0d"/>
+    </radialGradient>
+    <!-- Folder: bright top-left, darker bottom-right -->
+    <linearGradient id="folderBody" x1="0" y1="0" x2="0.75" y2="1">
+      <stop offset="0" stop-color="#ebebeb"/>
+      <stop offset="0.5" stop-color="#c5c5c5"/>
+      <stop offset="1" stop-color="#8f8f8f"/>
+    </linearGradient>
+    <linearGradient id="folderEdge" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#cfcfcf"/>
+      <stop offset="1" stop-color="#8f8f8f"/>
+    </linearGradient>
+    <linearGradient id="fin" x1="0" y1="0" x2="0.3" y2="1">
+      <stop offset="0" stop-color="#eeeeee"/>
+      <stop offset="1" stop-color="#d2d2d2"/>
+    </linearGradient>
+    <!-- Sheen: lighter wash above a diagonal boundary -->
+    <linearGradient id="sheen" x1="0.1" y1="0" x2="0.55" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.5"/>
+      <stop offset="0.5" stop-color="#ffffff" stop-opacity="0.12"/>
+      <stop offset="0.6" stop-color="#ffffff" stop-opacity="0"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+    <filter id="softShadow" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="24" stdDeviation="30" flood-color="#000000" flood-opacity="0.6"/>
+    </filter>
+    <filter id="finShadow" x="-40%" y="-40%" width="180%" height="180%">
+      <feDropShadow dx="14" dy="10" stdDeviation="14" flood-color="#000000" flood-opacity="0.45"/>
+    </filter>
+    <filter id="blurSmall"><feGaussianBlur stdDeviation="7"/></filter>
+    <filter id="blurBig"><feGaussianBlur stdDeviation="20"/></filter>
+    <clipPath id="finClip">
+      <path d="M 405 510 L 400 469
+        C 420 461 438 442 446 418
+        C 452 398 450 370 442 345
+        C 434 322 420 305 404 288
+        C 388 272 372 258 369 247
+        C 366 236 370 226 382 221
+        C 398 216 418 217 434 224
+        C 468 232 502 244 535 257
+        C 570 272 600 291 627 313
+        C 656 337 676 366 691 396
+        C 706 426 723 448 741 462
+        C 759 473 776 479 800 487
+        L 812 496 L 812 510 Z"/>
+    </clipPath>
+    <clipPath id="folderClip">
+      <path d="M 285 463
+        L 570 463
+        C 610 463 615 490 655 490
+        L 975 490
+        Q 1045 492 1052 570
+        C 1056 640 1048 850 1008 980
+        Q 995 1020 920 1024
+        L 330 1027
+        Q 258 1022 246 980
+        C 214 870 204 720 201 600
+        C 200 520 215 464 285 463
+        Z"/>
+    </clipPath>
+  </defs>
+
+  <!-- Background plate: full bleed. The OS applies the icon mask. -->
+  <rect width="1254" height="1254" fill="url(#plate)"/>
+
+  <!-- Fin (behind folder) -->
+  <g filter="url(#finShadow)">
+    <path d="M 405 510 L 400 469
+      C 420 461 438 442 446 418
+      C 452 398 450 370 442 345
+      C 434 322 420 305 404 288
+      C 388 272 372 258 369 247
+      C 366 236 370 226 382 221
+      C 398 216 418 217 434 224
+      C 468 232 502 244 535 257
+      C 570 272 600 291 627 313
+      C 656 337 676 366 691 396
+      C 706 426 723 448 741 462
+      C 759 473 776 479 800 487
+      L 812 496 L 812 510 Z" fill="url(#fin)"/>
+  </g>
+  <g clip-path="url(#finClip)">
+    <path d="M 500 380 C 540 430 590 460 650 478 L 810 492 L 810 520 L 490 520 Z" fill="#8a8a8a" opacity="0.2" filter="url(#blurBig)"/>
+    <path d="M 400 468 C 422 459 440 438 446 412 C 451 384 444 348 420 308" fill="none" stroke="#8f8f8f" stroke-width="14" opacity="0.18" filter="url(#blurBig)"/>
+    <path d="M 371 246 C 367 234 371 225 383 221 C 398 216 418 217 434 224 C 466 231 500 243 533 256" fill="none" stroke="#ffffff" stroke-width="6" opacity="0.6" filter="url(#blurSmall)"/>
+  </g>
+
+  <!-- Folder back panel (3D thickness) -->
+  <path d="M 282 456
+      L 572 456
+      C 612 456 617 483 657 483
+      L 977 483
+      Q 1050 485 1058 566
+      C 1062 640 1054 852 1014 984
+      Q 1000 1028 922 1032
+      L 328 1035
+      Q 252 1030 240 984
+      C 208 872 198 720 195 598
+      C 194 514 210 457 282 456
+      Z" fill="url(#folderEdge)" filter="url(#softShadow)"/>
+
+  <!-- Folder body -->
+  <path d="M 285 463
+      L 570 463
+      C 610 463 615 490 655 490
+      L 975 490
+      Q 1045 492 1052 570
+      C 1056 640 1048 850 1008 980
+      Q 995 1020 920 1024
+      L 330 1027
+      Q 258 1022 246 980
+      C 214 870 204 720 201 600
+      C 200 520 215 464 285 463
+      Z" fill="url(#folderBody)"/>
+
+  <!-- Sheen over folder -->
+  <g clip-path="url(#folderClip)">
+    <path d="M 195 900 C 420 820 700 700 1055 655 L 1055 455 L 195 455 Z" fill="url(#sheen)"/>
+    <rect x="200" y="458" width="860" height="9" fill="#ffffff" opacity="0.6" filter="url(#blurSmall)"/>
+  </g>
+
+  <!-- Subtle outline on folder -->
+  <path d="M 285 463
+      L 570 463
+      C 610 463 615 490 655 490
+      L 975 490
+      Q 1045 492 1052 570
+      C 1056 640 1048 850 1008 980
+      Q 995 1020 920 1024
+      L 330 1027
+      Q 258 1022 246 980
+      C 214 870 204 720 201 600
+      C 200 520 215 464 285 463
+      Z" fill="none" stroke="#8f8f8f" stroke-width="2" opacity="0.5"/>
+</svg>

@@ -1,0 +1,8 @@
+/target
+app/Orka.xcodeproj
+app/Generated/
+.DS_Store
+xcuserdata/
+build/
+/dist
+exec-*.png
