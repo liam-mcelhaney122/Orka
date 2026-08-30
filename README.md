@@ -91,3 +91,7 @@ build without the Rust dylib).
 - `main` is the primary branch.
 - `tab-dragging` carries an in-progress browser-style tab-drag feature.
   It is not yet merged.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
