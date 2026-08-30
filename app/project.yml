@@ -26,3 +26,23 @@ targets:
         LIBRARY_SEARCH_PATHS: "$(PROJECT_DIR)/../target/release"
         OTHER_LDFLAGS: "-lorka_ffi"
         CODE_SIGN_IDENTITY: "-"
+  OrkaTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: Orka/Model/OrkaPath.swift
+      - path: OrkaTests
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.orka.tests
+        SWIFT_VERSION: "5.9"
+        CODE_SIGN_IDENTITY: "-"
+        GENERATE_INFOPLIST_FILE: YES
+schemes:
+  OrkaTests:
+    build:
+      targets:
+        OrkaTests: all
+    test:
+      targets:
+        - OrkaTests

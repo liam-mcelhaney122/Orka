@@ -40,6 +40,12 @@ run: dist
     -killall Orka 2>/dev/null
     open "{{dist_app}}"
 
+# Run the Rust and Swift test suites.
+test:
+    {{cargo}} test --workspace
+    xcodebuild test -project app/Orka.xcodeproj -scheme OrkaTests \
+        -destination "platform=macOS"
+
 # Remove build products. Keeps dist/.
 clean:
     rm -rf "{{derived_data}}"
