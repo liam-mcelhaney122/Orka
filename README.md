@@ -82,41 +82,6 @@ above) builds `liborka_ffi` and regenerates them from the same crate.
 
 ## Full Disk Access
 
-Orka reads the Trash on launch to probe for Full Disk Access. Until macOS
-grants it, the app shows a gate screen instead of the file browser, with
-a button that opens System Settings > Privacy & Security > Full Disk
-Access. Add Orka there and turn it on; the gate screen closes on its own
-once access is granted.
-
-## Project layout
-
-```
-app/          SwiftUI app. app/project.yml is the XcodeGen source of
-              truth; app/Orka.xcodeproj is generated from it.
-crates/       Rust workspace.
-  orka-core/  Filesystem model, operations engine, remote backends,
-              search, git integration. Pure Rust, no UI.
-  orka-ffi/   UniFFI crate that exposes orka-core to Swift.
-scripts/      Build helpers (scripts/build-rust.sh).
-justfile      Build, run, and test recipes.
-```
-
-## Tests
-
-```sh
-just test
-```
-
-runs the Rust workspace tests (`cargo test --workspace`) and the Swift
-unit tests (`OrkaTests`, which cover pure logic such as `OrkaPath` and
-build without the Rust dylib).
-
-## Branches
-
-- `main` is the primary branch.
-- `tab-dragging` carries an in-progress browser-style tab-drag feature.
-  It is not yet merged.
-
 ## License
 
 MIT. See [LICENSE](LICENSE).
