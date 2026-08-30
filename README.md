@@ -4,17 +4,10 @@
 
 # Orka
 
-Orka is a Finder-style file manager for macOS. It has Chrome-style tabs,
-multiple windows, remote connections over SFTP, S3, FTP, SMB, NFS, ADLS
-Gen2, Google Drive, Dropbox, and RSync over SSH, a Trash, and a
-GitKraken-style git graph panel with per-file status badges.
+Orka is a File manager for MacOS that doesn't suck. It supports several different file locations (SFTP, SHH, S3, etc), has built in git support and branch viewing, and several other QoL features.
 
-The app is a SwiftUI shell over a Rust core. The Rust core owns the
-filesystem model, the operations engine (copy, move, trash, archive,
-undo/redo), and the remote backends. The Swift app talks to it through a
-UniFFI-generated bridge.
 
-## Requirements
+## Build Requirements
 
 - macOS 26
 - Xcode (a full install, not only the Command Line Tools)
