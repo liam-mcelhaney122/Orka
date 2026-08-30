@@ -1,0 +1,106 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # The Rust workspace is pure Rust (orka-core, orka-ffi). Its tests only
+  # touch the filesystem through tempdir and need no macOS frameworks, so a
+  # cheap Linux runner is enough — no reason to spend macOS runner minutes here.
+  rust:
+    name: Rust workspace
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build workspace
+        run: cargo build --workspace
+
+      - name: Test workspace
+        run: cargo test --workspace
+
+  # Builds and tests the macOS SwiftUI app.
+  #
+  # Runner/Xcode choice (researched 2026-08-30):
+  # actions/runner-images GA'd the macos-26 image (see
+  # https://github.blog/changelog/2026-02-26-macos-26-is-now-generally-available-for-github-hosted-runners/).
+  # `macos-latest` itself started pointing at macos-26 as of the June-July
+  # 2026 rollout (see
+  # https://github.com/actions/runner-images/issues/14167), but we pin the
+  # explicit `macos-26` label (arm64) instead of `-latest` so this workflow
+  # does not silently change runners/SDKs on us later.
+  #
+  # The macos-26-arm64 image ships seven Xcode versions, 26.0.1 through
+  # 26.6, all of which include a "macOS 26" SDK (macosx26.x) — even the
+  # oldest, Xcode 26.0.1, ships the macosx26.0 SDK
+  # (https://github.com/actions/runner-images/blob/main/images/macos/macos-26-arm64-Readme.md).
+  # Orka's app/project.yml sets deploymentTarget.macOS to "26.0", and an SDK
+  # only needs to be >= the deployment target, so every Xcode on this image
+  # can build it. We pin the image's default, Xcode 26.6 (macOS 26.5 SDK),
+  # via its versioned path rather than the unversioned /Applications/Xcode.app
+  # symlink, so a future image update that changes the default cannot change
+  # what this workflow builds against without us noticing in the diff.
+  app:
+    name: macOS app
+    runs-on: macos-26
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Verify selected Xcode version
+        run: xcodebuild -version
+
+      - name: Build Rust core and generate Swift bindings
+        run: ./scripts/build-rust.sh
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+        working-directory: app
+
+      # Hard gate: OrkaTests is a freestanding XCTest bundle (no host app,
+      # no FFI dependency) that only compiles app/Orka/Model/OrkaPath.swift
+      # plus app/OrkaTests/*. It does not depend on the Rust dylib or on
+      # app/Generated/, so this must always pass.
+      - name: Run OrkaTests unit tests
+        run: |
+          xcodebuild test \
+            -project app/Orka.xcodeproj \
+            -scheme OrkaTests \
+            -destination 'platform=macOS'
+
+      - name: Build Orka app (Release)
+        run: |
+          xcodebuild \
+            -project app/Orka.xcodeproj \
+            -scheme Orka \
+            -configuration Release \
+            -derivedDataPath build/DerivedData \
+            build
+
+      - name: Upload Orka.app artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Orka.app
+          path: build/DerivedData/Build/Products/Release/Orka.app
+          if-no-files-found: error
