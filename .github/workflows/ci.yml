@@ -6,12 +6,12 @@ on:
   pull_request:
 
 jobs:
-  # The Rust workspace is pure Rust (orka-core, orka-ffi). Its tests only
-  # touch the filesystem through tempdir and need no macOS frameworks, so a
-  # cheap Linux runner is enough — no reason to spend macOS runner minutes here.
+  # The Rust workspace must build on macOS: orka-core reads macOS-only
+  # statfs fields (f_mntfromname) for volume information, so a Linux
+  # runner cannot compile it.
   rust:
     name: Rust workspace
-    runs-on: ubuntu-latest
+    runs-on: macos-26
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
