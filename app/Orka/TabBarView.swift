@@ -4,8 +4,9 @@ import UniformTypeIdentifiers
 
 /// Safari-style tab strip in the window title bar band. Inactive tabs
 /// are plain labels with thin separators; the active tab floats as a
-/// Liquid Glass capsule on the darker band. The tab context menu can
-/// move a tab into its own window.
+/// Liquid Glass capsule on the darker band. Tabs drag like a browser's:
+/// within the strip to reorder, onto another window's strip to move,
+/// and anywhere else to tear off into a new window.
 struct TabBarView: View {
     @Bindable var model: AppModel
     @Bindable var window: WindowState
@@ -16,6 +17,9 @@ struct TabBarView: View {
     /// Drop-side twin of `NSPasteboard.PasteboardType.orkaRemotePath`.
     static let remotePathUTType = UTType(
         exportedAs: "com.orka.remote-path")
+
+    /// Drop-side twin of `NSPasteboard.PasteboardType.orkaTab`.
+    static let tabUTType = UTType(exportedAs: "com.orka.tab")
 
     private let bandHeight: CGFloat = 38
     private let tabHeight: CGFloat = 28
@@ -75,6 +79,11 @@ struct TabBarView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .contentShape(Rectangle())
                     .windowDragArea()
+                    // A tab dropped on the empty band lands at the end
+                    // of this window's strip.
+                    .onDrop(
+                        of: [Self.tabUTType],
+                        delegate: TabStripEndDropDelegate(window: window))
             }
         }
         .frame(height: bandHeight)
@@ -119,7 +128,9 @@ struct TabBarView: View {
             window.panes.count > 1
             && (isActive || hoveredTabId == pane.id)
         // A Button, not a tap gesture: the title bar drag region
-        // swallows plain tap gestures but yields to buttons.
+        // swallows plain tap gestures but yields to buttons. The
+        // TabDragHandle overlay handles the actual click and drag;
+        // the Button remains for styling and accessibility.
         return Button {
             window.selectTab(index)
         } label: {
@@ -176,6 +187,14 @@ struct TabBarView: View {
         .buttonStyle(.plain)
         // The tab title truncates; the tooltip shows the full path.
         .help(pane.directory.path)
+        // The drag layer sits over the whole tab: a click selects, a
+        // drag moves the tab or tears it off. It comes before the
+        // close overlay so the close button stays clickable on top.
+        .overlay {
+            TabDragHandle(paneID: pane.id) {
+                window.selectTab(index)
+            }
+        }
         // The close control overlays the tab as a sibling.
         // A nested button inside the tab label would not get clicks.
         .overlay(alignment: .trailing) {
@@ -237,17 +256,55 @@ struct TabBarView: View {
             }
         }
         .onDrop(
-            of: [.fileURL, Self.remotePathUTType],
+            of: [.fileURL, Self.remotePathUTType, Self.tabUTType],
             delegate: TabDropDelegate(
                 index: index, pane: pane, model: model, window: window,
                 dropTarget: $dropTargetTabId))
     }
 }
 
-/// Files dragged over a tab spring-load it, like a browser: a short
-/// hover switches to the tab, and a drop lands in the tab's directory.
+/// Reads a dragged tab's pane UUID from the AppKit drag pasteboard.
+/// Synchronous, unlike DropInfo's async item loading, so dropUpdated
+/// can decide the operation immediately.
+@MainActor
+private func draggedTabID() -> UUID? {
+    let items = NSPasteboard(name: .drag).pasteboardItems ?? []
+    for item in items {
+        if let raw = item.string(forType: .orkaTab),
+            let id = UUID(uuidString: raw)
+        {
+            return id
+        }
+    }
+    return nil
+}
+
+/// Drop target for the empty band after the tabs: a dragged tab lands
+/// at the end of this window's strip.
+private struct TabStripEndDropDelegate: DropDelegate {
+    let window: WindowState
+
+    func validateDrop(info: DropInfo) -> Bool {
+        info.hasItemsConforming(to: [TabBarView.tabUTType])
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        DropProposal(operation: .move)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        guard let id = draggedTabID() else { return false }
+        AppModel.shared.moveTab(
+            paneID: id, to: window, at: window.panes.count)
+        return true
+    }
+}
+
+/// Handles drops on one tab: files spring-load and transfer into the
+/// tab's directory, like a browser; a dragged tab inserts at this
+/// tab's position, like a browser reordering or adopting a tab.
 private struct TabDropDelegate: DropDelegate {
-    /// Hover time before the drag switches tabs. Long enough that a
+    /// Hover time before a file drag switches tabs. Long enough that a
     /// drag passing across the strip does not flip through every tab.
     static let springLoadDelay: TimeInterval = 0.35
 
@@ -259,11 +316,14 @@ private struct TabDropDelegate: DropDelegate {
 
     func validateDrop(info: DropInfo) -> Bool {
         info.hasItemsConforming(
-            to: [.fileURL, TabBarView.remotePathUTType])
+            to: [.fileURL, TabBarView.remotePathUTType, TabBarView.tabUTType])
     }
 
     func dropEntered(info: DropInfo) {
         dropTarget = pane.id
+        // A dragged tab must not spring-load: switching tabs mid-drag
+        // reads as flicker, and the drop itself sets the active tab.
+        guard draggedTabID() == nil else { return }
         let id = pane.id
         DispatchQueue.main.asyncAfter(
             deadline: .now() + Self.springLoadDelay
@@ -281,6 +341,11 @@ private struct TabDropDelegate: DropDelegate {
     }
 
     func dropUpdated(info: DropInfo) -> DropProposal? {
+        if let dragged = draggedTabID() {
+            // Dropping a tab onto itself is a no-op, not a move.
+            return DropProposal(
+                operation: dragged == pane.id ? .cancel : .move)
+        }
         let destDir = pane.directory.path
         if !remoteSources().isEmpty {
             // Same rule as the file list: remote rows land on a local
@@ -299,6 +364,11 @@ private struct TabDropDelegate: DropDelegate {
 
     func performDrop(info: DropInfo) -> Bool {
         dropTarget = nil
+        if let dragged = draggedTabID() {
+            guard dragged != pane.id else { return false }
+            AppModel.shared.moveTab(paneID: dragged, to: window, at: index)
+            return true
+        }
         let destDir = pane.directory.path
         let remote = remoteSources()
         if !remote.isEmpty {
