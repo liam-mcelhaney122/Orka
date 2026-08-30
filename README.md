@@ -6,6 +6,38 @@
 
 Orka is a File manager for MacOS that doesn't suck. It supports several different file locations (SFTP, SHH, S3, etc), has built in git support and branch viewing, and several other QoL features.
 
+## Features
+
+- **Tabs and windows** — browser-style tabs with colors and session
+  restore, multiple independent windows, and a "Move Tab to New Window"
+  action. Files dragged onto a tab spring-load it.
+- **Two view modes** — a details list and an icon grid.
+- **Sidebar** — reorderable Favorites, mounted volumes with eject,
+  saved remote connections, lazy folder trees for Home and `/`, and the
+  Trash.
+- **Remote locations** — SFTP, Dropbox, Google Drive, Azure Data Lake,
+  and HTTP, behind one navigation model. Remote listings refresh after
+  every job.
+- **File operations** — copy, move, duplicate, rename, new folder,
+  compress (zip, tar, tar.gz) and extract, all running as cancelable
+  background jobs with progress in the status bar.
+- **Trash** — move to Trash with undo, a Trash sidebar entry, and
+  Empty Trash. Remote deletes ask for confirmation instead, since
+  servers have no trash.
+- **Undo/redo** — a journal in the Rust engine backs undo and redo for
+  file operations.
+- **Search** — type to filter the current folder live; press Return
+  for a recursive search of the tree, with `*.ext` filtering.
+- **Folder sizes** — recursive totals in the Size column and the
+  status bar, computed in the background and cached.
+- **Git awareness** — per-file git status in listings and a commit
+  graph panel that can pop out into its own window.
+- **Quick Look** — press Space to preview, including remote files.
+- **Live updates** — local directories refresh through filesystem
+  events; no manual reloads.
+- **Quality of life** — breadcrumb path bar with direct path entry
+  (⌘L), cut/copy/paste, drag and drop, hidden-file toggle, Get Info
+  panel, and Open in Terminal.
 
 ## Build Requirements
 
