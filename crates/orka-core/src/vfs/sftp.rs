@@ -809,7 +809,14 @@ mod tests {
             .connect(&cfg, Arc::new(NoSecrets))
             .err()
             .expect("must fail");
-        assert!(err.contains("cannot connect"), "got: {err}");
+        // On a busy machine, another process can claim the freed port
+        // before the connect. The connect then reaches a non-SSH peer
+        // and fails at the handshake instead of the TCP connect. Both
+        // shapes satisfy the property under test: a clean, fast error.
+        assert!(
+            err.contains("cannot connect") || err.contains("handshake"),
+            "got: {err}"
+        );
         assert!(start.elapsed() < Duration::from_secs(20));
     }
 
