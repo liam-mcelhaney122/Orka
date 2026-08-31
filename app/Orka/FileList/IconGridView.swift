@@ -1,5 +1,11 @@
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
+
+extension UTType {
+    static let orkaSelectedPaths = UTType(
+        exportedAs: "com.orka.selected-paths")
+}
 
 /// Icon grid view. The details view stays the primary surface; the grid
 /// covers the Finder/Explorer icon-view parity case.
@@ -29,35 +35,41 @@ struct IconGridView: View {
     }
 
     var body: some View {
-        ScrollView {
-            LazyVGrid(
-                columns: [GridItem(.adaptive(minimum: 100), spacing: 4)],
-                spacing: 10
-            ) {
-                ForEach(entries, id: \.path) { entry in
-                    // Search results span many directories; a name-keyed
-                    // git-state lookup would mislabel entries from other
-                    // folders, so skip it while results are showing.
-                    let gitState = directory.searchResults == nil
-                        ? directory.gitStates[entry.name] : nil
-                    IconCell(
-                        entry: entry,
-                        selected: directory.selection.contains(entry.path),
-                        cut: model.cutPaths.contains(entry.path),
-                        gitState: gitState)
-                        .gesture(TapGesture(count: 2).onEnded {
-                            model.open(entry)
-                        })
-                        .simultaneousGesture(TapGesture().onEnded {
-                            select(entry)
-                        })
-                        .contextMenu { itemMenu(for: entry) }
+        ZStack {
+            ScrollView {
+                LazyVGrid(
+                    columns: [GridItem(.adaptive(minimum: 100), spacing: 4)],
+                    spacing: 10
+                ) {
+                    ForEach(entries, id: \.path) { entry in
+                        let gitState = directory.searchResults == nil
+                            ? directory.gitStates[entry.name] : nil
+                        IconCell(
+                            entry: entry,
+                            selected: directory.selection.contains(entry.path),
+                            cut: model.cutPaths.contains(entry.path),
+                            gitState: gitState)
+                            .gesture(TapGesture(count: 2).onEnded {
+                                model.open(entry)
+                            })
+                            .simultaneousGesture(TapGesture().onEnded {
+                                select(entry)
+                            })
+                            .onDrag {
+                                makeDragProvider(for: entry)
+                            }
+                            .contextMenu { itemMenu(for: entry) }
+                    }
                 }
+                .padding(12)
+                .frame(maxWidth: .infinity)
             }
-            .padding(12)
-            .frame(maxWidth: .infinity)
         }
-        // No opaque fill: the pane's glass surface shows through.
+        .contentShape(Rectangle())
+        .onDrop(
+            of: [TabBarView.remotePathUTType, .orkaSelectedPaths],
+            delegate: IconGridDropDelegate(
+                model: model, window: window))
         .contextMenu { backgroundMenu }
     }
 
@@ -110,6 +122,18 @@ struct IconGridView: View {
             selectForMenu(entry)
             model.copyPaths(
                 Array(directory.selection), relative: true, in: window)
+        }
+        Divider()
+        Button("Download to Downloads") {
+            selectForMenu(entry)
+            let downloads = FileManager.default.urls(
+                for: .downloadsDirectory, in: .userDomainMask).first?.path
+                ?? NSHomeDirectory()
+            model.downloadItems(Array(directory.selection), to: downloads)
+        }
+        Button("Download…") {
+            selectForMenu(entry)
+            presentDownloadPanel(for: Array(directory.selection))
         }
         if model.canPaste {
             Button("Paste") { model.paste(in: window) }
@@ -186,6 +210,13 @@ struct IconGridView: View {
             model.copyPaths(
                 Array(directory.selection), relative: true, in: window)
         }
+        if !model.connectionStore.connections.isEmpty {
+            Button("Upload to…") {
+                selectForMenu(entry)
+                window.uploadPickerTarget = UploadTarget(
+                    sources: Array(directory.selection))
+            }
+        }
         if model.canPaste {
             Button("Paste") { model.paste(in: window) }
         }
@@ -233,11 +264,103 @@ struct IconGridView: View {
         }
     }
 
+    /// Downloads a remote selection to a folder the user chooses. Anchors
+    /// as a sheet on the key window when one exists, else runs standalone.
+    private func presentDownloadPanel(for paths: [String]) {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.prompt = "Download"
+        if let keyWindow = NSApp.keyWindow {
+            panel.beginSheetModal(for: keyWindow) { response in
+                guard response == .OK, let url = panel.url else { return }
+                model.downloadItems(paths, to: url.path)
+            }
+        } else {
+            panel.begin { response in
+                guard response == .OK, let url = panel.url else { return }
+                model.downloadItems(paths, to: url.path)
+            }
+        }
+    }
+
     /// A right-click on an unselected item targets that item, like the
     /// details view.
     private func selectForMenu(_ entry: FsEntry) {
         if !directory.selection.contains(entry.path) {
             directory.selection = [entry.path]
+        }
+    }
+
+    /// Builds an NSItemProvider for a drag. When the entry is part of a
+    /// multi-selection, drags all selected items. Local files carry a
+    /// file URL for Finder; a remote set carries a file representation
+    /// that downloads on drop; every set carries the selected-paths type
+    /// so another Orka window can pick up a multi-item transfer.
+    private func makeDragProvider(for entry: FsEntry) -> NSItemProvider {
+        let dragging = entries.filter {
+            directory.selection.contains($0.path)
+        }
+        let paths: [String]
+        if dragging.isEmpty || !dragging.contains(where: { $0.path == entry.path }) {
+            paths = [entry.path]
+        } else {
+            paths = dragging.map(\.path)
+        }
+        let provider = NSItemProvider()
+        let firstLocal = paths.first(where: { OrkaPath.isLocal($0) })
+        if let localPath = firstLocal {
+            provider.suggestedName = (localPath as NSString).lastPathComponent
+            provider.registerObject(
+                NSURL(fileURLWithPath: localPath), visibility: .all)
+        } else if let remotePath = paths.first {
+            registerRemoteFileRepresentation(
+                for: remotePath, on: provider)
+        }
+        provider.registerDataRepresentation(
+            forTypeIdentifier: UTType.orkaSelectedPaths.identifier,
+            visibility: .ownProcess
+        ) { completion in
+            let data = (try? JSONEncoder().encode(paths)) ?? Data()
+            completion(data, nil)
+            return nil
+        }
+        return provider
+    }
+
+    /// Lets a remote grid item land in Finder: the load handler
+    /// downloads the file into a staging directory and hands the staged
+    /// URL over. The receiver copies from that URL, so the staging
+    /// directory cannot be removed here; the launch sweep collects it.
+    private func registerRemoteFileRepresentation(
+        for remotePath: String, on provider: NSItemProvider
+    ) {
+        let name = (remotePath as NSString).lastPathComponent
+        provider.suggestedName = name
+        let ext = (name as NSString).pathExtension
+        let fileType = ext.isEmpty
+            ? UTType.data
+            : (UTType(filenameExtension: ext) ?? .data)
+        let model = self.model
+        provider.registerFileRepresentation(
+            forTypeIdentifier: fileType.identifier,
+            fileOptions: [],
+            visibility: .all
+        ) { completion in
+            Task { @MainActor in
+                RemotePromiseStager.download(
+                    remotePath: remotePath, model: model
+                ) { result in
+                    switch result {
+                    case .success(let staged):
+                        completion(staged, false, nil)
+                    case .failure(let error):
+                        completion(nil, false, error)
+                    }
+                }
+            }
+            return nil
         }
     }
 }
@@ -296,6 +419,179 @@ private struct IconCell: View {
         case .untracked: return Color(nsColor: .tertiaryLabelColor)
         case .conflicted: return Color(nsColor: .systemRed)
         case .ignored, nil: return nil
+        }
+    }
+}
+
+// MARK: - Drop delegate
+
+/// Handles file drops onto the icon grid, from Finder and from other
+/// Orka views. The ZStack makes the full visible pane a drop target.
+private struct IconGridDropDelegate: DropDelegate {
+    let model: AppModel
+    let window: WindowState
+
+    private var destDir: String { window.activePane.directory.path }
+
+    func validateDrop(info: DropInfo) -> Bool {
+        return info.hasItemsConforming(
+            to: [.fileURL, TabBarView.remotePathUTType,
+                 .orkaSelectedPaths])
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        let providers = DropPathLoader.providers(from: info)
+        guard !providers.isEmpty else {
+            return DropProposal(operation: .cancel)
+        }
+        return DropProposal(operation: DropTransferPolicy.proposedOperation(
+            providers: providers, destDir: destDir))
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        let providers = DropPathLoader.providers(from: info)
+        guard !providers.isEmpty else { return false }
+        let destination = destDir
+        let forceCopy = NSEvent.modifierFlags.contains(.option)
+        DropPathLoader.load(providers) { result in
+            switch result {
+            case .success(let loaded):
+                let sources = DropTransferPolicy.transferSources(
+                    loaded, destDir: destination)
+                guard !sources.isEmpty else { return }
+                guard OrkaPath.isLocal(destination)
+                    || sources.allSatisfy(OrkaPath.isLocal)
+                else { return }
+                model.transfer(
+                    sources: sources,
+                    to: destination,
+                    move: DropTransferPolicy.shouldMove(
+                        sources: sources, destDir: destination,
+                        forceCopy: forceCopy),
+                    in: window)
+            case .failure(let error):
+                model.lastJobErrors = [JobItemError(
+                    path: destination,
+                    message: error.localizedDescription)]
+            }
+        }
+        return true
+    }
+}
+
+// MARK: - SwiftUI drop loading
+
+/// Loads paths through the item providers supplied by SwiftUI. A provider
+/// can vend its data later, so the AppKit drag pasteboard is not sufficient.
+enum DropPathLoader {
+    private enum Payload {
+        case selectedPaths
+        case remotePath
+        case fileURL
+
+        var typeIdentifier: String {
+            switch self {
+            case .selectedPaths: return UTType.orkaSelectedPaths.identifier
+            case .remotePath: return TabBarView.remotePathUTType.identifier
+            case .fileURL: return UTType.fileURL.identifier
+            }
+        }
+    }
+
+    struct LoadError: LocalizedError {
+        var errorDescription: String? {
+            "Could not read all items from the drop."
+        }
+    }
+
+    static func providers(from info: DropInfo) -> [NSItemProvider] {
+        info.itemProviders(for: [
+            .orkaSelectedPaths,
+            TabBarView.remotePathUTType,
+            .fileURL,
+        ])
+    }
+
+    @MainActor
+    static func load(
+        _ providers: [NSItemProvider],
+        completion: @escaping @MainActor (Result<[String], Error>) -> Void
+    ) {
+        let payload: Payload
+        if providers.contains(where: {
+            $0.hasItemConformingToTypeIdentifier(
+                Payload.selectedPaths.typeIdentifier)
+        }) {
+            payload = .selectedPaths
+        } else if providers.contains(where: {
+            $0.hasItemConformingToTypeIdentifier(
+                Payload.remotePath.typeIdentifier)
+        }) {
+            payload = .remotePath
+        } else {
+            payload = .fileURL
+        }
+
+        let matching = providers.filter {
+            $0.hasItemConformingToTypeIdentifier(payload.typeIdentifier)
+        }
+        let group = DispatchGroup()
+        let lock = NSLock()
+        var loaded = Array(repeating: [String](), count: matching.count)
+        var failed = false
+
+        for (index, provider) in matching.enumerated() {
+            group.enter()
+            switch payload {
+            case .fileURL:
+                provider.loadObject(ofClass: NSURL.self) { object, _ in
+                    lock.lock()
+                    if let path = (object as? NSURL)?.path {
+                        loaded[index] = [path]
+                    } else {
+                        failed = true
+                    }
+                    lock.unlock()
+                    group.leave()
+                }
+            case .selectedPaths, .remotePath:
+                provider.loadDataRepresentation(
+                    forTypeIdentifier: payload.typeIdentifier
+                ) { data, _ in
+                    lock.lock()
+                    if let data {
+                        switch payload {
+                        case .selectedPaths:
+                            if let paths = try? JSONDecoder().decode(
+                                [String].self, from: data) {
+                                loaded[index] = paths
+                            } else {
+                                failed = true
+                            }
+                        case .remotePath:
+                            if let path = String(data: data, encoding: .utf8) {
+                                loaded[index] = [path]
+                            } else {
+                                failed = true
+                            }
+                        case .fileURL:
+                            break
+                        }
+                    } else {
+                        failed = true
+                    }
+                    lock.unlock()
+                    group.leave()
+                }
+            }
+        }
+
+        group.notify(queue: .main) {
+            if failed {
+                completion(.failure(LoadError()))
+            } else {
+                completion(.success(loaded.flatMap { $0 }))
+            }
         }
     }
 }

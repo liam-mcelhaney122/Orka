@@ -148,7 +148,7 @@ final class DirectoryModel {
         gitStamp += 1
     }
 
-    private static func describe(_ error: Error) -> String {
+    static func describe(_ error: Error) -> String {
         if let e = error as? OrkaError {
             switch e {
             case .NotADirectory(let path): return "Not a folder: \(path)"

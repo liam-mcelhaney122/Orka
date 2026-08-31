@@ -4,6 +4,7 @@ struct StatusBarView: View {
     @Bindable var model: AppModel
     var window: WindowState
     @State private var freeSpace: String = ""
+    @Environment(\.openWindow) private var openWindow
 
     private var directory: DirectoryModel { window.activePane.directory }
 
@@ -11,7 +12,13 @@ struct StatusBarView: View {
         HStack(spacing: 12) {
             leftText
             Spacer()
-            if let job = model.activeJobs.values.first {
+            if model.transfers.activeCount > 0 {
+                transfersSummary
+            } else if let job = model.activeJobs.first(where: {
+                model.transfers.record(for: $0.key) == nil
+            })?.value {
+                // Archive, trash, and Quick Look jobs never register with
+                // the transfer manager, so they keep this strip.
                 jobView(job)
             } else if OrkaPath.isLocal(directory.path) {
                 if !freeSpace.isEmpty || paneFolderSize != nil {
@@ -106,6 +113,33 @@ struct StatusBarView: View {
         } else {
             Text("\(directory.selection.count) of \(directory.entries.count) selected\(selectionSize)")
         }
+    }
+
+    /// Aggregate summary for every upload, download, copy, and move the
+    /// transfer manager tracks. Opens the Transfers window on click.
+    private var transfersSummary: some View {
+        Button {
+            openWindow(id: TransfersPanel.windowID)
+        } label: {
+            HStack(spacing: 6) {
+                let count = model.transfers.activeCount
+                Text(count == 1 ? "1 transfer" : "\(count) transfers")
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                if let fraction = model.transfers.aggregateFraction {
+                    ProgressView(value: fraction)
+                        .frame(width: 120)
+                } else {
+                    // Linear style; the default circular spinner clips
+                    // inside the 24 pt status bar.
+                    ProgressView()
+                        .progressViewStyle(.linear)
+                        .frame(width: 120)
+                }
+            }
+        }
+        .buttonStyle(.borderless)
+        .help("Show Transfers")
     }
 
     private func jobView(_ job: JobProgress) -> some View {

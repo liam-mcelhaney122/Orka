@@ -237,7 +237,7 @@ struct TabBarView: View {
             }
         }
         .onDrop(
-            of: [.fileURL, Self.remotePathUTType],
+            of: [.fileURL, Self.remotePathUTType, .orkaSelectedPaths],
             delegate: TabDropDelegate(
                 index: index, pane: pane, model: model, window: window,
                 dropTarget: $dropTargetTabId))
@@ -259,7 +259,7 @@ private struct TabDropDelegate: DropDelegate {
 
     func validateDrop(info: DropInfo) -> Bool {
         info.hasItemsConforming(
-            to: [.fileURL, TabBarView.remotePathUTType])
+            to: [.fileURL, TabBarView.remotePathUTType, .orkaSelectedPaths])
     }
 
     func dropEntered(info: DropInfo) {
@@ -281,89 +281,45 @@ private struct TabDropDelegate: DropDelegate {
     }
 
     func dropUpdated(info: DropInfo) -> DropProposal? {
-        let destDir = pane.directory.path
-        if !remoteSources().isEmpty {
-            // Same rule as the file list: remote rows land on a local
-            // destination only, and always as a copy.
-            return DropProposal(
-                operation: OrkaPath.isLocal(destDir) ? .copy : .cancel)
-        }
-        let sources = transferSources(localSources(), destDir: destDir)
-        guard !sources.isEmpty else {
+        let providers = DropPathLoader.providers(from: info)
+        guard !providers.isEmpty else {
             return DropProposal(operation: .cancel)
         }
-        return DropProposal(
-            operation: shouldMove(sources, destDir: destDir)
-                ? .move : .copy)
+        return DropProposal(operation: DropTransferPolicy.proposedOperation(
+            providers: providers, destDir: pane.directory.path))
     }
 
     func performDrop(info: DropInfo) -> Bool {
         dropTarget = nil
-        let destDir = pane.directory.path
-        let remote = remoteSources()
-        if !remote.isEmpty {
-            guard OrkaPath.isLocal(destDir) else { return false }
-            model.transfer(sources: remote, to: destDir, move: false)
-            window.selectTab(index)
-            return true
+        let providers = DropPathLoader.providers(from: info)
+        guard !providers.isEmpty else { return false }
+        let destination = pane.directory.path
+        let forceCopy = NSEvent.modifierFlags.contains(.option)
+        DropPathLoader.load(providers) { result in
+            switch result {
+            case .success(let loaded):
+                let sources = DropTransferPolicy.transferSources(
+                    loaded, destDir: destination)
+                guard !sources.isEmpty else { return }
+                guard OrkaPath.isLocal(destination)
+                    || sources.allSatisfy(OrkaPath.isLocal)
+                else { return }
+                model.transfer(
+                    sources: sources,
+                    to: destination,
+                    move: DropTransferPolicy.shouldMove(
+                        sources: sources,
+                        destDir: destination,
+                        forceCopy: forceCopy),
+                    in: window)
+                window.selectTab(index)
+            case .failure(let error):
+                model.lastJobErrors = [JobItemError(
+                    path: destination,
+                    message: error.localizedDescription)]
+            }
         }
-        let sources = transferSources(localSources(), destDir: destDir)
-        guard !sources.isEmpty else { return false }
-        model.transfer(
-            sources: sources, to: destDir,
-            move: shouldMove(sources, destDir: destDir))
-        window.selectTab(index)
         return true
     }
 
-    // MARK: Drag pasteboard
-
-    // SwiftUI's DropInfo hands out item data asynchronously. The AppKit
-    // drag pasteboard carries the same content synchronously, which
-    // keeps the move-or-copy decision in dropUpdated immediate.
-    private func localSources() -> [String] {
-        let urls = NSPasteboard(name: .drag).readObjects(
-            forClasses: [NSURL.self],
-            options: [.urlReadingFileURLsOnly: true]) as? [URL]
-        return urls?.map(\.path) ?? []
-    }
-
-    private func remoteSources() -> [String] {
-        let items = NSPasteboard(name: .drag).pasteboardItems ?? []
-        return items.compactMap { $0.string(forType: .orkaRemotePath) }
-    }
-
-    /// Filters out no-op and unsafe transfers: dropping into the folder
-    /// the item is already in, or a folder into itself or its own
-    /// descendant. Mirrors the file list's drop filter.
-    private func transferSources(
-        _ sources: [String], destDir: String
-    ) -> [String] {
-        sources.filter { source in
-            let parent = URL(fileURLWithPath: source)
-                .deletingLastPathComponent().path
-            if parent == destDir { return false }
-            if destDir == source || destDir.hasPrefix(source + "/") {
-                return false
-            }
-            return true
-        }
-    }
-
-    private func shouldMove(_ sources: [String], destDir: String) -> Bool {
-        // Option forces a copy, following macOS convention.
-        if NSEvent.modifierFlags.contains(.option) { return false }
-        guard let first = sources.first else { return false }
-        return sameVolume(first, destDir)
-    }
-
-    private func sameVolume(_ a: String, _ b: String) -> Bool {
-        func volumeID(_ path: String) -> AnyHashable? {
-            let values = try? URL(fileURLWithPath: path)
-                .resourceValues(forKeys: [.volumeIdentifierKey])
-            return values?.volumeIdentifier as? AnyHashable
-        }
-        guard let va = volumeID(a), let vb = volumeID(b) else { return false }
-        return va == vb
-    }
 }

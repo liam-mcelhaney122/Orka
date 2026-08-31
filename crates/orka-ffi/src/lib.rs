@@ -78,6 +78,12 @@ pub enum JobState {
     Done,
 }
 
+#[derive(uniffi::Enum)]
+pub enum ConflictResolution {
+    Replace,
+    KeepBoth,
+}
+
 impl From<ops::JobState> for JobState {
     fn from(s: ops::JobState) -> Self {
         match s {
@@ -406,6 +412,25 @@ impl OrkaEngine {
         self.inner.r#move(
             sources.into_iter().map(PathBuf::from).collect(),
             dest_dir.into(),
+        )
+    }
+
+    pub fn resolve_local_conflict(
+        &self,
+        source: String,
+        dest_dir: String,
+        is_move: bool,
+        resolution: ConflictResolution,
+    ) -> u64 {
+        let resolution = match resolution {
+            ConflictResolution::Replace => ops::ConflictResolution::Replace,
+            ConflictResolution::KeepBoth => ops::ConflictResolution::KeepBoth,
+        };
+        self.inner.resolve_local_conflict(
+            PathBuf::from(source),
+            PathBuf::from(dest_dir),
+            is_move,
+            resolution,
         )
     }
 

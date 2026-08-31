@@ -86,12 +86,18 @@ final class WindowState: Identifiable {
 
     /// Non-nil shows the Get Info sheet for this path.
     var infoTarget: InfoTarget?
+    /// Non-nil shows the upload file picker sheet.
+    var uploadPickerTarget: UploadTarget?
     /// Non-nil shows the connection add/edit sheet.
     var editingConnection: ConnectionEditorTarget?
     /// Non-nil shows the permanent-delete confirmation for these paths.
     var confirmingDelete: [String]?
     /// True shows the Empty Trash confirmation.
     var confirmingEmptyTrash = false
+    /// Conflict currently shown for a local file transfer.
+    var transferConflict: TransferConflict?
+    /// Conflicts waiting behind the current prompt.
+    private var queuedTransferConflicts: [TransferConflict] = []
 
     /// `alreadyWatched` marks panes arriving from another window: their
     /// engine watches moved with them, so attaching again would
@@ -122,6 +128,27 @@ final class WindowState: Identifiable {
             return PaneState(path: AppModel.startPath())
         }
         return panes[min(activePaneIndex, panes.count - 1)]
+    }
+
+    func enqueueTransferConflicts(_ conflicts: [TransferConflict]) {
+        guard !conflicts.isEmpty else { return }
+        if transferConflict == nil {
+            transferConflict = conflicts[0]
+            queuedTransferConflicts.append(contentsOf: conflicts.dropFirst())
+        } else {
+            queuedTransferConflicts.append(contentsOf: conflicts)
+        }
+    }
+
+    func finishTransferConflict() {
+        transferConflict = nil
+        guard !queuedTransferConflicts.isEmpty else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.transferConflict == nil,
+                !self.queuedTransferConflicts.isEmpty
+            else { return }
+            self.transferConflict = self.queuedTransferConflicts.removeFirst()
+        }
     }
 
     // MARK: Tabs

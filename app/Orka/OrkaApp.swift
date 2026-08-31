@@ -22,6 +22,10 @@ struct OrkaApp: App {
             GitGraphPanel(model: AppModel.shared, inline: false)
         }
         .defaultSize(width: 760, height: 560)
+        Window("Transfers", id: TransfersPanel.windowID) {
+            TransfersPanel(model: AppModel.shared)
+        }
+        .defaultSize(width: 520, height: 380)
         .commands {
             CommandGroup(replacing: .undoRedo) {
                 let model = AppModel.shared

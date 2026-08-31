@@ -1,7 +1,9 @@
 import AppKit
 import CryptoKit
+import ObjectiveC
 import Quartz
 import SwiftUI
+import UniformTypeIdentifiers
 
 extension NSPasteboard.PasteboardType {
     /// Internal Orka drag type carrying a remote row's URI. Shared by
@@ -31,7 +33,7 @@ struct FileListView: NSViewRepresentable {
 }
 
 @MainActor
-final class FileListCoordinator: NSObject {
+final class FileListCoordinator: NSObject, @preconcurrency NSFilePromiseProviderDelegate {
     private let model: AppModel
     private let window: WindowState
     let scrollView = NSScrollView()
@@ -64,6 +66,10 @@ final class FileListCoordinator: NSObject {
     /// a drop outside Orka is inert instead of offering a broken alias
     /// with no real local file.
     private static let remotePathType = NSPasteboard.PasteboardType.orkaRemotePath
+
+    /// Key for the remote path stored in an NSFilePromiseProvider's
+    /// userInfo dictionary.
+    private static var remotePathAssocKey: UInt8 = 0
 
     private var directory: DirectoryModel { window.activePane.directory }
 
@@ -115,7 +121,11 @@ final class FileListCoordinator: NSObject {
         tableView.target = self
         tableView.doubleAction = #selector(handleDoubleClick)
 
-        tableView.registerForDraggedTypes([.fileURL, Self.remotePathType])
+        // On some macOS builds AppKit never routes external drags into
+        // NSViewRepresentable-embedded views; the SwiftUI pane-level
+        // drop target covers that case. Registration stays so internal
+        // drags, and systems that do route, keep row-targeted drops.
+        tableView.registerForDraggedTypes([Self.remotePathType, .fileURL])
         tableView.setDraggingSourceOperationMask([.copy, .move], forLocal: false)
         tableView.setDraggingSourceOperationMask([.copy, .move], forLocal: true)
 
@@ -628,6 +638,34 @@ final class FileListCoordinator: NSObject {
     @objc private func contextAddToFavorites() {
         for entry in targetEntries() { model.addFavorite(entry.path) }
     }
+
+    @objc private func contextUploadTo() {
+        window.uploadPickerTarget = UploadTarget(
+            sources: targetEntries().map(\.path))
+    }
+
+    @objc private func contextDownloadToDownloads() {
+        let downloads = FileManager.default.urls(
+            for: .downloadsDirectory, in: .userDomainMask).first?.path
+            ?? NSHomeDirectory()
+        model.downloadItems(targetEntries().map(\.path), to: downloads)
+    }
+
+    @objc private func contextDownload() {
+        // Capture the targets before the panel opens; the selection can
+        // change while the sheet is up.
+        let paths = targetEntries().map(\.path)
+        guard let window = tableView.window else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.prompt = "Download"
+        panel.beginSheetModal(for: window) { [weak self] response in
+            guard response == .OK, let url = panel.url else { return }
+            self?.model.downloadItems(paths, to: url.path)
+        }
+    }
 }
 
 // MARK: - Data source & drag and drop
@@ -675,14 +713,20 @@ extension FileListCoordinator: NSTableViewDataSource {
             retargetDropRow(row: row, dropOperation: dropOperation)
             return .copy
         }
-        guard let sources = droppedPaths(info), !sources.isEmpty else {
+        guard info.draggingPasteboard.availableType(from: [.fileURL]) != nil else {
             return []
+        }
+        retargetDropRow(row: row, dropOperation: dropOperation)
+        // Some drag sources vend file URLs lazily. Do not reject the drag
+        // only because the paths are not readable during validation.
+        guard let sources = droppedPaths(info), !sources.isEmpty else {
+            return allowedOperation(info, preferred: .copy)
         }
         let effective = transferSources(sources, destDir: destDir)
         guard !effective.isEmpty else { return [] }
-        retargetDropRow(row: row, dropOperation: dropOperation)
-        return shouldMove(info, sources: effective, destDir: destDir)
-            ? .move : .copy
+        let preferred: NSDragOperation = shouldMove(
+            info, sources: effective, destDir: destDir) ? .move : .copy
+        return allowedOperation(info, preferred: preferred)
     }
 
     func tableView(
@@ -693,16 +737,49 @@ extension FileListCoordinator: NSTableViewDataSource {
         if let remoteSources = droppedRemotePaths(info) {
             guard OrkaPath.isLocal(destDir), !remoteSources.isEmpty
             else { return false }
-            model.transfer(sources: remoteSources, to: destDir, move: false)
+            model.transfer(
+                sources: remoteSources, to: destDir, move: false, in: window)
             return true
         }
         guard let sources = droppedPaths(info) else { return false }
         let effective = transferSources(sources, destDir: destDir)
         guard !effective.isEmpty else { return false }
+        let preferred: NSDragOperation = shouldMove(
+            info, sources: effective, destDir: destDir) ? .move : .copy
+        let operation = allowedOperation(info, preferred: preferred)
+        guard !operation.isEmpty else { return false }
         model.transfer(
             sources: effective, to: destDir,
-            move: shouldMove(info, sources: effective, destDir: destDir))
+            move: operation == .move, in: window)
         return true
+    }
+
+    /// Adds file promise providers for remote rows so a drop onto Finder
+    /// downloads the file from the server and places it at the drop point.
+    func tableView(
+        _ tableView: NSTableView,
+        draggingSession session: NSDraggingSession,
+        willBeginAt screenPoint: NSPoint,
+        forRowIndexes rowIndexes: IndexSet
+    ) {
+        for row in rowIndexes where row < displayed.count {
+            let path = displayed[row].path
+            guard !OrkaPath.isLocal(path) else { continue }
+            let name = (path as NSString).lastPathComponent
+            let ext = (name as NSString).pathExtension
+            let fileType = !ext.isEmpty
+                ? (UTType(filenameExtension: ext)? .identifier
+                    ?? UTType.data.identifier)
+                : UTType.data.identifier
+            let promise = NSFilePromiseProvider(
+                fileType: fileType, delegate: self)
+            objc_setAssociatedObject(
+                promise,
+                &Self.remotePathAssocKey,
+                path,
+                .OBJC_ASSOCIATION_COPY_NONATOMIC)
+            session.draggingPasteboard.writeObjects([promise])
+        }
     }
 
     /// Retargets a drop that did not land squarely on a folder row to the
@@ -747,39 +824,34 @@ extension FileListCoordinator: NSTableViewDataSource {
         return paths.isEmpty ? nil : paths
     }
 
-    /// Filters out no-op and unsafe transfers: dropping into the folder the
-    /// item is already in, or a folder into itself or its own descendant.
     private func transferSources(
         _ sources: [String], destDir: String
     ) -> [String] {
-        sources.filter { source in
-            let parent = URL(fileURLWithPath: source)
-                .deletingLastPathComponent().path
-            if parent == destDir { return false }
-            if destDir == source || destDir.hasPrefix(source + "/") {
-                return false
-            }
-            return true
-        }
+        DropTransferPolicy.transferSources(sources, destDir: destDir)
     }
 
+    /// Mask-based move decision: AppKit drags express the Option key
+    /// through `draggingSourceOperationMask`, not live modifier flags.
     private func shouldMove(
         _ info: NSDraggingInfo, sources: [String], destDir: String
     ) -> Bool {
-        // Option key forces a copy, following macOS convention.
-        if info.draggingSourceOperationMask == .copy { return false }
-        guard let first = sources.first else { return false }
-        return sameVolume(first, destDir)
+        guard info.draggingSourceOperationMask.contains(.move) else {
+            return false
+        }
+        return sources.allSatisfy {
+            DropTransferPolicy.sameVolume($0, destDir)
+        }
     }
 
-    private func sameVolume(_ a: String, _ b: String) -> Bool {
-        func volumeID(_ path: String) -> AnyHashable? {
-            let values = try? URL(fileURLWithPath: path)
-                .resourceValues(forKeys: [.volumeIdentifierKey])
-            return values?.volumeIdentifier as? AnyHashable
-        }
-        guard let va = volumeID(a), let vb = volumeID(b) else { return false }
-        return va == vb
+    /// Returns only an operation advertised by the drag source.
+    private func allowedOperation(
+        _ info: NSDraggingInfo, preferred: NSDragOperation
+    ) -> NSDragOperation {
+        let allowed = info.draggingSourceOperationMask
+        if allowed.contains(preferred) { return preferred }
+        if allowed.contains(.copy) { return .copy }
+        if allowed.contains(.move) { return .move }
+        return []
     }
 }
 
@@ -1099,6 +1171,10 @@ extension FileListCoordinator: NSMenuDelegate {
             menu.addItem(.separator())
             menu.addItem(makeItem("Cut", action: #selector(contextCut)))
             menu.addItem(makeItem("Copy", action: #selector(contextCopy)))
+            if !model.connectionStore.connections.isEmpty {
+                menu.addItem(makeItem(
+                    "Upload to…", action: #selector(contextUploadTo)))
+            }
         }
         if model.canPaste {
             menu.addItem(makeItem("Paste", action: #selector(contextPaste)))
@@ -1232,6 +1308,12 @@ extension FileListCoordinator: NSMenuDelegate {
             menu.addItem(makeItem(
                 "Copy Relative Path",
                 action: #selector(contextCopyRelativePath)))
+            menu.addItem(.separator())
+            menu.addItem(makeItem(
+                "Download to Downloads",
+                action: #selector(contextDownloadToDownloads)))
+            menu.addItem(makeItem(
+                "Download…", action: #selector(contextDownload)))
         }
         if model.canPaste {
             menu.addItem(makeItem("Paste", action: #selector(contextPaste)))
@@ -1425,5 +1507,62 @@ final class FileListTableView: NSTableView {
     override func endPreviewPanelControl(_ panel: QLPreviewPanel!) {
         panel.dataSource = nil
         panel.delegate = nil
+    }
+}
+
+// MARK: - Remote drag-out via file promise
+
+extension FileListCoordinator {
+    func filePromiseProvider(
+        _ filePromiseProvider: NSFilePromiseProvider,
+        fileNameForType fileType: String
+    ) -> String {
+        let path = objc_getAssociatedObject(
+            filePromiseProvider,
+            &Self.remotePathAssocKey) as? String
+        return path.map { ($0 as NSString).lastPathComponent }
+            ?? "unknown"
+    }
+
+    func filePromiseProvider(
+        _ filePromiseProvider: NSFilePromiseProvider,
+        writePromiseTo url: URL,
+        completionHandler: @escaping (Error?) -> Void
+    ) {
+        guard let remotePath = objc_getAssociatedObject(
+            filePromiseProvider,
+            &Self.remotePathAssocKey) as? String
+        else {
+            completionHandler(OrkaError.Io(
+                message: "No remote path for promise"))
+            return
+        }
+        RemotePromiseStager.download(
+            remotePath: remotePath, model: model
+        ) { result in
+            switch result {
+            case .success(let staged):
+                defer {
+                    RemotePromiseStager.removeStagingDirectory(for: staged)
+                }
+                do {
+                    if FileManager.default.fileExists(atPath: url.path) {
+                        try FileManager.default.removeItem(at: url)
+                    }
+                    try FileManager.default.moveItem(at: staged, to: url)
+                    completionHandler(nil)
+                } catch {
+                    completionHandler(error)
+                }
+            case .failure(let error):
+                completionHandler(error)
+            }
+        }
+    }
+
+    func operationMask(
+        for filePromiseProvider: NSFilePromiseProvider
+    ) -> NSDragOperation {
+        .copy
     }
 }

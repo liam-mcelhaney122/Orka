@@ -382,9 +382,7 @@ fn extract_tar(
 /// clicks cannot pick the same name.
 pub fn choose_archive_name(dest_dir: &Path, sources: &[PathBuf], format: ArchiveFormat) -> PathBuf {
     let stem = match sources {
-        [single] => single
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned()),
+        [single] => single.file_name().map(|n| n.to_string_lossy().into_owned()),
         _ => None,
     }
     .unwrap_or_else(|| "Archive".to_string());

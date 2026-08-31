@@ -1,4 +1,6 @@
+import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct SidebarView: View {
     @Bindable var model: AppModel
@@ -37,6 +39,9 @@ struct SidebarView: View {
                     sidebarButton(
                         name: favoriteName(for: path),
                         icon: favoriteIcon(for: path), path: path)
+                        .modifier(SidebarFolderDropModifier(
+                            destination: path, model: model, window: window,
+                            enabled: !missing))
                         .foregroundStyle(missing ? .secondary : .primary)
                         .opacity(missing ? 0.5 : 1)
                         .contextMenu {
@@ -84,6 +89,9 @@ struct SidebarView: View {
                             .help("Eject")
                         }
                     }
+                    .modifier(SidebarFolderDropModifier(
+                        destination: volume.path, model: model, window: window,
+                        enabled: true))
                 }
             } header: {
                 sectionHeader("Locations")
@@ -103,8 +111,8 @@ struct SidebarView: View {
                 sectionHeader("Connections")
             }
             Section {
-                SidebarTreeRow(node: homeTree, window: window)
-                SidebarTreeRow(node: rootTree, window: window)
+                SidebarTreeRow(node: homeTree, model: model, window: window)
+                SidebarTreeRow(node: rootTree, model: model, window: window)
             } header: {
                 sectionHeader("Folders")
             }
@@ -222,13 +230,14 @@ struct VolumeInfo: Identifiable {
 /// Recursive lazy tree row. Expanding a node loads its child directories.
 struct SidebarTreeRow: View {
     @Bindable var node: SidebarNode
+    let model: AppModel
     var window: WindowState
 
     var body: some View {
         DisclosureGroup(isExpanded: $node.isExpanded) {
             if let children = node.children {
                 ForEach(children) { child in
-                    SidebarTreeRow(node: child, window: window)
+                    SidebarTreeRow(node: child, model: model, window: window)
                 }
             } else {
                 ProgressView()
@@ -238,6 +247,136 @@ struct SidebarTreeRow: View {
             Label(node.name, systemImage: "folder")
                 .contentShape(Rectangle())
                 .onTapGesture { window.navigate(to: node.path) }
+                .modifier(SidebarFolderDropModifier(
+                    destination: node.path, model: model, window: window,
+                    enabled: true))
         }
+    }
+}
+
+private struct SidebarFolderDropModifier: ViewModifier {
+    let destination: String
+    let model: AppModel
+    let window: WindowState
+    let enabled: Bool
+    @State private var isTargeted = false
+
+    func body(content: Content) -> some View {
+        content
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+            .overlay {
+                if isTargeted {
+                    RoundedRectangle(cornerRadius: 5)
+                        .stroke(Color.accentColor, lineWidth: 2)
+                        .allowsHitTesting(false)
+                    }
+            }
+            .dropDestination(for: URL.self) { urls, _ in
+                guard enabled, isValidDestination else { return false }
+                let sources = urls.filter(\.isFileURL).map(\.path)
+                guard !sources.isEmpty else { return false }
+                model.transfer(
+                    sources: sources,
+                    to: destination,
+                    move: DropTransferPolicy.shouldMove(
+                        sources: sources,
+                        destDir: destination,
+                        forceCopy: NSEvent.modifierFlags.contains(.option)),
+                    in: window)
+                return true
+            } isTargeted: { targeted in
+                isTargeted = targeted && enabled && isValidDestination
+            }
+            .onDrop(
+                of: [TabBarView.remotePathUTType, .orkaSelectedPaths],
+                delegate: SidebarFolderDropDelegate(
+                    destination: destination, model: model, window: window,
+                    enabled: enabled, isTargeted: $isTargeted))
+    }
+
+    private var isValidDestination: Bool {
+        guard OrkaPath.isLocal(destination),
+            !destination.lowercased().hasSuffix(".app")
+        else { return false }
+        var isDirectory: ObjCBool = false
+        return FileManager.default.fileExists(
+            atPath: destination, isDirectory: &isDirectory)
+            && isDirectory.boolValue
+    }
+}
+
+private struct SidebarFolderDropDelegate: DropDelegate {
+    let destination: String
+    let model: AppModel
+    let window: WindowState
+    let enabled: Bool
+    @Binding var isTargeted: Bool
+
+    func validateDrop(info: DropInfo) -> Bool {
+        enabled && isValidDestination
+            && info.hasItemsConforming(
+                to: [TabBarView.remotePathUTType, .orkaSelectedPaths])
+    }
+
+    func dropEntered(info: DropInfo) {
+        isTargeted = validateDrop(info: info)
+    }
+
+    func dropExited(info: DropInfo) {
+        isTargeted = false
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        guard validateDrop(info: info) else {
+            isTargeted = false
+            return DropProposal(operation: .cancel)
+        }
+        let providers = DropPathLoader.providers(from: info)
+        guard !providers.isEmpty else {
+            isTargeted = false
+            return DropProposal(operation: .cancel)
+        }
+        return DropProposal(operation: DropTransferPolicy.proposedOperation(
+            providers: providers, destDir: destination))
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        isTargeted = false
+        guard enabled, isValidDestination else { return false }
+        let providers = DropPathLoader.providers(from: info)
+        guard !providers.isEmpty else { return false }
+        let capturedDestination = destination
+        let forceCopy = NSEvent.modifierFlags.contains(.option)
+        DropPathLoader.load(providers) { result in
+            switch result {
+            case .success(let loaded):
+                let sources = DropTransferPolicy.transferSources(
+                    loaded, destDir: capturedDestination)
+                guard !sources.isEmpty else { return }
+                model.transfer(
+                    sources: sources,
+                    to: capturedDestination,
+                    move: DropTransferPolicy.shouldMove(
+                        sources: sources, destDir: capturedDestination,
+                        forceCopy: forceCopy),
+                    in: window)
+            case .failure(let error):
+                model.lastJobErrors = [JobItemError(
+                    path: capturedDestination,
+                    message: error.localizedDescription)]
+            }
+        }
+        return true
+    }
+
+    private var isValidDestination: Bool {
+        guard OrkaPath.isLocal(destination),
+            !destination.lowercased().hasSuffix(".app")
+        else { return false }
+        var isDirectory: ObjCBool = false
+        return FileManager.default.fileExists(
+            atPath: destination, isDirectory: &isDirectory)
+            && isDirectory.boolValue
     }
 }

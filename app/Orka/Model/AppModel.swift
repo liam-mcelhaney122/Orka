@@ -60,6 +60,9 @@ final class AppModel {
     private var jobCompletionHandlers: [UInt64: (JobState) -> Void] = [:]
     /// Recursive folder totals for the Size column.
     let folderSizes = FolderSizeCache()
+    /// Registry of every transfer job started by the app, for the
+    /// Transfers panel.
+    let transfers = TransferManager()
     /// Id of the live Get Info size request. Listing and status-bar
     /// requests live per window; the Get Info sheet keeps one global
     /// slot because it opens one sheet at a time.
@@ -112,6 +115,11 @@ final class AppModel {
         pendingSessions = Self.loadWindowSessions()
         engine.setConnections(configs: connectionStore.toEngine())
         checkFullDiskAccess()
+        RemotePromiseStager.sweepStaleStagingDirectories()
+        transfers.connectionName = { [weak self] id in
+            self?.connectionStore.connections
+                .first { $0.id == id }?.displayName ?? id
+        }
     }
 
     // MARK: Session persistence
@@ -420,9 +428,17 @@ final class AppModel {
         switch event {
         case .jobProgress(let progress):
             activeJobs[progress.jobId] = progress
+            _ = transfers.applyProgress(progress)
         case .jobFinished(let jobId, let state, let errors):
             activeJobs[jobId] = nil
-            lastJobErrors = errors
+            let handled = transfers.applyFinished(
+                jobId: jobId, state: state, errors: errors)
+            // A job the transfer registry knows keeps its errors on its
+            // own row; an unregistered job keeps today's status-bar
+            // behavior.
+            if !handled {
+                lastJobErrors = errors
+            }
             refreshJournal()
             if let handler = jobCompletionHandlers.removeValue(forKey: jobId) {
                 handler(state)
@@ -619,11 +635,9 @@ final class AppModel {
         let isCut = !cutPaths.isEmpty
             && pasteboard.changeCount == cutChangeCount
             && Set(sources) == cutPaths
+        startEngineTransfer(sources: sources, destDir: dest, move: isCut)
         if isCut {
-            _ = engine.moveItems(sources: sources, destDir: dest)
             cutPaths = []
-        } else {
-            _ = engine.copyItems(sources: sources, destDir: dest)
         }
     }
 
@@ -726,8 +740,13 @@ final class AppModel {
     /// Probes Full Disk Access by listing the Trash. POSIX permissions
     /// always allow the owner there, so a failure means macOS privacy
     /// protection blocks the app. The launch gate polls this until the
-    /// grant arrives.
+    /// grant arrives. Set ORKA_SKIP_FDA_GATE=1 to skip the gate in
+    /// ad-hoc test builds.
     func checkFullDiskAccess() {
+        if ProcessInfo.processInfo.environment["ORKA_SKIP_FDA_GATE"] == "1" {
+            hasFullDiskAccess = true
+            return
+        }
         hasFullDiskAccess = (try? FileManager.default
             .contentsOfDirectory(atPath: Self.trashPath)) != nil
     }
@@ -927,13 +946,106 @@ final class AppModel {
         }
     }
 
-    /// Drop or paste of external URLs into a directory.
-    func transfer(sources: [String], to destDir: String, move: Bool) {
-        if move {
-            _ = engine.moveItems(sources: sources, destDir: destDir)
-        } else {
-            _ = engine.copyItems(sources: sources, destDir: destDir)
+    /// Starts non-conflicting items and prompts for local name conflicts.
+    /// The pre-scan touches the filesystem once per item, so it runs off
+    /// the main actor; jobs start and conflicts enqueue back on it.
+    func transfer(
+        sources: [String], to destDir: String, move: Bool,
+        in window: WindowState? = nil
+    ) {
+        guard OrkaPath.isLocal(destDir), sources.allSatisfy(OrkaPath.isLocal)
+        else {
+            // Remote endpoints have no local conflict scan.
+            startEngineTransfer(sources: sources, destDir: destDir, move: move)
+            return
         }
+        // Resolve the window now; focus can change during the scan.
+        let target = window ?? focusedWindow
+        Task {
+            let scan = await Task.detached(priority: .userInitiated) {
+                Self.scanLocalConflicts(
+                    sources: sources, destDir: destDir, move: move)
+            }.value
+            startEngineTransfer(
+                sources: scan.ready, destDir: destDir, move: move)
+            target?.enqueueTransferConflicts(scan.conflicts)
+        }
+    }
+
+    /// Splits a local transfer into items that can start now and items
+    /// whose destination name is taken. Safe to call off the main actor.
+    private nonisolated static func scanLocalConflicts(
+        sources: [String], destDir: String, move: Bool
+    ) -> (ready: [String], conflicts: [TransferConflict]) {
+        var ready: [String] = []
+        var conflicts: [TransferConflict] = []
+        var claimedDestinations: Set<String> = []
+        for source in sources {
+            let destination = URL(fileURLWithPath: destDir)
+                .appendingPathComponent(
+                    URL(fileURLWithPath: source).lastPathComponent).path
+            if URL(fileURLWithPath: source).standardizedFileURL.path
+                == URL(fileURLWithPath: destination).standardizedFileURL.path
+            {
+                continue
+            }
+            let destinationWasClaimed = !claimedDestinations
+                .insert(destination).inserted
+            if destinationWasClaimed
+                || FileManager.default.fileExists(atPath: destination)
+            {
+                conflicts.append(TransferConflict(
+                    source: source,
+                    destination: destination,
+                    destinationDirectory: destDir,
+                    move: move))
+            } else {
+                ready.append(source)
+            }
+        }
+        return (ready, conflicts)
+    }
+
+    private func startEngineTransfer(
+        sources: [String], destDir: String, move: Bool
+    ) {
+        guard !sources.isEmpty else { return }
+        let jobId = move
+            ? engine.moveItems(sources: sources, destDir: destDir)
+            : engine.copyItems(sources: sources, destDir: destDir)
+        transfers.register(
+            jobId: jobId, sources: sources, destDir: destDir, move: move)
+    }
+
+    /// Downloads remote items into a local folder. Always a copy: a
+    /// remote source has no "move" the engine can perform across the
+    /// wire.
+    func downloadItems(_ paths: [String], to localDir: String) {
+        transfer(sources: paths, to: localDir, move: false, in: focusedWindow)
+    }
+
+    /// Uploads local items into a remote folder. Always a copy, for the
+    /// same reason as `downloadItems`.
+    func uploadItems(_ paths: [String], to remoteDir: String) {
+        transfer(
+            sources: paths, to: remoteDir, move: false, in: focusedWindow)
+    }
+
+    func resolveTransferConflict(
+        _ conflict: TransferConflict, as resolution: ConflictResolution
+    ) {
+        let jobId = engine.resolveLocalConflict(
+            source: conflict.source,
+            destDir: conflict.destinationDirectory,
+            isMove: conflict.move,
+            resolution: resolution)
+        // Register the job so the item joins its drop's other items in
+        // the Transfers panel instead of erroring through the status bar.
+        transfers.register(
+            jobId: jobId,
+            sources: [conflict.source],
+            destDir: conflict.destinationDirectory,
+            move: conflict.move)
     }
 
     // MARK: Terminal
@@ -964,6 +1076,25 @@ final class AppModel {
 struct InfoTarget: Identifiable {
     let path: String
     var id: String { path }
+}
+
+/// Identifiable wrapper so an upload's local sources can drive the
+/// upload picker sheet.
+struct UploadTarget: Identifiable {
+    let id = UUID()
+    let sources: [String]
+}
+
+struct TransferConflict: Identifiable {
+    let id = UUID()
+    let source: String
+    let destination: String
+    let destinationDirectory: String
+    let move: Bool
+
+    var name: String {
+        URL(fileURLWithPath: destination).lastPathComponent
+    }
 }
 
 /// Receives engine events on a Rust thread and hops to the main actor.
