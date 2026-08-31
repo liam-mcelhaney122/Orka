@@ -5,111 +5,94 @@
 <h1 align="center">Orka</h1>
 
 <p align="center">
-  <em>A fast, tabbed, multi-window file manager for macOS with first-class remote and git support.</em>
+  <strong>A Finder replacement for work across your Mac, remote storage, and Git repositories.</strong>
+</p>
+
+<p align="center">
+  Orka replaces Finder with browser-style navigation, built-in remote access, and the tools you need to understand and move files.
 </p>
 
 <p align="center">
   <a href="https://github.com/liam-mcelhaney122/Orka/actions/workflows/ci.yml"><img src="https://github.com/liam-mcelhaney122/Orka/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <img src="https://img.shields.io/badge/macOS-26-blue" alt="macOS 26">
-  <img src="https://img.shields.io/badge/UI-SwiftUI-orange" alt="SwiftUI">
-  <img src="https://img.shields.io/badge/core-Rust-8b3103" alt="Rust core">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT license">
 </p>
 
 <p align="center">
-  <a href="https://github.com/liam-mcelhaney122/Orka/releases/latest"><strong>⬇ Download the latest release</strong></a>
+  <a href="https://github.com/liam-mcelhaney122/Orka/releases/latest"><strong>Download the latest release</strong></a>
 </p>
 
 ---
 
-Orka is a File manager for MacOS that doesn't suck. It supports several different file locations (SFTP, SHH, S3, etc), has built in git support and branch viewing, and several other QoL features.
+## Move through files like the web
 
-## Features
+Open folders in browser-style tabs. Give tabs colors, restore them between sessions, and move any tab into a separate window. Keep multiple independent windows open when one workspace is not enough.
 
-- 🗂 **Tabs and windows** — browser-style tabs with colors and session
-  restore, multiple independent windows, and a "Move Tab to New Window"
-  action. Files dragged onto a tab spring-load it.
-- 👁 **Two view modes** — a details list and an icon grid.
-- 📌 **Sidebar** — reorderable Favorites, mounted volumes with eject,
-  saved remote connections, lazy folder trees for Home and `/`, and the
-  Trash.
-- 🌐 **Remote locations** — SFTP, Dropbox, Google Drive, Azure Data Lake,
-  and HTTP, behind one navigation model. Remote listings refresh after
-  every job.
-- ⚙️ **File operations** — copy, move, duplicate, rename, new folder,
-  compress (zip, tar, tar.gz) and extract, all running as cancelable
-  background jobs with progress in the status bar.
-- 🗑 **Trash** — move to Trash with undo, a Trash sidebar entry, and
-  Empty Trash. Remote deletes ask for confirmation instead, since
-  servers have no trash.
-- ↩️ **Undo/redo** — a journal in the Rust engine backs undo and redo for
-  file operations.
-- 🔍 **Search** — type to filter the current folder live; press Return
-  for a recursive search of the tree, with `*.ext` filtering.
-- 📊 **Folder sizes** — recursive totals in the Size column and the
-  status bar, computed in the background and cached.
-- 🌿 **Git awareness** — per-file git status in listings and a commit
-  graph panel that can pop out into its own window.
-- ⚡️ **Quick Look** — press Space to preview, including remote files.
-- 🔄 **Live updates** — local directories refresh through filesystem
-  events; no manual reloads.
-- ✨ **Quality of life** — breadcrumb path bar with direct path entry
-  (⌘L), cut/copy/paste, drag and drop, hidden-file toggle, Get Info
-  panel, and Open in Terminal.
+Drag files onto a tab to switch to it and send the files to that folder. You can also drop files directly onto folders in the sidebar.
+
+## One place for every location
+
+Browse local files and remote storage through the same navigation model. Orka connects to:
+
+- SFTP servers
+- Dropbox
+- Google Drive
+- Azure Data Lake
+
+Save connections beside your favorite folders and mounted volumes. Press Space to use Quick Look with local or remote files.
+
+## See more before you open a file
+
+- **Git context:** See file status in each listing. Open the commit graph in a panel or a separate window.
+- **Useful search:** Filter the current folder as you type. Press Return to search recursively. Use patterns such as `*.pdf` to filter by extension.
+- **Real folder sizes:** See recursive folder totals in the Size column and status bar. Orka calculates them in the background.
+- **Live updates:** See local file changes as they happen. You do not need to refresh the folder.
+
+## File work without losing your place
+
+Copy, move, duplicate, rename, and create folders while Orka tracks active work in the status bar. Long operations run in the background, show progress, and can be canceled.
+
+When names collide, choose Replace, Keep Both, or Skip. Orka creates Finder-style numbered copies when you keep both items.
+
+For local files, create ZIP, TAR, and TAR.GZ archives, or extract archives in place. Use undo and redo for supported file operations.
+
+For faster navigation, use reorderable favorites, direct path entry with Command-L, Open in Terminal, and the hidden-file toggle.
+
+## Why not Finder?
+
+Finder remains the standard macOS file browser. Orka is for workflows that need more context and fewer separate tools.
+
+| Workflow | What Orka adds |
+| --- | --- |
+| Work across many folders | Colored tabs, session restore, tab-to-window movement, and multiple independent windows |
+| Move files between open locations | Drop files onto tabs or sidebar folders |
+| Browse remote storage | SFTP, Dropbox, Google Drive, and Azure Data Lake beside local files |
+| Work in repositories | File-level Git status and a built-in commit graph |
+| Inspect large folder trees | Recursive search, extension filters, and calculated folder sizes |
+| Manage long file operations | Background progress, cancellation, archive tools, and undo or redo |
 
 ## Install
 
-1. Download and unzip the [latest release](https://github.com/liam-mcelhaney122/Orka/releases/latest), then move `Orka.app` to `/Applications`.
-2. The build is not notarized. On first launch, right-click the app and
-   choose **Open**, or clear the quarantine flag:
+Orka requires macOS 26.
+
+1. Download and unzip the [latest release](https://github.com/liam-mcelhaney122/Orka/releases/latest). Move `Orka.app` to `/Applications`.
+2. The current build is not notarized. On first launch, right-click Orka and select **Open**. You can also clear the quarantine flag:
+
    ```sh
    xattr -dr com.apple.quarantine /Applications/Orka.app
    ```
-3. Orka needs **Full Disk Access**. The app shows a gate screen on
-   launch that opens System Settings > Privacy & Security > Full Disk
-   Access for you; add Orka there and the gate closes on its own.
 
-## Build Requirements
+3. Grant **Full Disk Access** when Orka asks for it. Orka needs this access for protected locations such as Trash. The app opens the correct System Settings page.
 
-- macOS 26
-- Xcode (a full install, not only the Command Line Tools)
-- The Rust toolchain (`rustup`, stable)
-- [XcodeGen](https://github.com/yonaskolb/XcodeGen) (`brew install xcodegen`)
-- [`just`](https://github.com/casey/just) (`brew install just`)
+## Contribute and build
 
-## Build
+Development requires macOS 26, a full Xcode installation, the stable Rust toolchain, XcodeGen, and [`just`](https://github.com/casey/just). Build a release and run all tests with:
 
 ```sh
 just release
+just test
 ```
-
-This builds the Rust core in release mode, then builds the app with
-`xcodebuild`. `just` points `DEVELOPER_DIR` at a full Xcode install, since
-`xcodebuild` needs one.
-
-Other recipes:
-
-```sh
-just debug    # Rust release build + Debug app build
-just dist     # release build, copied to dist/Orka.app
-just run      # dist, then relaunch the app from dist/
-just test     # Rust and Swift unit tests
-just clean    # remove build products (keeps dist/)
-```
-
-The Xcode project, `app/Orka.xcodeproj`, is generated by XcodeGen from
-`app/project.yml` and is not checked in. Run `xcodegen` inside `app/`
-after changing `project.yml`, or after cloning the repository, before
-opening the project in Xcode:
-
-```sh
-cd app && xcodegen
-```
-
-The generated Swift bindings under `app/Generated/` are also not checked
-in. `scripts/build-rust.sh` (run automatically by the `just` recipes
-above) builds `liborka_ffi` and regenerates them from the same crate.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+Orka is available under the [MIT License](LICENSE).
