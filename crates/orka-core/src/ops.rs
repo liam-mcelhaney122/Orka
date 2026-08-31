@@ -1,9 +1,10 @@
 //! File operations engine.
 //!
-//! Jobs run FIFO on one worker thread. Each job is cancellable and reports
-//! progress through an [`EventSink`]. All events for one engine are emitted
-//! from the worker thread, so their order is deterministic and calls never
-//! overlap.
+//! Local jobs run FIFO on one worker thread, so their events stay ordered
+//! and calls never overlap. A job that touches a remote path instead runs
+//! on a small transfer lane (see [`TRANSFER_LANE_WORKERS`]), so one slow
+//! network job cannot block another. Each job is cancellable and reports
+//! progress through an [`EventSink`].
 
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -146,41 +147,83 @@ enum WorkerMessage {
 
 pub struct OpsEngine {
     tx: Sender<WorkerMessage>,
+    transfer_tx: Sender<WorkerMessage>,
     next_id: AtomicU64,
-    cancel_flags: Mutex<HashMap<u64, Arc<AtomicBool>>>,
-    worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+    cancel_flags: Arc<Mutex<HashMap<u64, Arc<AtomicBool>>>>,
+    workers: Mutex<Vec<std::thread::JoinHandle<()>>>,
     journal: Arc<Mutex<Journal>>,
-    /// Not used by local jobs yet. Remote transfers route through it in
-    /// a later milestone.
+    /// Local jobs never touch this. It backs the transfer lane and
+    /// `run_delete`, both of which resolve every path through it.
     router: Arc<crate::vfs::BackendRouter>,
 }
 
 impl OpsEngine {
     pub fn new(sink: Arc<dyn EventSink>, delegate: Arc<dyn PlatformDelegate>) -> Self {
         let (tx, rx) = channel::<WorkerMessage>();
+        let (transfer_tx, transfer_rx) = channel::<WorkerMessage>();
+        let transfer_rx = Arc::new(Mutex::new(transfer_rx));
         let journal = Arc::new(Mutex::new(Journal::default()));
-        let worker_journal = journal.clone();
         let router = Arc::new(crate::vfs::BackendRouter::new());
-        let worker_router = router.clone();
-        let worker = std::thread::Builder::new()
-            .name("orka-ops".into())
-            .spawn(move || {
-                while let Ok(WorkerMessage::Run(job)) = rx.recv() {
-                    run_job(
-                        &job,
-                        sink.as_ref(),
-                        delegate.as_ref(),
-                        &worker_journal,
-                        &worker_router,
-                    );
-                }
-            })
-            .expect("spawn ops worker");
+        let cancel_flags: Arc<Mutex<HashMap<u64, Arc<AtomicBool>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let mut workers = Vec::new();
+
+        // Local lane: unchanged FIFO ordering on one worker thread.
+        {
+            let sink = sink.clone();
+            let delegate = delegate.clone();
+            let journal = journal.clone();
+            let router = router.clone();
+            let cancel_flags = cancel_flags.clone();
+            workers.push(
+                std::thread::Builder::new()
+                    .name("orka-ops".into())
+                    .spawn(move || {
+                        while let Ok(WorkerMessage::Run(job)) = rx.recv() {
+                            let id = job.id;
+                            run_job(&job, sink.as_ref(), delegate.as_ref(), &journal, &router);
+                            cancel_flags.lock().unwrap().remove(&id);
+                        }
+                    })
+                    .expect("spawn ops worker"),
+            );
+        }
+
+        // Transfer lane: a small pool so one slow remote job cannot block
+        // another. Each worker releases the shared receiver's lock before
+        // it runs a job - holding the lock across `run_job` would
+        // serialize the lane and remove its concurrency.
+        for n in 1..=TRANSFER_LANE_WORKERS {
+            let sink = sink.clone();
+            let delegate = delegate.clone();
+            let journal = journal.clone();
+            let router = router.clone();
+            let cancel_flags = cancel_flags.clone();
+            let transfer_rx = transfer_rx.clone();
+            workers.push(
+                std::thread::Builder::new()
+                    .name(format!("orka-transfer-{n}"))
+                    .spawn(move || loop {
+                        let message = transfer_rx.lock().unwrap().recv();
+                        match message {
+                            Ok(WorkerMessage::Run(job)) => {
+                                let id = job.id;
+                                run_job(&job, sink.as_ref(), delegate.as_ref(), &journal, &router);
+                                cancel_flags.lock().unwrap().remove(&id);
+                            }
+                            Ok(WorkerMessage::Shutdown) | Err(_) => break,
+                        }
+                    })
+                    .expect("spawn transfer worker"),
+            );
+        }
+
         Self {
             tx,
+            transfer_tx,
             next_id: AtomicU64::new(1),
-            cancel_flags: Mutex::new(HashMap::new()),
-            worker: Mutex::new(Some(worker)),
+            cancel_flags,
+            workers: Mutex::new(workers),
             journal,
             router,
         }
@@ -352,11 +395,16 @@ impl OpsEngine {
         }
     }
 
-    /// Stops the worker after the current job. Call before the app exits so
-    /// no event fires into a dead runtime.
+    /// Stops every worker after its current job. Call before the app exits
+    /// so no event fires into a dead runtime.
     pub fn shutdown(&self) {
         let _ = self.tx.send(WorkerMessage::Shutdown);
-        if let Some(handle) = self.worker.lock().unwrap().take() {
+        // One Shutdown per transfer worker: each worker consumes exactly
+        // one message, so a lone Shutdown would stop only one of them.
+        for _ in 0..TRANSFER_LANE_WORKERS {
+            let _ = self.transfer_tx.send(WorkerMessage::Shutdown);
+        }
+        for handle in self.workers.lock().unwrap().drain(..) {
             let _ = handle.join();
         }
     }
@@ -365,12 +413,17 @@ impl OpsEngine {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let cancel = Arc::new(AtomicBool::new(false));
         self.cancel_flags.lock().unwrap().insert(id, cancel.clone());
-        let _ = self.tx.send(WorkerMessage::Run(Job {
+        let is_local = job_is_local(&kind);
+        let job = Job {
             id,
             kind,
             description,
             cancel,
-        }));
+        };
+        // The same predicate `run_job` dispatches on, so a job's lane and
+        // its execution path can never disagree.
+        let sender = if is_local { &self.tx } else { &self.transfer_tx };
+        let _ = sender.send(WorkerMessage::Run(job));
         id
     }
 }
@@ -501,6 +554,12 @@ fn run_job(
     journal: &Mutex<Journal>,
     router: &crate::vfs::BackendRouter,
 ) {
+    // A job cancelled while still queued never needs to run at all.
+    if job.cancel.load(Ordering::Relaxed) {
+        sink.job_finished(job.id, JobState::Cancelled, Vec::new());
+        return;
+    }
+
     // Delete always routes through backends, local or remote.
     if let OpKind::Delete { sources } = &job.kind {
         run_delete(job, sink, router, sources);
@@ -831,6 +890,10 @@ fn trash_one(ctx: &mut JobContext, delegate: &dyn PlatformDelegate, path: &Path)
 // Router-based jobs: permanent delete and cross-backend transfers
 // ---------------------------------------------------------------------------
 
+/// Remote jobs run on a small pool instead of the single local worker, so
+/// one slow network transfer cannot block another.
+const TRANSFER_LANE_WORKERS: usize = 2;
+
 /// Streamed transfers move data in chunks of this size.
 const TRANSFER_CHUNK: usize = 256 * 1024;
 
@@ -920,6 +983,12 @@ fn run_generic_transfer(
             return;
         }
     };
+    // A cancel that lands while queued or during dest resolution should
+    // skip the network pre-scan entirely, not just the transfer loop.
+    if job.cancel.load(Ordering::Relaxed) {
+        sink.job_finished(job.id, JobState::Cancelled, Vec::new());
+        return;
+    }
     let (items_total, bytes_total) = measure_via_router(router, sources);
     let mut ctx = JobContext {
         job_id: job.id,
@@ -2659,6 +2728,296 @@ mod tests {
         assert_eq!(state, JobState::Cancelled);
         assert!(!tmp.path().join("Archive.zip").exists());
         assert!(engine.undo_description().is_none());
+        engine.shutdown();
+    }
+
+    // -----------------------------------------------------------------
+    // Transfer lane
+    // -----------------------------------------------------------------
+
+    /// Trashes an item by parking on a channel until the test releases
+    /// it. Occupies the local lane's one worker so a test can prove a
+    /// remote job does not wait behind it.
+    struct BlockingTrash {
+        /// Fires once, the first time `trash_item` is entered.
+        arrived: Mutex<Option<Sender<()>>>,
+        release: Mutex<Receiver<()>>,
+    }
+
+    impl PlatformDelegate for BlockingTrash {
+        fn trash_item(&self, _path: &Path) -> Result<PathBuf, String> {
+            if let Some(tx) = self.arrived.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+            let _ = self.release.lock().unwrap().recv();
+            Ok(PathBuf::from("/dev/null"))
+        }
+    }
+
+    /// Signals arrival once, then blocks until the test sends a release.
+    /// Backs [`GateBackend::open_read`] so a test can hold a transfer
+    /// mid-stream and control exactly when it completes.
+    struct GateReader {
+        arrived: Option<Sender<()>>,
+        release: Arc<Mutex<Receiver<()>>>,
+    }
+
+    impl std::io::Read for GateReader {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            if let Some(tx) = self.arrived.take() {
+                let _ = tx.send(());
+            }
+            let _ = self.release.lock().unwrap().recv();
+            Ok(0)
+        }
+    }
+
+    /// Minimal remote backend for concurrency tests. `stat` reports a
+    /// small file for every registered path; `open_read` gates on a
+    /// channel. The other methods are stubs that these tests never call.
+    struct GateBackend {
+        gates: Mutex<HashMap<String, (Sender<()>, Arc<Mutex<Receiver<()>>>)>>,
+    }
+
+    impl crate::vfs::FsBackend for GateBackend {
+        fn capabilities(&self) -> crate::vfs::Capabilities {
+            crate::vfs::Capabilities::none()
+        }
+        fn list_dir(
+            &self,
+            _path: &str,
+            _opts: &crate::ListOptions,
+        ) -> Result<Vec<crate::Entry>, String> {
+            Err("not supported".to_string())
+        }
+        fn stat(&self, path: &str) -> Result<crate::Entry, String> {
+            if self.gates.lock().unwrap().contains_key(path) {
+                Ok(crate::Entry {
+                    name: path.trim_start_matches('/').to_string(),
+                    path: path.to_string(),
+                    is_dir: false,
+                    size: 0,
+                    modified_ms: 0,
+                    is_hidden: false,
+                    is_symlink: false,
+                })
+            } else {
+                Err("not found".to_string())
+            }
+        }
+        fn open_read(&self, path: &str) -> Result<Box<dyn std::io::Read + Send>, String> {
+            let (arrived, release) = self
+                .gates
+                .lock()
+                .unwrap()
+                .get(path)
+                .cloned()
+                .ok_or_else(|| "not found".to_string())?;
+            Ok(Box::new(GateReader {
+                arrived: Some(arrived),
+                release,
+            }))
+        }
+        fn create_write(
+            &self,
+            _path: &str,
+            _size_hint: Option<u64>,
+        ) -> Result<Box<dyn crate::vfs::WriteFinish>, String> {
+            Err("not supported".to_string())
+        }
+        fn delete(&self, _path: &str, _recursive: bool) -> Result<(), String> {
+            Ok(())
+        }
+        fn rename(&self, _from: &str, _to: &str) -> Result<(), String> {
+            Err("not supported".to_string())
+        }
+        fn mkdir(&self, _path: &str) -> Result<(), String> {
+            Err("not supported".to_string())
+        }
+    }
+
+    #[test]
+    fn remote_job_bypasses_a_blocked_local_lane() {
+        let trash = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let (occupy_tx, occupy_rx) = channel::<()>();
+        let (release_tx, release_rx) = channel::<()>();
+        let delegate = Arc::new(BlockingTrash {
+            arrived: Mutex::new(Some(occupy_tx)),
+            release: Mutex::new(release_rx),
+        });
+        let (tx, rx) = channel();
+        let sink = Arc::new(TestSink {
+            finished: Mutex::new(tx),
+            on_first_progress: Mutex::new(None),
+        });
+        let engine = OpsEngine::new(sink, delegate);
+
+        // Occupies the local lane's only worker; it stays parked until
+        // this test releases it below.
+        let occupy_job = engine.trash(vec![trash.path().join("occupy.txt")]);
+        occupy_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("trash job did not start");
+
+        // An unknown connection fails fast. The result is meaningful only
+        // when the job runs while the local lane is still blocked.
+        let remote_job = engine.copy(
+            vec![PathBuf::from("sftp://nowhere/x")],
+            dest.path().to_path_buf(),
+        );
+        let (_, state, errors) = wait(&rx, remote_job);
+        assert_eq!(state, JobState::Failed);
+        assert!(
+            errors[0].message.contains("unknown connection"),
+            "unexpected error: {:?}",
+            errors[0]
+        );
+
+        release_tx.send(()).unwrap();
+        let (_, occupy_state, _) = wait(&rx, occupy_job);
+        assert_eq!(occupy_state, JobState::Done);
+        engine.shutdown();
+    }
+
+    #[test]
+    fn queued_job_cancelled_before_running_finishes_cancelled() {
+        let trash = tempfile::tempdir().unwrap();
+        let src_dir = tempfile::tempdir().unwrap();
+        let dest_dir = tempfile::tempdir().unwrap();
+        let src_file = src_dir.path().join("a.txt");
+        std::fs::write(&src_file, b"alpha").unwrap();
+
+        let (occupy_tx, occupy_rx) = channel::<()>();
+        let (release_tx, release_rx) = channel::<()>();
+        let delegate = Arc::new(BlockingTrash {
+            arrived: Mutex::new(Some(occupy_tx)),
+            release: Mutex::new(release_rx),
+        });
+        let (tx, rx) = channel();
+        let sink = Arc::new(TestSink {
+            finished: Mutex::new(tx),
+            on_first_progress: Mutex::new(None),
+        });
+        let engine = OpsEngine::new(sink, delegate);
+
+        let occupy_job = engine.trash(vec![trash.path().join("occupy.txt")]);
+        occupy_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("occupy job did not start");
+
+        // The local lane's one worker is busy, so this copy is still
+        // sitting in the queue when we cancel it.
+        let copy_job = engine.copy(vec![src_file], dest_dir.path().to_path_buf());
+        engine.cancel(copy_job);
+
+        release_tx.send(()).unwrap();
+        let (_, occupy_state, _) = wait(&rx, occupy_job);
+        assert_eq!(occupy_state, JobState::Done);
+
+        let (_, state, _) = wait(&rx, copy_job);
+        assert_eq!(state, JobState::Cancelled);
+        assert!(!dest_dir.path().join("a.txt").exists());
+        engine.shutdown();
+    }
+
+    #[test]
+    fn transfer_lane_runs_two_remote_jobs_at_once() {
+        let trash = tempfile::tempdir().unwrap();
+        let dest_dir = tempfile::tempdir().unwrap();
+        let (engine, rx) = engine(trash.path());
+
+        let mut gates = HashMap::new();
+        let mut arrivals = HashMap::new();
+        let mut releases = HashMap::new();
+        for name in ["a", "b", "c"] {
+            let (arrived_tx, arrived_rx) = channel::<()>();
+            let (release_tx, release_rx) = channel::<()>();
+            gates.insert(
+                format!("/{name}"),
+                (arrived_tx, Arc::new(Mutex::new(release_rx))),
+            );
+            arrivals.insert(name, arrived_rx);
+            releases.insert(name, release_tx);
+        }
+        let backend = Arc::new(GateBackend {
+            gates: Mutex::new(gates),
+        });
+        engine.router().register("fake".to_string(), backend);
+
+        let job_a = engine.copy(
+            vec![PathBuf::from("sftp://fake/a")],
+            dest_dir.path().to_path_buf(),
+        );
+        let job_b = engine.copy(
+            vec![PathBuf::from("sftp://fake/b")],
+            dest_dir.path().to_path_buf(),
+        );
+
+        // Both readers must reach the gate before either is released:
+        // proof the two jobs run at the same time, not back to back.
+        arrivals["a"]
+            .recv_timeout(Duration::from_secs(5))
+            .expect("job a did not arrive");
+        arrivals["b"]
+            .recv_timeout(Duration::from_secs(5))
+            .expect("job b did not arrive");
+
+        let job_c = engine.copy(
+            vec![PathBuf::from("sftp://fake/c")],
+            dest_dir.path().to_path_buf(),
+        );
+        // The lane is capped at TRANSFER_LANE_WORKERS: a third job must
+        // wait for a slot instead of starting immediately.
+        assert!(
+            arrivals["c"]
+                .recv_timeout(Duration::from_millis(200))
+                .is_err(),
+            "a third job started before a slot freed up"
+        );
+
+        releases["a"].send(()).unwrap();
+        let (_, state_a, errors_a) = wait(&rx, job_a);
+        assert_eq!(state_a, JobState::Done, "errors: {errors_a:?}");
+
+        arrivals["c"]
+            .recv_timeout(Duration::from_secs(5))
+            .expect("job c did not arrive after a slot freed up");
+
+        releases["b"].send(()).unwrap();
+        let (_, state_b, errors_b) = wait(&rx, job_b);
+        assert_eq!(state_b, JobState::Done, "errors: {errors_b:?}");
+
+        releases["c"].send(()).unwrap();
+        let (_, state_c, errors_c) = wait(&rx, job_c);
+        assert_eq!(state_c, JobState::Done, "errors: {errors_c:?}");
+
+        engine.shutdown();
+    }
+
+    #[test]
+    fn finished_jobs_release_their_cancel_flags() {
+        let trash = tempfile::tempdir().unwrap();
+        let src_dir = tempfile::tempdir().unwrap();
+        let dest_dir = tempfile::tempdir().unwrap();
+        let src_file = src_dir.path().join("a.txt");
+        std::fs::write(&src_file, b"alpha").unwrap();
+        let (engine, rx) = engine(trash.path());
+
+        let job = engine.copy(vec![src_file], dest_dir.path().to_path_buf());
+        let (_, state, errors) = wait(&rx, job);
+        assert_eq!(state, JobState::Done, "errors: {errors:?}");
+
+        // Pruning happens just after the finished event is sent, so poll
+        // instead of asserting immediately after `wait` returns.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if engine.cancel_flags.lock().unwrap().is_empty() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "cancel flag was never pruned");
+            std::thread::sleep(Duration::from_millis(10));
+        }
         engine.shutdown();
     }
 }
