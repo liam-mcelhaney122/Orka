@@ -118,6 +118,16 @@ struct MainWindowView: View {
                         .padding(.vertical, 10)
                         .padding(
                             .trailing, window.showingGitGraph ? 0 : 10)
+                        .dropDestination(for: URL.self) { urls, _ in
+                            let sources = urls.filter(\.isFileURL).map(\.path)
+                            guard !sources.isEmpty else { return false }
+                            model.transfer(
+                                sources: sources,
+                                to: pane.directory.path,
+                                move: false,
+                                in: window)
+                            return true
+                        }
                         if window.showingGitGraph {
                             panelDivider(available: geo.size.width)
                             GitGraphPanel(
@@ -176,6 +186,30 @@ struct MainWindowView: View {
         } message: {
             Text("Every item in the Trash deletes permanently. There is no undo.")
         }
+        .confirmationDialog(
+            window.transferConflict.map {
+                "An item named \($0.name) already exists."
+            } ?? "File conflict",
+            isPresented: Binding(
+                get: { window.transferConflict != nil },
+                set: { if !$0 { window.finishTransferConflict() } }),
+            titleVisibility: .visible
+        ) {
+            Button("Replace", role: .destructive) {
+                resolveCurrentConflict(as: .replace)
+            }
+            Button("Keep Both") {
+                resolveCurrentConflict(as: .keepBoth)
+            }
+            Button("Skip", role: .cancel) {
+                window.finishTransferConflict()
+            }
+        } message: {
+            if let conflict = window.transferConflict {
+                Text(
+                    "Incoming: \(conflict.source)\nExisting: \(conflict.destination)")
+            }
+        }
         // The gate covers every pane and the chrome, so nothing is
         // clickable until macOS grants Full Disk Access.
         .overlay {
@@ -187,6 +221,12 @@ struct MainWindowView: View {
         .onAppear {
             pane.directory.reload(showHidden: model.showHidden)
         }
+    }
+
+    private func resolveCurrentConflict(as resolution: ConflictResolution) {
+        guard let conflict = window.transferConflict else { return }
+        model.resolveTransferConflict(conflict, as: resolution)
+        window.finishTransferConflict()
     }
 
     /// Draggable splitter between the sidebar and the file pane.
