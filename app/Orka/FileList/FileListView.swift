@@ -638,6 +638,34 @@ final class FileListCoordinator: NSObject, @preconcurrency NSFilePromiseProvider
     @objc private func contextAddToFavorites() {
         for entry in targetEntries() { model.addFavorite(entry.path) }
     }
+
+    @objc private func contextUploadTo() {
+        window.uploadPickerTarget = UploadTarget(
+            sources: targetEntries().map(\.path))
+    }
+
+    @objc private func contextDownloadToDownloads() {
+        let downloads = FileManager.default.urls(
+            for: .downloadsDirectory, in: .userDomainMask).first?.path
+            ?? NSHomeDirectory()
+        model.downloadItems(targetEntries().map(\.path), to: downloads)
+    }
+
+    @objc private func contextDownload() {
+        // Capture the targets before the panel opens; the selection can
+        // change while the sheet is up.
+        let paths = targetEntries().map(\.path)
+        guard let window = tableView.window else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.prompt = "Download"
+        panel.beginSheetModal(for: window) { [weak self] response in
+            guard response == .OK, let url = panel.url else { return }
+            self?.model.downloadItems(paths, to: url.path)
+        }
+    }
 }
 
 // MARK: - Data source & drag and drop
@@ -1143,6 +1171,10 @@ extension FileListCoordinator: NSMenuDelegate {
             menu.addItem(.separator())
             menu.addItem(makeItem("Cut", action: #selector(contextCut)))
             menu.addItem(makeItem("Copy", action: #selector(contextCopy)))
+            if !model.connectionStore.connections.isEmpty {
+                menu.addItem(makeItem(
+                    "Upload to…", action: #selector(contextUploadTo)))
+            }
         }
         if model.canPaste {
             menu.addItem(makeItem("Paste", action: #selector(contextPaste)))
@@ -1276,6 +1308,12 @@ extension FileListCoordinator: NSMenuDelegate {
             menu.addItem(makeItem(
                 "Copy Relative Path",
                 action: #selector(contextCopyRelativePath)))
+            menu.addItem(.separator())
+            menu.addItem(makeItem(
+                "Download to Downloads",
+                action: #selector(contextDownloadToDownloads)))
+            menu.addItem(makeItem(
+                "Download…", action: #selector(contextDownload)))
         }
         if model.canPaste {
             menu.addItem(makeItem("Paste", action: #selector(contextPaste)))

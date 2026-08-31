@@ -60,6 +60,9 @@ final class AppModel {
     private var jobCompletionHandlers: [UInt64: (JobState) -> Void] = [:]
     /// Recursive folder totals for the Size column.
     let folderSizes = FolderSizeCache()
+    /// Registry of every transfer job started by the app, for the
+    /// Transfers panel.
+    let transfers = TransferManager()
     /// Id of the live Get Info size request. Listing and status-bar
     /// requests live per window; the Get Info sheet keeps one global
     /// slot because it opens one sheet at a time.
@@ -113,6 +116,10 @@ final class AppModel {
         engine.setConnections(configs: connectionStore.toEngine())
         checkFullDiskAccess()
         RemotePromiseStager.sweepStaleStagingDirectories()
+        transfers.connectionName = { [weak self] id in
+            self?.connectionStore.connections
+                .first { $0.id == id }?.displayName ?? id
+        }
     }
 
     // MARK: Session persistence
@@ -421,9 +428,17 @@ final class AppModel {
         switch event {
         case .jobProgress(let progress):
             activeJobs[progress.jobId] = progress
+            _ = transfers.applyProgress(progress)
         case .jobFinished(let jobId, let state, let errors):
             activeJobs[jobId] = nil
-            lastJobErrors = errors
+            let handled = transfers.applyFinished(
+                jobId: jobId, state: state, errors: errors)
+            // A job the transfer registry knows keeps its errors on its
+            // own row; an unregistered job keeps today's status-bar
+            // behavior.
+            if !handled {
+                lastJobErrors = errors
+            }
             refreshJournal()
             if let handler = jobCompletionHandlers.removeValue(forKey: jobId) {
                 handler(state)
@@ -620,11 +635,9 @@ final class AppModel {
         let isCut = !cutPaths.isEmpty
             && pasteboard.changeCount == cutChangeCount
             && Set(sources) == cutPaths
+        startEngineTransfer(sources: sources, destDir: dest, move: isCut)
         if isCut {
-            _ = engine.moveItems(sources: sources, destDir: dest)
             cutPaths = []
-        } else {
-            _ = engine.copyItems(sources: sources, destDir: dest)
         }
     }
 
@@ -997,21 +1010,42 @@ final class AppModel {
         sources: [String], destDir: String, move: Bool
     ) {
         guard !sources.isEmpty else { return }
-        if move {
-            _ = engine.moveItems(sources: sources, destDir: destDir)
-        } else {
-            _ = engine.copyItems(sources: sources, destDir: destDir)
-        }
+        let jobId = move
+            ? engine.moveItems(sources: sources, destDir: destDir)
+            : engine.copyItems(sources: sources, destDir: destDir)
+        transfers.register(
+            jobId: jobId, sources: sources, destDir: destDir, move: move)
+    }
+
+    /// Downloads remote items into a local folder. Always a copy: a
+    /// remote source has no "move" the engine can perform across the
+    /// wire.
+    func downloadItems(_ paths: [String], to localDir: String) {
+        transfer(sources: paths, to: localDir, move: false, in: focusedWindow)
+    }
+
+    /// Uploads local items into a remote folder. Always a copy, for the
+    /// same reason as `downloadItems`.
+    func uploadItems(_ paths: [String], to remoteDir: String) {
+        transfer(
+            sources: paths, to: remoteDir, move: false, in: focusedWindow)
     }
 
     func resolveTransferConflict(
         _ conflict: TransferConflict, as resolution: ConflictResolution
     ) {
-        _ = engine.resolveLocalConflict(
+        let jobId = engine.resolveLocalConflict(
             source: conflict.source,
             destDir: conflict.destinationDirectory,
             isMove: conflict.move,
             resolution: resolution)
+        // Register the job so the item joins its drop's other items in
+        // the Transfers panel instead of erroring through the status bar.
+        transfers.register(
+            jobId: jobId,
+            sources: [conflict.source],
+            destDir: conflict.destinationDirectory,
+            move: conflict.move)
     }
 
     // MARK: Terminal
@@ -1042,6 +1076,13 @@ final class AppModel {
 struct InfoTarget: Identifiable {
     let path: String
     var id: String { path }
+}
+
+/// Identifiable wrapper so an upload's local sources can drive the
+/// upload picker sheet.
+struct UploadTarget: Identifiable {
+    let id = UUID()
+    let sources: [String]
 }
 
 struct TransferConflict: Identifiable {

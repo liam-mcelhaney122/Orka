@@ -86,6 +86,8 @@ final class WindowState: Identifiable {
 
     /// Non-nil shows the Get Info sheet for this path.
     var infoTarget: InfoTarget?
+    /// Non-nil shows the upload file picker sheet.
+    var uploadPickerTarget: UploadTarget?
     /// Non-nil shows the connection add/edit sheet.
     var editingConnection: ConnectionEditorTarget?
     /// Non-nil shows the permanent-delete confirmation for these paths.

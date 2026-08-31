@@ -33,6 +33,7 @@ targets:
     platform: macOS
     sources:
       - path: Orka/Model/OrkaPath.swift
+      - path: Orka/Model/TransferKind.swift
       - path: OrkaTests
     settings:
       base:

@@ -123,6 +123,18 @@ struct IconGridView: View {
             model.copyPaths(
                 Array(directory.selection), relative: true, in: window)
         }
+        Divider()
+        Button("Download to Downloads") {
+            selectForMenu(entry)
+            let downloads = FileManager.default.urls(
+                for: .downloadsDirectory, in: .userDomainMask).first?.path
+                ?? NSHomeDirectory()
+            model.downloadItems(Array(directory.selection), to: downloads)
+        }
+        Button("Download…") {
+            selectForMenu(entry)
+            presentDownloadPanel(for: Array(directory.selection))
+        }
         if model.canPaste {
             Button("Paste") { model.paste(in: window) }
         }
@@ -198,6 +210,13 @@ struct IconGridView: View {
             model.copyPaths(
                 Array(directory.selection), relative: true, in: window)
         }
+        if !model.connectionStore.connections.isEmpty {
+            Button("Upload to…") {
+                selectForMenu(entry)
+                window.uploadPickerTarget = UploadTarget(
+                    sources: Array(directory.selection))
+            }
+        }
         if model.canPaste {
             Button("Paste") { model.paste(in: window) }
         }
@@ -242,6 +261,27 @@ struct IconGridView: View {
         }
         if model.canPaste {
             Button("Paste") { model.paste(in: window) }
+        }
+    }
+
+    /// Downloads a remote selection to a folder the user chooses. Anchors
+    /// as a sheet on the key window when one exists, else runs standalone.
+    private func presentDownloadPanel(for paths: [String]) {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.prompt = "Download"
+        if let keyWindow = NSApp.keyWindow {
+            panel.beginSheetModal(for: keyWindow) { response in
+                guard response == .OK, let url = panel.url else { return }
+                model.downloadItems(paths, to: url.path)
+            }
+        } else {
+            panel.begin { response in
+                guard response == .OK, let url = panel.url else { return }
+                model.downloadItems(paths, to: url.path)
+            }
         }
     }
 

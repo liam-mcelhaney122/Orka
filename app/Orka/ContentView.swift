@@ -156,6 +156,9 @@ struct MainWindowView: View {
         .sheet(item: $window.editingConnection) { target in
             ConnectionEditorView(target: target)
         }
+        .sheet(item: $window.uploadPickerTarget) { target in
+            UploadPickerView(model: model, target: target)
+        }
         .confirmationDialog(
             deleteConfirmTitle,
             isPresented: Binding(
