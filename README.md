@@ -73,16 +73,27 @@ Finder remains the standard macOS file browser. Orka is for workflows that need 
 
 ## Install
 
-Orka requires macOS 26.
+Orka requires macOS 26. Releases are signed with a Developer ID certificate and notarized by Apple.
 
-1. Download and unzip the [latest release](https://github.com/liam-mcelhaney122/Orka/releases/latest). Move `Orka.app` to `/Applications`.
-2. The current build is not notarized. On first launch, right-click Orka and select **Open**. You can also clear the quarantine flag:
+### Homebrew
 
-   ```sh
-   xattr -dr com.apple.quarantine /Applications/Orka.app
-   ```
+```sh
+brew install --cask liam-mcelhaney122/tap/orka
+```
 
-3. Grant **Full Disk Access** when Orka asks for it. Orka needs this access for protected locations such as Trash. The app opens the correct System Settings page.
+Update to a new version with:
+
+```sh
+brew upgrade --cask orka
+```
+
+### Manual download
+
+Download and unzip the [latest release](https://github.com/liam-mcelhaney122/Orka/releases/latest). Move `Orka.app` to `/Applications`.
+
+### First launch
+
+Grant **Full Disk Access** when Orka asks for it. Orka needs this access for protected locations such as Trash. The app opens the correct System Settings page.
 
 ## Contribute and build
 
