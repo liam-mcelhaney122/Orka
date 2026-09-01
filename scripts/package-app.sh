@@ -15,6 +15,15 @@ DYLIB=liborka_ffi.dylib
 # An ad-hoc signature here would drop TCC grants on every build.
 SIGN_IDENTITY="${ORKA_SIGN_IDENTITY:-Apple Development}"
 
+# Notarization requires a secure timestamp and the hardened runtime on
+# every signature in the bundle, not only the outer app. Skip these for
+# local "Apple Development" builds: they slow down the sign step and
+# are not needed for a build that never leaves this Mac.
+CODESIGN_EXTRA_ARGS=""
+if [ "$SIGN_IDENTITY" != "Apple Development" ]; then
+  CODESIGN_EXTRA_ARGS="--options runtime --timestamp"
+fi
+
 # Find the absolute load path that the linker recorded.
 OLD_PATH=$(otool -L "$BIN" | awk "/$DYLIB/ {print \$1}")
 if [ -z "$OLD_PATH" ]; then
@@ -32,8 +41,8 @@ case "$OLD_PATH" in
     install_name_tool -id "@rpath/$DYLIB" "$FRAMEWORKS/$DYLIB"
     install_name_tool -change "$OLD_PATH" "@rpath/$DYLIB" "$BIN"
     # install_name_tool breaks the signature. Sign inside-out.
-    codesign --force --sign "$SIGN_IDENTITY" "$FRAMEWORKS/$DYLIB"
-    codesign --force --sign "$SIGN_IDENTITY" "$APP"
+    codesign --force --sign "$SIGN_IDENTITY" $CODESIGN_EXTRA_ARGS "$FRAMEWORKS/$DYLIB"
+    codesign --force --sign "$SIGN_IDENTITY" $CODESIGN_EXTRA_ARGS "$APP"
     ;;
 esac
 
