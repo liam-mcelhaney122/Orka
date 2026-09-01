@@ -14,7 +14,7 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::io::Read;
 use std::sync::mpsc::{self, Receiver, SyncSender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -22,6 +22,7 @@ use super::connections::{AuthMethod, BackendFactory, ConnectionConfig, SecretPro
 use super::http::{
     agent, error_string, is_ok, parse_rfc1123_to_ms, read_body_string, response_reader, url_encode,
 };
+use super::oauth::{self, Provider};
 use super::{Capabilities, FsBackend, WriteFinish};
 use crate::{Entry, ListOptions};
 
@@ -35,6 +36,7 @@ const CHANNEL_DEPTH: usize = 4;
 
 /// The HTTP verbs the ADLS REST surface needs. An enum keeps an
 /// unsupported method string out of the request path entirely.
+#[derive(Clone, Copy)]
 enum Method {
     Get,
     Put,
@@ -63,16 +65,24 @@ impl BackendFactory for AdlsFactory {
         config: &ConnectionConfig,
         secrets: Arc<dyn SecretProvider>,
     ) -> Result<Arc<dyn FsBackend>, String> {
-        let core = build_core(config, secrets.as_ref())?;
+        let core = build_core(config, secrets)?;
         Ok(Arc::new(AdlsBackend {
             core: Arc::new(core),
         }))
     }
 }
 
-/// Validates the config and resolves the account key. Everything that
-/// can fail without the network fails here, before any request.
-fn build_core(config: &ConnectionConfig, secrets: &dyn SecretProvider) -> Result<AdlsCore, String> {
+/// Validates the config and resolves the credential. Everything that
+/// can fail without the network fails here, before any request: a
+/// stored secret is fetched and decoded (SharedKey) or shape-checked
+/// (SasToken), and the service-principal and OAuth-app ids are
+/// checked for presence. The service-principal and OAuth-app token
+/// exchanges themselves stay lazy, on the first request, so a bad
+/// tenant or a down identity endpoint never fails a connect.
+fn build_core(
+    config: &ConnectionConfig,
+    secrets: Arc<dyn SecretProvider>,
+) -> Result<AdlsCore, String> {
     if config.host.is_empty() {
         return Err("adls host is empty; use the account endpoint, for example myaccount.dfs.core.windows.net".to_string());
     }
@@ -103,7 +113,53 @@ fn build_core(config: &ConnectionConfig, secrets: &dyn SecretProvider) -> Result
                 .ok_or_else(|| "no access token stored for this connection".to_string())?;
             AdlsCredential::Bearer(token.trim().to_string())
         }
-        _ => return Err("wrong auth method for adls; use SharedKey or an OAuth token".to_string()),
+        AuthMethod::SasToken => {
+            let raw = secrets
+                .get_secret(&config.id)
+                .ok_or_else(|| "no SAS token stored for this connection".to_string())?;
+            AdlsCredential::Sas(normalize_sas_token(&raw)?)
+        }
+        AuthMethod::ServicePrincipal {
+            tenant_id,
+            client_id,
+        } => {
+            if tenant_id.is_empty() || client_id.is_empty() {
+                return Err(
+                    "service-principal auth needs a tenant ID and a client ID".to_string(),
+                );
+            }
+            let client_secret = secrets
+                .get_secret(&config.id)
+                .ok_or_else(|| "no client secret stored for this connection".to_string())?;
+            AdlsCredential::ServicePrincipal {
+                tenant_id: tenant_id.clone(),
+                client_id: client_id.clone(),
+                client_secret: client_secret.trim().to_string(),
+                cache: Mutex::new(None),
+            }
+        }
+        AuthMethod::OAuthApp {
+            client_id,
+            tenant_id,
+        } => {
+            if tenant_id.is_empty() || client_id.is_empty() {
+                return Err("adls sign-in needs a tenant ID and a client ID".to_string());
+            }
+            if secrets.get_secret(&config.id).is_none() {
+                return Err("not signed in; use Sign In to authorize this connection".to_string());
+            }
+            AdlsCredential::OAuthApp {
+                tenant_id: tenant_id.clone(),
+                client_id: client_id.clone(),
+                connection_id: config.id.clone(),
+                secrets: secrets.clone(),
+                cache: Mutex::new(None),
+            }
+        }
+        _ => return Err(
+            "wrong auth method for adls; use account key, SAS token, service principal, sign-in, or a pasted token"
+                .to_string(),
+        ),
     };
     let account = config
         .host
@@ -120,12 +176,133 @@ fn build_core(config: &ConnectionConfig, secrets: &dyn SecretProvider) -> Result
     })
 }
 
-/// The secret that authorizes requests. SharedKey holds the decoded
-/// account key for HMAC signing. Bearer holds an OAuth access token
-/// sent as-is in the Authorization header.
+/// One bearer token fetched for a service-principal or OAuth-app
+/// credential, with the time it stops being safe to reuse.
+#[derive(Debug)]
+struct CachedToken {
+    access_token: String,
+    expires_at_ms: i64,
+}
+
+/// True when `expires_at_ms` is more than 60 seconds past `now_ms`,
+/// meaning the cached token is still safe to reuse. Pure so the
+/// refresh boundary is testable without a clock or a server.
+fn token_is_fresh(expires_at_ms: i64, now_ms: i64) -> bool {
+    expires_at_ms - now_ms > 60_000
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Strips a leading '?' and rejects a SAS token that is empty or
+/// carries no `key=value` pair. Runs before any network call so a
+/// pasted-wrong value fails immediately instead of as a confusing
+/// 403 from Azure.
+fn normalize_sas_token(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim().trim_start_matches('?').trim();
+    if trimmed.is_empty() {
+        return Err("SAS token is empty".to_string());
+    }
+    if !trimmed.contains('=') {
+        return Err(
+            "SAS token is malformed: expected a query string of 'key=value' pairs".to_string(),
+        );
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Appends a normalized SAS query string after a request URL's own
+/// query parameters, per the Azure SAS contract of signing the whole
+/// query string together.
+fn append_sas_query(url: &str, sas: &str) -> String {
+    if sas.is_empty() {
+        return url.to_string();
+    }
+    if url.contains('?') {
+        format!("{url}&{sas}")
+    } else {
+        format!("{url}?{sas}")
+    }
+}
+
+/// Exchanges a service-principal client secret for a bearer token via
+/// the OAuth2 client-credentials grant, scoped to Azure Storage.
+fn fetch_service_principal_token(
+    agent: &ureq::Agent,
+    tenant_id: &str,
+    client_id: &str,
+    client_secret: &str,
+) -> Result<CachedToken, String> {
+    let url = format!("https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token");
+    let response = agent
+        .post(&url)
+        .send_form(&[
+            ("grant_type", "client_credentials"),
+            ("client_id", client_id),
+            ("client_secret", client_secret),
+            ("scope", "https://storage.azure.com/.default"),
+        ])
+        .map_err(|e| format!("cannot get service-principal token: {}", error_string(e)))?;
+    let mut body = String::new();
+    response
+        .into_reader()
+        .read_to_string(&mut body)
+        .map_err(|e| format!("cannot read service-principal token response: {e}"))?;
+    parse_client_credentials_response(&body, now_ms())
+}
+
+/// Parses a client-credentials token response body. Pure over the
+/// response text and the current time, so both a well-formed response
+/// and a malformed one are testable without a server.
+fn parse_client_credentials_response(json: &str, now_ms: i64) -> Result<CachedToken, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| format!("cannot parse token response: {e}"))?;
+    let access_token = value
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "token response has no access_token".to_string())?;
+    let expires_in = value
+        .get("expires_in")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(3600);
+    Ok(CachedToken {
+        access_token: access_token.to_string(),
+        expires_at_ms: now_ms + expires_in * 1000,
+    })
+}
+
+/// The secret that authorizes requests.
 enum AdlsCredential {
+    /// Decoded account key, for HMAC signing.
     SharedKey(Vec<u8>),
+    /// A pasted OAuth access token, sent as-is (legacy).
     Bearer(String),
+    /// A SAS query string (no leading '?'), appended to every request
+    /// URL. No Authorization header is sent.
+    Sas(String),
+    /// Azure AD app-only auth. The bearer token is fetched lazily via
+    /// the client-credentials grant and cached until close to expiry.
+    ServicePrincipal {
+        tenant_id: String,
+        client_id: String,
+        client_secret: String,
+        cache: Mutex<Option<CachedToken>>,
+    },
+    /// An interactively-signed-in OAuth app. The bearer token comes
+    /// from [`oauth::ensure_fresh_token`], which reads and refreshes
+    /// the connection's stored token set; the result is cached here
+    /// too so a request does not re-resolve it needlessly.
+    OAuthApp {
+        tenant_id: String,
+        client_id: String,
+        connection_id: String,
+        secrets: Arc<dyn SecretProvider>,
+        cache: Mutex<Option<CachedToken>>,
+    },
 }
 
 /// Shared signing and HTTP state for one connection. The credential
@@ -176,10 +353,81 @@ impl AdlsCore {
         (url, sorted)
     }
 
-    /// Sends one signed request. `ms_headers` lists extra `x-ms-*`
-    /// headers; `x-ms-date` and `x-ms-version` are always added. A
-    /// body gets an explicit content type that matches the signature.
-    /// Only headers sent here are signed.
+    /// Resolves the bearer token for a service-principal credential,
+    /// reusing the cached one while it stays fresh.
+    fn service_principal_token(&self) -> Result<String, String> {
+        let AdlsCredential::ServicePrincipal {
+            tenant_id,
+            client_id,
+            client_secret,
+            cache,
+        } = &self.credential
+        else {
+            return Err("not a service-principal credential".to_string());
+        };
+        {
+            let guard = cache.lock().unwrap();
+            if let Some(cached) = guard.as_ref() {
+                if token_is_fresh(cached.expires_at_ms, now_ms()) {
+                    return Ok(cached.access_token.clone());
+                }
+            }
+        }
+        let fetched =
+            fetch_service_principal_token(&self.agent, tenant_id, client_id, client_secret)?;
+        let token = fetched.access_token.clone();
+        *cache.lock().unwrap() = Some(fetched);
+        Ok(token)
+    }
+
+    /// Resolves the bearer token for a signed-in OAuth-app credential.
+    /// `force` bypasses the cache and re-resolves through
+    /// [`oauth::ensure_fresh_token`]; a normal request only does that
+    /// when nothing is cached yet or the cache has aged out.
+    ///
+    /// [`oauth::ensure_fresh_token`] does its own expiry tracking
+    /// against the stored token set and does not report the real
+    /// expiry back here, so the cache below trusts its answer for a
+    /// fixed, short window rather than the token's true lifetime.
+    /// That can call it more often than the token strictly needs, but
+    /// never sends a request with a token the module itself would
+    /// already have refreshed.
+    fn oauth_app_token(&self, force: bool) -> Result<String, String> {
+        let AdlsCredential::OAuthApp {
+            tenant_id,
+            client_id,
+            connection_id,
+            secrets,
+            cache,
+        } = &self.credential
+        else {
+            return Err("not an OAuth-app credential".to_string());
+        };
+        if !force {
+            let guard = cache.lock().unwrap();
+            if let Some(cached) = guard.as_ref() {
+                if token_is_fresh(cached.expires_at_ms, now_ms()) {
+                    return Ok(cached.access_token.clone());
+                }
+            }
+        }
+        let provider = Provider::Azure {
+            tenant_id: tenant_id.clone(),
+        };
+        let token =
+            oauth::ensure_fresh_token(provider, client_id, connection_id, secrets.as_ref())?;
+        *cache.lock().unwrap() = Some(CachedToken {
+            access_token: token.clone(),
+            expires_at_ms: now_ms() + 60_000,
+        });
+        Ok(token)
+    }
+
+    /// Sends one signed request, retrying once with a forced token
+    /// refresh when an OAuth-app request comes back `401`: the cached
+    /// token could have been revoked or the client clock could be
+    /// behind, and [`oauth::ensure_fresh_token`] may know better than
+    /// the local cache does.
     fn request(
         &self,
         method: Method,
@@ -187,8 +435,38 @@ impl AdlsCore {
         params: &[(String, String)],
         ms_headers: &[(&str, String)],
         body: Option<&[u8]>,
-    ) -> Result<ureq::Response, Box<ureq::Error>> {
-        let (url, sorted_params) = self.request_url(path, params);
+    ) -> Result<ureq::Response, ReqError> {
+        let result = self.request_once(method, path, params, ms_headers, body);
+        match result {
+            Err(ReqError::Http(boxed))
+                if matches!(*boxed, ureq::Error::Status(401, _))
+                    && matches!(self.credential, AdlsCredential::OAuthApp { .. }) =>
+            {
+                self.oauth_app_token(true).map_err(ReqError::Auth)?;
+                self.request_once(method, path, params, ms_headers, body)
+            }
+            other => other,
+        }
+    }
+
+    /// Sends one signed request. `ms_headers` lists extra `x-ms-*`
+    /// headers; `x-ms-date` and `x-ms-version` are always added. A
+    /// body gets an explicit content type that matches the signature.
+    /// Only headers sent here are signed. A SAS credential appends its
+    /// query string after the request's own and sends no Authorization
+    /// header at all.
+    fn request_once(
+        &self,
+        method: Method,
+        path: &str,
+        params: &[(String, String)],
+        ms_headers: &[(&str, String)],
+        body: Option<&[u8]>,
+    ) -> Result<ureq::Response, ReqError> {
+        let (mut url, sorted_params) = self.request_url(path, params);
+        if let AdlsCredential::Sas(sas) = &self.credential {
+            url = append_sas_query(&url, sas);
+        }
         let date = now_rfc1123();
         let content_type = body.map(|_| "application/octet-stream".to_string());
         let mut all_ms: Vec<(String, String)> = vec![
@@ -198,7 +476,7 @@ impl AdlsCore {
         for (name, value) in ms_headers {
             all_ms.push((name.to_string(), value.clone()));
         }
-        let auth = match &self.credential {
+        let auth: Option<String> = match &self.credential {
             AdlsCredential::SharedKey(key) => {
                 let resource =
                     canonicalized_resource(&self.account, &self.filesystem, path, &sorted_params);
@@ -210,11 +488,26 @@ impl AdlsCore {
                     &all_ms,
                     &resource,
                 );
-                format!("SharedKey {}:{}", self.account, signature_b64(key, &sts))
+                Some(format!(
+                    "SharedKey {}:{}",
+                    self.account,
+                    signature_b64(key, &sts)
+                ))
             }
             // Bearer requests need no signature. Azure still requires
             // `x-ms-version`, which `all_ms` already carries.
-            AdlsCredential::Bearer(token) => format!("Bearer {token}"),
+            AdlsCredential::Bearer(token) => Some(format!("Bearer {token}")),
+            // A SAS token authorizes through its own query parameters;
+            // no Authorization header goes on the wire.
+            AdlsCredential::Sas(_) => None,
+            AdlsCredential::ServicePrincipal { .. } => Some(format!(
+                "Bearer {}",
+                self.service_principal_token().map_err(ReqError::Auth)?
+            )),
+            AdlsCredential::OAuthApp { .. } => Some(format!(
+                "Bearer {}",
+                self.oauth_app_token(false).map_err(ReqError::Auth)?
+            )),
         };
         let mut req = match method {
             Method::Get => self.agent.get(&url),
@@ -228,10 +521,14 @@ impl AdlsCore {
         if let Some(ct) = &content_type {
             req = req.set("Content-Type", ct);
         }
-        req = req.set("Authorization", &auth);
+        if let Some(auth) = &auth {
+            req = req.set("Authorization", auth);
+        }
         match body {
-            Some(bytes) => req.send_bytes(bytes).map_err(Box::new),
-            None => req.call().map_err(Box::new),
+            Some(bytes) => req
+                .send_bytes(bytes)
+                .map_err(|e| ReqError::Http(Box::new(e))),
+            None => req.call().map_err(|e| ReqError::Http(Box::new(e))),
         }
     }
 
@@ -260,7 +557,7 @@ impl AdlsCore {
         };
         let response = self
             .request(Method::Get, "", &params, &[], None)
-            .map_err(|e| request_error("cannot list", &display, *e))?;
+            .map_err(|e| request_error("cannot list", &display, e))?;
         let token = response.header("x-ms-continuation").map(|t| t.to_string());
         let mut body = String::new();
         response
@@ -275,7 +572,7 @@ impl AdlsCore {
     fn append(&self, path: &str, chunk: &[u8]) -> Result<(), String> {
         let params = vec![("action".to_string(), "append".to_string())];
         self.request(Method::Patch, path, &params, &[], Some(chunk))
-            .map_err(|e| request_error("cannot append to", path, *e))
+            .map_err(|e| request_error("cannot append to", path, e))
             .map(|_| ())
     }
 
@@ -288,17 +585,27 @@ impl AdlsCore {
             ("close".to_string(), "true".to_string()),
         ];
         self.request(Method::Patch, path, &params, &[], Some(&[]))
-            .map_err(|e| request_error("cannot flush", path, *e))
+            .map_err(|e| request_error("cannot flush", path, e))
             .map(|_| ())
     }
 }
 
+/// A request failure: either the HTTP call itself, or resolving the
+/// credential for it (a service-principal or OAuth-app token fetch).
+enum ReqError {
+    Http(Box<ureq::Error>),
+    Auth(String),
+}
+
 /// Flattens a request failure for `path`. A 404 reads as "not found"
 /// so callers can match it the way local ops errors are matched.
-fn request_error(action: &str, path: &str, e: ureq::Error) -> String {
+fn request_error(action: &str, path: &str, e: ReqError) -> String {
     match e {
-        ureq::Error::Status(404, _) => format!("{path}: not found"),
-        other => format!("{action} {path}: {}", error_string(other)),
+        ReqError::Http(boxed) => match *boxed {
+            ureq::Error::Status(404, _) => format!("{path}: not found"),
+            other => format!("{action} {path}: {}", error_string(other)),
+        },
+        ReqError::Auth(message) => format!("{action} {path}: {message}"),
     }
 }
 
@@ -580,7 +887,7 @@ impl FsBackend for AdlsBackend {
         let response = self
             .core
             .request(Method::Get, &normalized, &params, &[], None)
-            .map_err(|e| request_error("cannot stat", &normalized, *e))?;
+            .map_err(|e| request_error("cannot stat", &normalized, e))?;
         let mut body = String::new();
         response
             .into_reader()
@@ -618,7 +925,7 @@ impl FsBackend for AdlsBackend {
         let response = self
             .core
             .request(Method::Get, &normalized, &[], &[], None)
-            .map_err(|e| request_error("cannot open", &normalized, *e))?;
+            .map_err(|e| request_error("cannot open", &normalized, e))?;
         Ok(response_reader(response))
     }
 
@@ -651,7 +958,7 @@ impl FsBackend for AdlsBackend {
         let params = vec![("recursive".to_string(), recursive.to_string())];
         self.core
             .request(Method::Delete, &normalized, &params, &[], None)
-            .map_err(|e| request_error("cannot delete", &normalized, *e))
+            .map_err(|e| request_error("cannot delete", &normalized, e))
             .map(|_| ())
     }
 
@@ -666,10 +973,11 @@ impl FsBackend for AdlsBackend {
         let params = vec![("action".to_string(), "getStatus".to_string())];
         let status = match self.core.request(Method::Get, &dest, &params, &[], None) {
             Ok(response) => response.status(),
-            Err(boxed) => match *boxed {
+            Err(ReqError::Http(boxed)) => match *boxed {
                 ureq::Error::Status(status, _) => status,
                 e => return Err(format!("cannot rename {from}: {}", error_string(e))),
             },
+            Err(ReqError::Auth(message)) => return Err(format!("cannot rename {from}: {message}")),
         };
         if rename_dest_exists(status)? {
             return Err(format!("an item with this name already exists: {to}"));
@@ -679,7 +987,7 @@ impl FsBackend for AdlsBackend {
         let params = vec![("action".to_string(), "rename".to_string())];
         self.core
             .request(Method::Put, &dest, &params, &ms_headers, None)
-            .map_err(|e| request_error("cannot rename", &dest, *e))
+            .map_err(|e| request_error("cannot rename", &dest, e))
             .map(|_| ())
     }
 
@@ -694,13 +1002,14 @@ impl FsBackend for AdlsBackend {
             .request(Method::Put, &normalized, &params, &[], None)
         {
             Ok(_) => Ok(()),
-            Err(boxed) => match *boxed {
+            Err(ReqError::Http(boxed)) => match *boxed {
                 ureq::Error::Status(status, response) => {
                     let body = read_body_string(response);
                     mkdir_result(status, &body)
                 }
                 e => Err(format!("cannot create {normalized}: {}", error_string(e))),
             },
+            Err(ReqError::Auth(message)) => Err(format!("cannot create {normalized}: {message}")),
         }
     }
 }
@@ -860,6 +1169,14 @@ mod tests {
         fn get_secret(&self, _connection_id: &str) -> Option<String> {
             None
         }
+    }
+
+    fn static_secret(value: &'static str) -> Arc<dyn SecretProvider> {
+        Arc::new(StaticSecrets(value))
+    }
+
+    fn no_secret() -> Arc<dyn SecretProvider> {
+        Arc::new(NoSecrets)
     }
 
     fn config(auth: AuthMethod) -> ConnectionConfig {
@@ -1142,16 +1459,33 @@ mod tests {
         let not_found =
             ureq::Error::Status(404, ureq::Response::new(404, "Not Found", "").unwrap());
         assert_eq!(
-            request_error("cannot stat", "/missing", not_found),
+            request_error(
+                "cannot stat",
+                "/missing",
+                ReqError::Http(Box::new(not_found))
+            ),
             "/missing: not found"
         );
         let server_error = ureq::Error::Status(
             500,
             ureq::Response::new(500, "Server Error", "boom").unwrap(),
         );
-        let message = request_error("cannot stat", "/x", server_error);
+        let message = request_error("cannot stat", "/x", ReqError::Http(Box::new(server_error)));
         assert!(message.contains("HTTP 500"), "got: {message}");
         assert!(message.contains("boom"), "got: {message}");
+    }
+
+    #[test]
+    fn request_error_reports_auth_failures_without_an_http_status() {
+        let message = request_error(
+            "cannot list",
+            "/x",
+            ReqError::Auth("cannot get service-principal token: timed out".to_string()),
+        );
+        assert_eq!(
+            message,
+            "cannot list /x: cannot get service-principal token: timed out"
+        );
     }
 
     #[test]
@@ -1236,7 +1570,7 @@ mod tests {
 
     #[test]
     fn factory_rejects_missing_key_before_network() {
-        let err = build_core(&config(AuthMethod::SharedKey), &NoSecrets)
+        let err = build_core(&config(AuthMethod::SharedKey), no_secret())
             .err()
             .expect("must fail");
         assert!(
@@ -1247,18 +1581,18 @@ mod tests {
 
     #[test]
     fn factory_accepts_oauth_token() {
-        let core = build_core(&config(AuthMethod::OAuthToken), &StaticSecrets("tok"))
+        let core = build_core(&config(AuthMethod::OAuthToken), static_secret("tok"))
             .expect("must succeed offline");
         // The token is stored as-is; it is not base64.
         match core.credential {
             AdlsCredential::Bearer(token) => assert_eq!(token, "tok"),
-            AdlsCredential::SharedKey(_) => panic!("expected a Bearer credential"),
+            _ => panic!("expected a Bearer credential"),
         }
     }
 
     #[test]
     fn factory_rejects_oauth_without_stored_token() {
-        let err = build_core(&config(AuthMethod::OAuthToken), &NoSecrets)
+        let err = build_core(&config(AuthMethod::OAuthToken), no_secret())
             .err()
             .expect("must fail");
         assert!(
@@ -1269,7 +1603,7 @@ mod tests {
 
     #[test]
     fn factory_rejects_other_auth_methods() {
-        let err = build_core(&config(AuthMethod::Password), &StaticSecrets("pw"))
+        let err = build_core(&config(AuthMethod::Password), static_secret("pw"))
             .err()
             .expect("must fail");
         assert!(err.contains("wrong auth method"), "got: {err}");
@@ -1279,13 +1613,13 @@ mod tests {
     fn factory_rejects_bad_host() {
         let mut cfg = config(AuthMethod::SharedKey);
         cfg.host = String::new();
-        let err = build_core(&cfg, &StaticSecrets("a2V5"))
+        let err = build_core(&cfg, static_secret("a2V5"))
             .err()
             .expect("must fail");
         assert!(err.contains("host is empty"), "got: {err}");
 
         cfg.host = "https://myaccount.dfs.core.windows.net".to_string();
-        let err = build_core(&cfg, &StaticSecrets("a2V5"))
+        let err = build_core(&cfg, static_secret("a2V5"))
             .err()
             .expect("must fail");
         assert!(err.contains("must not contain a scheme"), "got: {err}");
@@ -1294,7 +1628,7 @@ mod tests {
     #[test]
     fn factory_rejects_invalid_base64_key_without_leaking_it() {
         let secret = "not base64 !!!";
-        let err = build_core(&config(AuthMethod::SharedKey), &StaticSecrets(secret))
+        let err = build_core(&config(AuthMethod::SharedKey), static_secret(secret))
             .err()
             .expect("must fail");
         assert!(err.contains("not valid base64"), "got: {err}");
@@ -1303,14 +1637,14 @@ mod tests {
 
     #[test]
     fn factory_derives_account_and_filesystem_from_config() {
-        let core = build_core(&config(AuthMethod::SharedKey), &StaticSecrets("a2V5"))
+        let core = build_core(&config(AuthMethod::SharedKey), static_secret("a2V5"))
             .expect("must succeed offline");
         assert_eq!(core.account, "myaccount");
         assert_eq!(core.filesystem, "fs");
         // "a2V5" is base64 for "key"; the decoded bytes sign requests.
         match core.credential {
             AdlsCredential::SharedKey(key) => assert_eq!(key, b"key"),
-            AdlsCredential::Bearer(_) => panic!("expected a SharedKey credential"),
+            _ => panic!("expected a SharedKey credential"),
         }
     }
 
@@ -1319,5 +1653,243 @@ mod tests {
         let uri = join_uri(Scheme::Adls, "store", "/fs/dir");
         assert_eq!(uri, "adls://store/fs/dir");
         assert_eq!(VPath::parse(&uri).to_uri_string(), uri);
+    }
+
+    // --- SAS token: normalization, validation, and URL composition ---
+
+    #[test]
+    fn normalize_sas_token_strips_leading_question_mark() {
+        assert_eq!(
+            normalize_sas_token("?sv=2023&sig=abc").unwrap(),
+            "sv=2023&sig=abc"
+        );
+        assert_eq!(
+            normalize_sas_token("sv=2023&sig=abc").unwrap(),
+            "sv=2023&sig=abc"
+        );
+        assert_eq!(normalize_sas_token("  ?sv=2023  ").unwrap(), "sv=2023");
+    }
+
+    #[test]
+    fn normalize_sas_token_rejects_empty_or_malformed() {
+        let err = normalize_sas_token("").unwrap_err();
+        assert!(err.contains("empty"), "got: {err}");
+        let err = normalize_sas_token("   ").unwrap_err();
+        assert!(err.contains("empty"), "got: {err}");
+        let err = normalize_sas_token("?").unwrap_err();
+        assert!(err.contains("empty"), "got: {err}");
+        let err = normalize_sas_token("not-a-sas-token").unwrap_err();
+        assert!(err.contains("malformed"), "got: {err}");
+    }
+
+    #[test]
+    fn factory_rejects_bad_sas_token_before_network() {
+        let err = build_core(&config(AuthMethod::SasToken), static_secret("garbage"))
+            .err()
+            .expect("must fail");
+        assert!(err.contains("malformed"), "got: {err}");
+
+        let err = build_core(&config(AuthMethod::SasToken), no_secret())
+            .err()
+            .expect("must fail");
+        assert!(err.contains("no SAS token stored"), "got: {err}");
+    }
+
+    #[test]
+    fn factory_accepts_sas_token_and_strips_question_mark() {
+        let core = build_core(
+            &config(AuthMethod::SasToken),
+            static_secret("?sv=2023-11-03&sig=abc%3D"),
+        )
+        .expect("must succeed offline");
+        match core.credential {
+            AdlsCredential::Sas(sas) => assert_eq!(sas, "sv=2023-11-03&sig=abc%3D"),
+            _ => panic!("expected a Sas credential"),
+        }
+    }
+
+    #[test]
+    fn append_sas_query_goes_after_existing_query_parameters() {
+        assert_eq!(
+            append_sas_query("https://acct.dfs.core.windows.net/fs/a", "sv=1&sig=x"),
+            "https://acct.dfs.core.windows.net/fs/a?sv=1&sig=x"
+        );
+        assert_eq!(
+            append_sas_query(
+                "https://acct.dfs.core.windows.net/fs/a?resource=filesystem",
+                "sv=1&sig=x"
+            ),
+            "https://acct.dfs.core.windows.net/fs/a?resource=filesystem&sv=1&sig=x"
+        );
+        // An empty SAS string is a no-op, so a caller need not branch.
+        assert_eq!(
+            append_sas_query("https://acct.dfs.core.windows.net/fs/a", ""),
+            "https://acct.dfs.core.windows.net/fs/a"
+        );
+    }
+
+    // --- Token-cache expiry: pure functions ---
+
+    #[test]
+    fn token_is_fresh_holds_until_the_last_60_seconds() {
+        let now = 1_000_000_i64;
+        assert!(token_is_fresh(now + 61_000, now));
+        assert!(!token_is_fresh(now + 60_000, now));
+        assert!(!token_is_fresh(now + 1_000, now));
+        assert!(!token_is_fresh(now - 1, now));
+        assert!(!token_is_fresh(now, now));
+    }
+
+    #[test]
+    fn parse_client_credentials_response_reads_token_and_expiry() {
+        let json = r#"{"token_type":"Bearer","expires_in":3599,"access_token":"tok-123"}"#;
+        let cached = parse_client_credentials_response(json, 1_000_000).unwrap();
+        assert_eq!(cached.access_token, "tok-123");
+        assert_eq!(cached.expires_at_ms, 1_000_000 + 3_599_000);
+    }
+
+    #[test]
+    fn parse_client_credentials_response_defaults_expiry_when_absent() {
+        let json = r#"{"access_token":"tok-123"}"#;
+        let cached = parse_client_credentials_response(json, 1_000_000).unwrap();
+        assert_eq!(cached.expires_at_ms, 1_000_000 + 3_600_000);
+    }
+
+    #[test]
+    fn parse_client_credentials_response_rejects_missing_token() {
+        let err =
+            parse_client_credentials_response(r#"{"error":"invalid_client"}"#, 0).unwrap_err();
+        assert!(err.contains("access_token"), "got: {err}");
+        let err = parse_client_credentials_response("not json", 0).unwrap_err();
+        assert!(err.contains("cannot parse"), "got: {err}");
+    }
+
+    // --- Auth-method validation ---
+
+    #[test]
+    fn factory_rejects_service_principal_with_missing_ids() {
+        let err = build_core(
+            &config(AuthMethod::ServicePrincipal {
+                tenant_id: String::new(),
+                client_id: "client".to_string(),
+            }),
+            static_secret("shh"),
+        )
+        .err()
+        .expect("must fail");
+        assert!(err.contains("tenant ID"), "got: {err}");
+
+        let err = build_core(
+            &config(AuthMethod::ServicePrincipal {
+                tenant_id: "tenant".to_string(),
+                client_id: String::new(),
+            }),
+            static_secret("shh"),
+        )
+        .err()
+        .expect("must fail");
+        assert!(err.contains("client ID"), "got: {err}");
+    }
+
+    #[test]
+    fn factory_rejects_service_principal_without_stored_secret() {
+        let err = build_core(
+            &config(AuthMethod::ServicePrincipal {
+                tenant_id: "tenant".to_string(),
+                client_id: "client".to_string(),
+            }),
+            no_secret(),
+        )
+        .err()
+        .expect("must fail");
+        assert!(err.contains("no client secret stored"), "got: {err}");
+    }
+
+    #[test]
+    fn factory_accepts_service_principal_without_a_network_call() {
+        // Building the core must not fetch a token; only the ids and
+        // the stored secret are checked here.
+        let core = build_core(
+            &config(AuthMethod::ServicePrincipal {
+                tenant_id: "tenant".to_string(),
+                client_id: "client".to_string(),
+            }),
+            static_secret("shh"),
+        )
+        .expect("must succeed offline");
+        match core.credential {
+            AdlsCredential::ServicePrincipal {
+                tenant_id,
+                client_id,
+                client_secret,
+                ..
+            } => {
+                assert_eq!(tenant_id, "tenant");
+                assert_eq!(client_id, "client");
+                assert_eq!(client_secret, "shh");
+            }
+            _ => panic!("expected a ServicePrincipal credential"),
+        }
+    }
+
+    #[test]
+    fn factory_rejects_oauth_app_with_missing_ids() {
+        let err = build_core(
+            &config(AuthMethod::OAuthApp {
+                client_id: "client".to_string(),
+                tenant_id: String::new(),
+            }),
+            static_secret(r#"{"access_token":"a"}"#),
+        )
+        .err()
+        .expect("must fail");
+        assert!(err.contains("tenant ID"), "got: {err}");
+    }
+
+    #[test]
+    fn factory_rejects_oauth_app_before_sign_in() {
+        let err = build_core(
+            &config(AuthMethod::OAuthApp {
+                client_id: "client".to_string(),
+                tenant_id: "tenant".to_string(),
+            }),
+            no_secret(),
+        )
+        .err()
+        .expect("must fail");
+        assert!(err.contains("not signed in"), "got: {err}");
+    }
+
+    #[test]
+    fn factory_accepts_oauth_app_once_a_token_set_is_stored() {
+        let core = build_core(
+            &config(AuthMethod::OAuthApp {
+                client_id: "client".to_string(),
+                tenant_id: "tenant".to_string(),
+            }),
+            static_secret(r#"{"access_token":"a","refresh_token":null,"expires_at_ms":0,"client_secret":null}"#),
+        )
+        .expect("must succeed offline");
+        match core.credential {
+            AdlsCredential::OAuthApp {
+                tenant_id,
+                client_id,
+                connection_id,
+                ..
+            } => {
+                assert_eq!(tenant_id, "tenant");
+                assert_eq!(client_id, "client");
+                assert_eq!(connection_id, "test");
+            }
+            _ => panic!("expected an OAuthApp credential"),
+        }
+    }
+
+    #[test]
+    fn factory_rejects_unknown_auth_methods_for_adls() {
+        let err = build_core(&config(AuthMethod::SshAgent), static_secret("x"))
+            .err()
+            .expect("must fail");
+        assert!(err.contains("wrong auth method"), "got: {err}");
     }
 }
