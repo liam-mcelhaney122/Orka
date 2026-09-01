@@ -352,6 +352,14 @@ impl OrkaEngine {
             Arc::new(orka_core::vfs::sftp::SftpFactory::rsync()),
         );
         connections.register_factory(
+            orka_core::vfs::Scheme::S3,
+            Arc::new(orka_core::vfs::s3::S3Factory),
+        );
+        connections.register_factory(
+            orka_core::vfs::Scheme::Ftp,
+            Arc::new(orka_core::vfs::ftp::FtpFactory),
+        );
+        connections.register_factory(
             orka_core::vfs::Scheme::Smb,
             Arc::new(orka_core::vfs::mount::MountFactory),
         );
@@ -633,6 +641,9 @@ pub enum AuthMethod {
     /// Azure shared-key auth; the keychain secret is the base64
     /// account key.
     SharedKey,
+    /// No credentials: anonymous FTP, guest SMB, or a mount (NFS) whose
+    /// transport has no auth step at all.
+    None,
 }
 
 impl From<AuthMethod> for connections::AuthMethod {
@@ -645,6 +656,7 @@ impl From<AuthMethod> for connections::AuthMethod {
             AuthMethod::S3Keys => Self::S3Keys,
             AuthMethod::OAuthToken => Self::OAuthToken,
             AuthMethod::SharedKey => Self::SharedKey,
+            AuthMethod::None => Self::None,
         }
     }
 }

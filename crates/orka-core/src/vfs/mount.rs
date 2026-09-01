@@ -254,8 +254,13 @@ impl Drop for MountBackend {
 /// mount_smbfs has no stdin or secret-file interface; percent-encoding
 /// keeps special characters from splitting the URL. Error text never
 /// contains the secret.
+///
+/// `AuthMethod::None` always builds a guest URL and never looks at
+/// `secret`, even if a stale secret is still stored from an earlier
+/// `Password` config: switching a saved connection to No Auth must not
+/// silently keep authenticating with a leftover credential.
 fn build_smb_url(config: &ConnectionConfig, secret: Option<&str>) -> Result<String, String> {
-    if !matches!(config.auth, AuthMethod::Password) {
+    if !matches!(config.auth, AuthMethod::Password | AuthMethod::None) {
         return Err("wrong auth method for smb".to_string());
     }
     let (server, share) = config
@@ -264,6 +269,9 @@ fn build_smb_url(config: &ConnectionConfig, secret: Option<&str>) -> Result<Stri
         .ok_or_else(|| "share name required".to_string())?;
     if share.is_empty() {
         return Err("share name required".to_string());
+    }
+    if config.auth == AuthMethod::None {
+        return Ok(format!("//{server}/{share}"));
     }
     match secret {
         Some(password) if !password.is_empty() => Ok(format!(
@@ -419,6 +427,18 @@ mod tests {
         let config = smb_config("server/share", AuthMethod::Password);
         assert_eq!(build_smb_url(&config, None).unwrap(), "//server/share");
         assert_eq!(build_smb_url(&config, Some("")).unwrap(), "//server/share");
+    }
+
+    #[test]
+    fn smb_no_auth_is_guest_and_ignores_a_stale_secret() {
+        let config = smb_config("server/share", AuthMethod::None);
+        // A leftover secret from an earlier Password config must never
+        // reach the URL once the connection is set to No Auth.
+        assert_eq!(
+            build_smb_url(&config, Some("stale-password")).unwrap(),
+            "//server/share"
+        );
+        assert_eq!(build_smb_url(&config, None).unwrap(), "//server/share");
     }
 
     #[test]

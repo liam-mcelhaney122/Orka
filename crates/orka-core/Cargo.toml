@@ -12,6 +12,8 @@ nucleo-matcher = "0.3.1"
 # vendored-libgit2 compiles the C library in; no system dependency.
 git2 = { version = "0.21.0", default-features = false, features = ["vendored-libgit2"] }
 ssh2 = { version = "0.9.6", features = ["vendored-openssl"] }
+# FTP backend.
+suppaftp = { version = "6", default-features = false, features = ["rustls"] }
 # REST file-server backends (Dropbox, Google Drive, ADLS) and their JSON.
 ureq = { version = "2", features = ["json", "tls"] }
 serde = { version = "1", features = ["derive"] }

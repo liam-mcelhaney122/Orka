@@ -80,7 +80,8 @@ fn prepare_auth(
         AuthMethod::S3Profile { .. }
         | AuthMethod::S3Keys
         | AuthMethod::OAuthToken
-        | AuthMethod::SharedKey => Err("wrong auth method for sftp".to_string()),
+        | AuthMethod::SharedKey
+        | AuthMethod::None => Err("wrong auth method for sftp".to_string()),
     }
 }
 

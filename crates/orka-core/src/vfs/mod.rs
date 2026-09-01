@@ -9,10 +9,12 @@
 pub mod adls;
 pub mod connections;
 pub mod dropbox;
+pub mod ftp;
 pub mod gdrive;
 pub mod http;
 pub mod local;
 pub mod mount;
+pub mod s3;
 pub mod sftp;
 
 pub use local::LocalBackend;
