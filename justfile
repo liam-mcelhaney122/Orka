@@ -33,6 +33,7 @@ release: rust
 dist: release
     rm -rf "{{dist_app}}"
     ditto "{{derived_data}}/Build/Products/Release/Orka.app" "{{dist_app}}"
+    ./scripts/package-app.sh "{{dist_app}}"
     @echo "Built {{dist_app}}"
 
 # Build dist and relaunch the app from it.
