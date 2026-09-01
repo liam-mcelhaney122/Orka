@@ -81,7 +81,12 @@ fn prepare_auth(
         | AuthMethod::S3Profile { .. }
         | AuthMethod::S3Keys
         | AuthMethod::OAuthToken
-        | AuthMethod::SharedKey => Err("wrong auth method for ftp".to_string()),
+        | AuthMethod::SharedKey
+        | AuthMethod::SasToken
+        | AuthMethod::ServicePrincipal { .. }
+        | AuthMethod::OAuthApp { .. }
+        | AuthMethod::ServiceAccount
+        | AuthMethod::Kerberos => Err("wrong auth method for ftp".to_string()),
     }
 }
 
@@ -114,10 +119,24 @@ fn connect_session(config: &ConnectionConfig, secrets: &dyn SecretProvider) -> R
     Ok(stream)
 }
 
-/// Creates FTP backends for [`super::Scheme::Ftp`]. Plain FTP: the
-/// login and all data move in cleartext over the network.
+/// Creates FTP backends for [`super::Scheme::Ftp`] and
+/// [`super::Scheme::Ftps`]. Plain FTP (`tls: false`) sends the login
+/// and all data in cleartext. FTPS (`tls: true`) is not implemented
+/// yet: [`FtpFactory::connect`] fails immediately rather than falling
+/// back to plain FTP, so a connection never talks in the clear when
+/// the user asked for TLS.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct FtpFactory;
+pub struct FtpFactory {
+    tls: bool,
+}
+
+impl FtpFactory {
+    /// An FTPS factory. Port 990 means implicit TLS; any other port
+    /// means explicit `AUTH TLS` on the plain control connection.
+    pub fn tls() -> Self {
+        Self { tls: true }
+    }
+}
 
 impl BackendFactory for FtpFactory {
     fn connect(
@@ -125,6 +144,9 @@ impl BackendFactory for FtpFactory {
         config: &ConnectionConfig,
         secrets: Arc<dyn SecretProvider>,
     ) -> Result<Arc<dyn FsBackend>, String> {
+        if self.tls {
+            return Err("FTPS is not implemented yet".to_string());
+        }
         let stream = connect_session(config, secrets.as_ref())?;
         Ok(Arc::new(FtpBackend {
             inner: Mutex::new(stream),
@@ -698,7 +720,7 @@ mod tests {
         let mut cfg = config(AuthMethod::SshAgent);
         cfg.host = "host.invalid".to_string();
         let start = Instant::now();
-        let err = FtpFactory
+        let err = FtpFactory::default()
             .connect(&cfg, Arc::new(NoSecrets))
             .err()
             .expect("must fail");
@@ -711,7 +733,7 @@ mod tests {
         let mut cfg = config(AuthMethod::Password);
         cfg.host = "host.invalid".to_string();
         let start = Instant::now();
-        let err = FtpFactory
+        let err = FtpFactory::default()
             .connect(&cfg, Arc::new(NoSecrets))
             .err()
             .expect("must fail");
@@ -729,7 +751,7 @@ mod tests {
         let mut cfg = config(AuthMethod::None);
         cfg.port = port as u32;
         let start = Instant::now();
-        let err = FtpFactory
+        let err = FtpFactory::default()
             .connect(&cfg, Arc::new(NoSecrets))
             .err()
             .expect("must fail");

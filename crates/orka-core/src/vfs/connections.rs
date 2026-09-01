@@ -36,6 +36,9 @@ pub enum AuthMethod {
     S3Profile {
         profile: String,
     },
+    /// AWS access keys. The secret is the plain secret access key, or
+    /// JSON `{"secret_access_key","session_token"}` when a session
+    /// token is also needed. See [`super::secret::SecretFields`].
     S3Keys,
     /// Bearer token from the keychain. Dropbox, Google Drive, and
     /// OAuth-configured ADLS use it. The token comes from
@@ -44,8 +47,32 @@ pub enum AuthMethod {
     /// Azure Storage shared-key auth. The secret is the base64
     /// account key; the account name is the connection's host.
     SharedKey,
+    /// Azure ADLS Gen2 shared-access-signature auth. The secret is the
+    /// SAS query string, with or without a leading '?'.
+    SasToken,
+    /// Azure ADLS Gen2 service-principal auth. The secret is the
+    /// client secret.
+    ServicePrincipal {
+        tenant_id: String,
+        client_id: String,
+    },
+    /// An OAuth app the user signs in to interactively. Used by Google
+    /// Drive, Dropbox, and OAuth-configured ADLS; `tenant_id` is empty
+    /// except for ADLS. The secret is JSON encoding a
+    /// [`super::oauth::TokenSet`].
+    OAuthApp {
+        client_id: String,
+        tenant_id: String,
+    },
+    /// Google Drive service-account auth. The secret is the full
+    /// service-account JSON key file content.
+    ServiceAccount,
+    /// SMB or NFS auth using the signed-in user's existing ticket. No
+    /// secret.
+    Kerberos,
     /// No credentials: anonymous FTP, guest SMB, or a mount (NFS) whose
-    /// transport has no auth step at all.
+    /// transport has no auth step at all. Also unsigned (anonymous) S3
+    /// access.
     None,
 }
 
@@ -61,6 +88,11 @@ pub enum ConnectionState {
 /// Called on a connect worker thread and can block on user approval.
 pub trait SecretProvider: Send + Sync {
     fn get_secret(&self, connection_id: &str) -> Option<String>;
+
+    /// Stores a refreshed secret for a connection, for example a
+    /// renewed OAuth token set. Backends that never refresh a secret
+    /// need not override this; the default body does nothing.
+    fn set_secret(&self, _connection_id: &str, _value: &str) {}
 }
 
 /// Receives connection state transitions. Called from connect worker

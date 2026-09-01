@@ -198,6 +198,10 @@ pub trait PlatformDelegate: Send + Sync {
     /// Reads the secret for one connection from the keychain. None means
     /// no stored secret; password-based connects then fail.
     fn get_secret(&self, connection_id: String) -> Option<String>;
+
+    /// Stores a refreshed secret for one connection, for example a
+    /// renewed OAuth token set.
+    fn set_secret(&self, connection_id: String, value: String);
 }
 
 struct DelegateAdapter {
@@ -216,6 +220,11 @@ impl ops::PlatformDelegate for DelegateAdapter {
 impl connections::SecretProvider for DelegateAdapter {
     fn get_secret(&self, connection_id: &str) -> Option<String> {
         self.delegate.get_secret(connection_id.to_string())
+    }
+
+    fn set_secret(&self, connection_id: &str, value: &str) {
+        self.delegate
+            .set_secret(connection_id.to_string(), value.to_string());
     }
 }
 
@@ -357,7 +366,11 @@ impl OrkaEngine {
         );
         connections.register_factory(
             orka_core::vfs::Scheme::Ftp,
-            Arc::new(orka_core::vfs::ftp::FtpFactory),
+            Arc::new(orka_core::vfs::ftp::FtpFactory::default()),
+        );
+        connections.register_factory(
+            orka_core::vfs::Scheme::Ftps,
+            Arc::new(orka_core::vfs::ftp::FtpFactory::tls()),
         );
         connections.register_factory(
             orka_core::vfs::Scheme::Smb,
@@ -599,6 +612,7 @@ pub enum Scheme {
     Sftp,
     S3,
     Ftp,
+    Ftps,
     Smb,
     Nfs,
     Adls,
@@ -613,6 +627,7 @@ impl From<Scheme> for orka_core::vfs::Scheme {
             Scheme::Sftp => Self::Sftp,
             Scheme::S3 => Self::S3,
             Scheme::Ftp => Self::Ftp,
+            Scheme::Ftps => Self::Ftps,
             Scheme::Smb => Self::Smb,
             Scheme::Nfs => Self::Nfs,
             Scheme::Adls => Self::Adls,
@@ -641,6 +656,27 @@ pub enum AuthMethod {
     /// Azure shared-key auth; the keychain secret is the base64
     /// account key.
     SharedKey,
+    /// Azure ADLS Gen2 SAS auth; the keychain secret is the SAS query
+    /// string, with or without a leading '?'.
+    SasToken,
+    /// Azure ADLS Gen2 service-principal auth; the keychain secret is
+    /// the client secret.
+    ServicePrincipal {
+        tenant_id: String,
+        client_id: String,
+    },
+    /// An OAuth app the user signs in to interactively. `tenant_id` is
+    /// empty except for ADLS.
+    OAuthApp {
+        client_id: String,
+        tenant_id: String,
+    },
+    /// Google Drive service-account auth; the keychain secret is the
+    /// full service-account JSON key file content.
+    ServiceAccount,
+    /// SMB or NFS auth using the signed-in user's existing ticket. No
+    /// secret.
+    Kerberos,
     /// No credentials: anonymous FTP, guest SMB, or a mount (NFS) whose
     /// transport has no auth step at all.
     None,
@@ -656,9 +692,61 @@ impl From<AuthMethod> for connections::AuthMethod {
             AuthMethod::S3Keys => Self::S3Keys,
             AuthMethod::OAuthToken => Self::OAuthToken,
             AuthMethod::SharedKey => Self::SharedKey,
+            AuthMethod::SasToken => Self::SasToken,
+            AuthMethod::ServicePrincipal {
+                tenant_id,
+                client_id,
+            } => Self::ServicePrincipal {
+                tenant_id,
+                client_id,
+            },
+            AuthMethod::OAuthApp {
+                client_id,
+                tenant_id,
+            } => Self::OAuthApp {
+                client_id,
+                tenant_id,
+            },
+            AuthMethod::ServiceAccount => Self::ServiceAccount,
+            AuthMethod::Kerberos => Self::Kerberos,
             AuthMethod::None => Self::None,
         }
     }
+}
+
+/// Maps an engine scheme to its OAuth provider. Returns an error for a
+/// scheme that has no OAuth sign-in.
+fn oauth_provider_for(
+    scheme: Scheme,
+    tenant_id: String,
+) -> Result<orka_core::vfs::oauth::Provider, String> {
+    use orka_core::vfs::oauth::Provider;
+    match scheme {
+        Scheme::Gdrive => Ok(Provider::Google),
+        Scheme::Dropbox => Ok(Provider::Dropbox),
+        Scheme::Adls => Ok(Provider::Azure { tenant_id }),
+        _ => Err("oauth sign-in is not supported for this scheme".to_string()),
+    }
+}
+
+/// Runs the interactive OAuth sign-in flow for `scheme` and returns the
+/// resulting token set as JSON. The caller (Swift) stores the JSON as
+/// the connection's keychain secret. Blocks on user interaction in the
+/// browser; call off the main thread.
+#[uniffi::export]
+pub fn oauth_sign_in(
+    scheme: Scheme,
+    client_id: String,
+    client_secret: Option<String>,
+    tenant_id: String,
+) -> Result<String, OrkaError> {
+    let provider =
+        oauth_provider_for(scheme, tenant_id).map_err(|message| OrkaError::Io { message })?;
+    let token_set = orka_core::vfs::oauth::sign_in(provider, &client_id, client_secret.as_deref())
+        .map_err(|message| OrkaError::Io { message })?;
+    token_set
+        .to_json()
+        .map_err(|message| OrkaError::Io { message })
 }
 
 #[derive(uniffi::Enum)]

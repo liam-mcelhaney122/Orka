@@ -81,6 +81,11 @@ fn prepare_auth(
         | AuthMethod::S3Keys
         | AuthMethod::OAuthToken
         | AuthMethod::SharedKey
+        | AuthMethod::SasToken
+        | AuthMethod::ServicePrincipal { .. }
+        | AuthMethod::OAuthApp { .. }
+        | AuthMethod::ServiceAccount
+        | AuthMethod::Kerberos
         | AuthMethod::None => Err("wrong auth method for sftp".to_string()),
     }
 }

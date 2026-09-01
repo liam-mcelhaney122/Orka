@@ -47,13 +47,22 @@ targets:
     sources:
       - path: Orka/Model/OrkaPath.swift
       - path: Orka/Model/TransferKind.swift
+      - path: Orka/Model/ConnectionStore.swift
+      - path: Generated
+        optional: true
       - path: OrkaTests
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.orka.tests
         SWIFT_VERSION: "5.9"
+        SWIFT_OBJC_BRIDGING_HEADER: Orka/Orka-Bridging-Header.h
         CODE_SIGN_IDENTITY: "-"
         GENERATE_INFOPLIST_FILE: YES
+        # ConnectionStore.swift converts to the engine's generated
+        # types, so the test bundle links the same Rust library as the
+        # app target.
+        LIBRARY_SEARCH_PATHS: "$(PROJECT_DIR)/../target/release"
+        OTHER_LDFLAGS: "-lorka_ffi"
 schemes:
   OrkaTests:
     build:
