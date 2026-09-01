@@ -31,9 +31,16 @@ targets:
         OTHER_LDFLAGS: "-lorka_ffi"
         # A stable identity keeps TCC grants (Full Disk Access)
         # across builds. Ad-hoc signatures lose them every build.
-        CODE_SIGN_IDENTITY: "Apple Development"
+        # Developer ID is the identity for distribution outside the
+        # App Store. Notarization requires Developer ID, the hardened
+        # runtime, and a secure timestamp.
+        # CI overrides these settings with ad-hoc signing when the
+        # runner has no certificate.
+        CODE_SIGN_IDENTITY: "Developer ID Application"
         DEVELOPMENT_TEAM: GQK8MGC2AU
         CODE_SIGN_STYLE: Manual
+        ENABLE_HARDENED_RUNTIME: YES
+        OTHER_CODE_SIGN_FLAGS: "--timestamp"
   OrkaTests:
     type: bundle.unit-test
     platform: macOS

@@ -13,7 +13,15 @@ DYLIB=liborka_ffi.dylib
 
 # Sign with the same stable identity as the Xcode build.
 # An ad-hoc signature here would drop TCC grants on every build.
-SIGN_IDENTITY="${ORKA_SIGN_IDENTITY:-Apple Development}"
+# Set ORKA_SIGN_IDENTITY=- for an ad-hoc signature (CI without a certificate).
+SIGN_IDENTITY="${ORKA_SIGN_IDENTITY:-Developer ID Application}"
+
+# Notarization requires the hardened runtime and a secure timestamp.
+# Ad-hoc signatures cannot carry a timestamp, so skip it for "-".
+SIGN_FLAGS="--options runtime"
+if [ "$SIGN_IDENTITY" != "-" ]; then
+  SIGN_FLAGS="$SIGN_FLAGS --timestamp"
+fi
 
 # Find the absolute load path that the linker recorded.
 OLD_PATH=$(otool -L "$BIN" | awk "/$DYLIB/ {print \$1}")
@@ -32,8 +40,10 @@ case "$OLD_PATH" in
     install_name_tool -id "@rpath/$DYLIB" "$FRAMEWORKS/$DYLIB"
     install_name_tool -change "$OLD_PATH" "@rpath/$DYLIB" "$BIN"
     # install_name_tool breaks the signature. Sign inside-out.
-    codesign --force --sign "$SIGN_IDENTITY" "$FRAMEWORKS/$DYLIB"
-    codesign --force --sign "$SIGN_IDENTITY" "$APP"
+    # shellcheck disable=SC2086
+    codesign --force --sign "$SIGN_IDENTITY" $SIGN_FLAGS "$FRAMEWORKS/$DYLIB"
+    # shellcheck disable=SC2086
+    codesign --force --sign "$SIGN_IDENTITY" $SIGN_FLAGS "$APP"
     ;;
 esac
 

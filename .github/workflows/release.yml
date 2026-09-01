@@ -1,7 +1,17 @@
 name: Release
 
-# A pushed v* tag builds the app and publishes a GitHub release with
-# the zipped Orka.app attached.
+# A pushed v* tag builds the app, signs it with a Developer ID
+# certificate, notarizes it, staples the ticket, and publishes a
+# GitHub release with the zipped Orka.app attached.
+#
+# Required repository secrets:
+#   APPLE_CERTIFICATE_P12_BASE64  Developer ID Application certificate
+#                                 and private key, exported as .p12 and
+#                                 encoded with `base64`.
+#   APPLE_CERTIFICATE_PASSWORD    Password of the .p12 file.
+#   APPLE_ID                      Apple ID that owns the developer team.
+#   APPLE_TEAM_ID                 Team ID (GQK8MGC2AU).
+#   APPLE_APP_SPECIFIC_PASSWORD   App-specific password for notarytool.
 on:
   push:
     tags: ["v*"]
@@ -15,6 +25,7 @@ jobs:
     runs-on: macos-26
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      KEYCHAIN_PATH: ${{ runner.temp }}/build.keychain-db
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -42,6 +53,31 @@ jobs:
             -scheme OrkaTests \
             -destination 'platform=macOS'
 
+      # xcodebuild signs the app, so the certificate must exist before
+      # the build step. The keychain lives in the runner temp directory.
+      # The last step deletes it.
+      - name: Import Developer ID certificate
+        env:
+          APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          CERT_PATH="$RUNNER_TEMP/certificate.p12"
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 24)
+          echo "$APPLE_CERTIFICATE_P12_BASE64" | base64 --decode > "$CERT_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 \
+            -k "$KEYCHAIN_PATH" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list \
+            -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain
+          rm -f "$CERT_PATH"
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH"
+
       - name: Build Orka app (Release)
         run: |
           xcodebuild \
@@ -51,17 +87,81 @@ jobs:
             -derivedDataPath build/DerivedData \
             build
 
+      # package-app.sh bundles the Rust dylib and signs the app again
+      # with the Developer ID identity, the hardened runtime, and a
+      # secure timestamp.
+      - name: Package the app
+        run: |
+          rm -rf dist
+          mkdir -p dist
+          ditto build/DerivedData/Build/Products/Release/Orka.app dist/Orka.app
+          ./scripts/package-app.sh dist/Orka.app
+
+      - name: Notarize the app
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: |
+          ditto -c -k --keepParent dist/Orka.app Orka-notarize.zip
+          set +e
+          xcrun notarytool submit Orka-notarize.zip \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --wait --timeout 30m \
+            --output-format json > notarize-result.json
+          STATUS=$?
+          set -e
+          cat notarize-result.json
+          SUBMISSION_ID=$(python3 -c \
+            'import json,sys; print(json.load(open(sys.argv[1])).get("id", ""))' \
+            notarize-result.json)
+          RESULT=$(python3 -c \
+            'import json,sys; print(json.load(open(sys.argv[1])).get("status", ""))' \
+            notarize-result.json)
+          if [ "$STATUS" -ne 0 ] || [ "$RESULT" != "Accepted" ]; then
+            echo "Notarization failed with status '$RESULT'." >&2
+            if [ -n "$SUBMISSION_ID" ]; then
+              xcrun notarytool log "$SUBMISSION_ID" \
+                --apple-id "$APPLE_ID" \
+                --team-id "$APPLE_TEAM_ID" \
+                --password "$APPLE_APP_SPECIFIC_PASSWORD"
+            fi
+            exit 1
+          fi
+          xcrun stapler staple dist/Orka.app
+          spctl -a -t exec -vv dist/Orka.app
+
+      # The Homebrew cask downloads Orka-<tag>.zip. Keep this name.
       - name: Zip the app
         run: |
-          ditto -c -k --keepParent \
-            build/DerivedData/Build/Products/Release/Orka.app \
-            "Orka-${GITHUB_REF_NAME}.zip"
+          ditto -c -k --keepParent dist/Orka.app "Orka-${GITHUB_REF_NAME}.zip"
+          shasum -a 256 "Orka-${GITHUB_REF_NAME}.zip" > "Orka-${GITHUB_REF_NAME}.zip.sha256"
+          cat "Orka-${GITHUB_REF_NAME}.zip.sha256"
 
+      # A rerun of the workflow finds an existing release. Upload the
+      # assets again instead of a failed create.
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
-            "Orka-${GITHUB_REF_NAME}.zip" \
-            --title "Orka $GITHUB_REF_NAME" \
-            --generate-notes
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" --clobber \
+              "Orka-${GITHUB_REF_NAME}.zip" \
+              "Orka-${GITHUB_REF_NAME}.zip.sha256"
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              "Orka-${GITHUB_REF_NAME}.zip" \
+              "Orka-${GITHUB_REF_NAME}.zip.sha256" \
+              --verify-tag \
+              --title "Orka $GITHUB_REF_NAME" \
+              --generate-notes
+          fi
+
+      - name: Delete temporary keychain
+        if: always()
+        run: |
+          if [ -f "$KEYCHAIN_PATH" ]; then
+            security delete-keychain "$KEYCHAIN_PATH"
+          fi
