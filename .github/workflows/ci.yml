@@ -88,6 +88,9 @@ jobs:
             -scheme OrkaTests \
             -destination 'platform=macOS'
 
+      # The project signs with "Developer ID Application". This runner
+      # has no certificate, so override the identity with an ad-hoc
+      # signature. The release workflow signs with the real certificate.
       - name: Build Orka app (Release)
         run: |
           xcodebuild \
@@ -95,12 +98,24 @@ jobs:
             -scheme Orka \
             -configuration Release \
             -derivedDataPath build/DerivedData \
+            CODE_SIGN_IDENTITY=- \
+            CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM= \
             build
+
+      # Verify that the packaging script bundles the Rust dylib and
+      # that the result passes codesign --verify.
+      - name: Package Orka.app
+        run: |
+          rm -rf dist
+          mkdir -p dist
+          ditto build/DerivedData/Build/Products/Release/Orka.app dist/Orka.app
+          ORKA_SIGN_IDENTITY=- ./scripts/package-app.sh dist/Orka.app
 
       - name: Upload Orka.app artifact
         if: success()
         uses: actions/upload-artifact@v4
         with:
           name: Orka.app
-          path: build/DerivedData/Build/Products/Release/Orka.app
+          path: dist/Orka.app
           if-no-files-found: error
