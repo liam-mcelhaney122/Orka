@@ -12,9 +12,9 @@ dist_app := justfile_directory() / "dist/Orka.app"
 default:
     @just --list
 
-# Build the Rust core (release).
+# Build the Rust core (release) and regenerate the Swift bindings.
 rust:
-    {{cargo}} build --release
+    ./scripts/build-rust.sh
 
 # The Xcode project links the release Rust library, so every app
 # recipe builds the Rust core first.

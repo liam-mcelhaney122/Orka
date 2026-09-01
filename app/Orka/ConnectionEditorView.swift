@@ -22,9 +22,10 @@ struct ConnectionEditorTarget: Identifiable {
 /// Add/edit sheet for one saved connection, opened from the sidebar's
 /// Connections section. Fields adapt to the chosen scheme: SFTP and
 /// RSync offer Password, SSH Key, and SSH Agent; S3 offers Profile and
-/// Access Keys; SMB, NFS, and FTP offer Password only; ADLS offers an
-/// account key or an OAuth token; Google Drive and Dropbox use an OAuth
-/// token.
+/// Access Keys; SMB and FTP offer Password or No Auth (guest/anonymous);
+/// NFS needs no sign-in at all, so it shows no Auth picker; ADLS offers
+/// an account key or an OAuth token; Google Drive and Dropbox use an
+/// OAuth token.
 struct ConnectionEditorView: View {
     let target: ConnectionEditorTarget
 
@@ -46,14 +47,24 @@ struct ConnectionEditorView: View {
         self.target = target
         let existing = target.connection
         _displayName = State(initialValue: existing?.displayName ?? "")
-        _scheme = State(initialValue: existing?.scheme ?? .sftp)
+        let initialScheme = existing?.scheme ?? .sftp
+        _scheme = State(initialValue: initialScheme)
         _host = State(initialValue: existing?.host ?? "")
         _port = State(
             initialValue: existing.map { String($0.port) }
                 ?? String(StoredScheme.sftp.defaultPort))
         _username = State(initialValue: existing?.username ?? "")
         _initialPath = State(initialValue: existing?.initialPath ?? "/")
-        _authKind = State(initialValue: existing?.auth.kind ?? .password)
+        // A saved connection can predate its scheme's current auth
+        // options (for example an NFS connection saved back when NFS
+        // still offered Password). Clamp here too, not only in
+        // onChange(of: scheme), or opening it renders a stale auth
+        // kind's fields with no picker to correct them.
+        let initialAuthKinds = Self.authKinds(for: initialScheme)
+        let savedAuthKind = existing?.auth.kind ?? .password
+        _authKind = State(
+            initialValue: initialAuthKinds.contains(savedAuthKind)
+                ? savedAuthKind : (initialAuthKinds.first ?? .none))
         _keyPath = State(initialValue: existing?.auth.keyPath ?? "")
         _profile = State(initialValue: existing?.auth.profile ?? "")
         _secret = State(initialValue: "")
@@ -75,7 +86,7 @@ struct ConnectionEditorView: View {
                 port = String(newValue.defaultPort)
             }
             if !availableAuthKinds.contains(authKind) {
-                authKind = availableAuthKinds[0]
+                authKind = availableAuthKinds.first ?? .none
             }
         }
     }
@@ -100,9 +111,11 @@ struct ConnectionEditorView: View {
             TextField("Port", text: $port)
             TextField(usernameLabel, text: $username)
             TextField("Initial Path", text: $initialPath)
-            Picker("Auth", selection: $authKind) {
-                ForEach(availableAuthKinds, id: \.self) { kind in
-                    Text(kind.rawValue).tag(kind)
+            if !availableAuthKinds.isEmpty {
+                Picker("Auth", selection: $authKind) {
+                    ForEach(availableAuthKinds, id: \.self) { kind in
+                        Text(kind.rawValue).tag(kind)
+                    }
                 }
             }
             if scheme == .nfs {
@@ -188,6 +201,8 @@ struct ConnectionEditorView: View {
             Text("Paste the base64 storage account key. It is stored in your keychain.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+        case .none:
+            EmptyView()
         }
     }
 
@@ -211,24 +226,33 @@ struct ConnectionEditorView: View {
         .padding(.vertical, 12)
     }
 
-    /// Schemes the picker offers. S3 and FTP have no backend yet, so new
-    /// connections hide them. A saved connection keeps its scheme so the
-    /// picker selection stays in the list.
+    /// Schemes the picker offers. Every scheme has a backend now.
     private var availableSchemes: [StoredScheme] {
-        StoredScheme.allCases.filter { candidate in
-            candidate != .s3 && candidate != .ftp
-                || candidate == target.connection?.scheme
+        StoredScheme.allCases
+    }
+
+    /// Auth kinds offered for the chosen scheme. NFS needs no sign-in at
+    /// all (the mount runs as the local user), so it offers none and the
+    /// form hides the Auth picker entirely. FTP and SMB add No Auth
+    /// alongside Password for anonymous/guest access.
+    ///
+    /// A `static` function (not just this computed property) so `init`
+    /// can clamp a saved connection's auth kind against its scheme's
+    /// current options before the view ever renders — see the comment
+    /// in `init`.
+    private static func authKinds(for scheme: StoredScheme) -> [AuthKind] {
+        switch scheme {
+        case .sftp, .rsync: return [.password, .sshKey, .sshAgent]
+        case .s3: return [.s3Profile, .s3Keys]
+        case .ftp, .smb: return [.password, .none]
+        case .nfs: return []
+        case .adls: return [.sharedKey, .oauthToken]
+        case .gdrive, .dropbox: return [.oauthToken]
         }
     }
 
     private var availableAuthKinds: [AuthKind] {
-        switch scheme {
-        case .sftp, .rsync: return [.password, .sshKey, .sshAgent]
-        case .s3: return [.s3Profile, .s3Keys]
-        case .ftp, .smb, .nfs: return [.password]
-        case .adls: return [.sharedKey, .oauthToken]
-        case .gdrive, .dropbox: return [.oauthToken]
-        }
+        Self.authKinds(for: scheme)
     }
 
     /// The port field parsed into the valid TCP range, or nil.
@@ -271,6 +295,7 @@ struct ConnectionEditorView: View {
         case .s3Keys: auth = .s3Keys
         case .oauthToken: auth = .oauthToken
         case .sharedKey: auth = .sharedKey
+        case .none: auth = .none
         }
         let config = StoredConnection(
             id: target.connection?.id ?? UUID().uuidString,

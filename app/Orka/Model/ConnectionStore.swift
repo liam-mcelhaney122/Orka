@@ -68,6 +68,9 @@ enum StoredAuthMethod: Codable, Hashable {
     case s3Keys
     case oauthToken
     case sharedKey
+    /// No credentials: anonymous FTP, guest SMB, or a mount (NFS) whose
+    /// transport has no auth step at all.
+    case none
 }
 
 /// Which auth fields the editor shows. One per `StoredAuthMethod` case.
@@ -79,6 +82,7 @@ enum AuthKind: String, CaseIterable {
     case s3Keys = "Access Keys"
     case oauthToken = "Token"
     case sharedKey = "Account Key"
+    case none = "No Auth"
 }
 
 extension StoredAuthMethod {
@@ -91,6 +95,7 @@ extension StoredAuthMethod {
         case .s3Keys: return .s3Keys
         case .oauthToken: return .oauthToken
         case .sharedKey: return .sharedKey
+        case .none: return .none
         }
     }
 
@@ -110,7 +115,7 @@ extension StoredAuthMethod {
         switch self {
         case .password, .sshKey, .s3Keys, .oauthToken, .sharedKey:
             return true
-        case .sshAgent, .s3Profile: return false
+        case .sshAgent, .s3Profile, .none: return false
         }
     }
 }
@@ -163,6 +168,7 @@ extension StoredAuthMethod {
         case .s3Keys: return .s3Keys
         case .oauthToken: return .oAuthToken
         case .sharedKey: return .sharedKey
+        case .none: return .none
         }
     }
 }

@@ -44,6 +44,9 @@ pub enum AuthMethod {
     /// Azure Storage shared-key auth. The secret is the base64
     /// account key; the account name is the connection's host.
     SharedKey,
+    /// No credentials: anonymous FTP, guest SMB, or a mount (NFS) whose
+    /// transport has no auth step at all.
+    None,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
