@@ -4,7 +4,8 @@
 
 - File servers with full backends:
   - SSH via RSync (SSH transport, rsync-style server-side copy)
-  - ADLS Gen2 (shared-key auth)
+  - ADLS Gen2 (account key, SAS token, service principal, or
+    in-app sign-in)
   - SMB (mount_smbfs, Password or No Auth for guest access)
   - NFS (mount_nfs, no sign-in needed)
   - Google Drive (OAuth token)
