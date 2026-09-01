@@ -13,7 +13,7 @@
 use super::connections::{AuthMethod, BackendFactory, ConnectionConfig, SecretProvider};
 use super::{Capabilities, FsBackend, WriteFinish};
 use crate::{Entry, ListOptions};
-use ssh2::{OpenFlags, OpenType, RenameFlags, Session, Sftp};
+use ssh2::{KeyboardInteractivePrompt, OpenFlags, OpenType, Prompt, RenameFlags, Session, Sftp};
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
@@ -60,6 +60,17 @@ fn expand_key_path(key_path: &str) -> Result<PathBuf, String> {
     Ok(PathBuf::from(key_path))
 }
 
+/// Derives the OpenSSH certificate path for an already-expanded private
+/// key path: the key path with `-cert.pub` appended, matching the
+/// convention the `ssh` client itself uses. Building it from the
+/// expanded key path carries the same `~` expansion, with no separate
+/// step needed.
+fn cert_path_for_key(key_path: &Path) -> PathBuf {
+    let mut cert = key_path.as_os_str().to_owned();
+    cert.push("-cert.pub");
+    PathBuf::from(cert)
+}
+
 fn prepare_auth(
     config: &ConnectionConfig,
     secrets: &dyn SecretProvider,
@@ -90,6 +101,83 @@ fn prepare_auth(
     }
 }
 
+/// One step in a password-based auth attempt, in the order to try it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PasswordAuthStep {
+    Password,
+    KeyboardInteractive,
+}
+
+/// Maps the server's advertised auth method list (as returned by
+/// `Session::auth_methods`, a comma-separated string) to an ordered
+/// plan for [`AuthMethod::Password`]. Plain password comes first when
+/// offered; keyboard-interactive is the fallback, since many servers
+/// wrap a single password prompt behind it. Pure, so tests cover the
+/// decision without a live session.
+fn password_auth_plan(methods: &str) -> Vec<PasswordAuthStep> {
+    let offers = |name: &str| methods.split(',').any(|m| m.trim().eq_ignore_ascii_case(name));
+    let mut plan = Vec::new();
+    if offers("password") {
+        plan.push(PasswordAuthStep::Password);
+    }
+    if offers("keyboard-interactive") {
+        plan.push(PasswordAuthStep::KeyboardInteractive);
+    }
+    plan
+}
+
+/// Answers every keyboard-interactive prompt with the stored password.
+/// A server that wraps plain password auth behind keyboard-interactive
+/// asks one question; this covers that case without inspecting the
+/// prompt text, which servers phrase inconsistently.
+struct PasswordPrompter<'a> {
+    password: &'a str,
+}
+
+impl KeyboardInteractivePrompt for PasswordPrompter<'_> {
+    fn prompt<'p>(
+        &mut self,
+        _username: &str,
+        _instructions: &str,
+        prompts: &[Prompt<'p>],
+    ) -> Vec<String> {
+        prompts.iter().map(|_| self.password.to_string()).collect()
+    }
+}
+
+/// Runs the password auth plan against `session`. Tries each step in
+/// order and stops at the first success. The final error names the
+/// methods the server offers, never the password: the password never
+/// appears in a formatted string in this function.
+fn userauth_password_with_fallback(
+    session: &Session,
+    user: &str,
+    password: &str,
+) -> Result<(), String> {
+    let methods = session.auth_methods(user).unwrap_or("").to_string();
+    let plan = password_auth_plan(&methods);
+    for step in &plan {
+        let result = match step {
+            PasswordAuthStep::Password => session.userauth_password(user, password),
+            PasswordAuthStep::KeyboardInteractive => {
+                let mut prompter = PasswordPrompter { password };
+                session.userauth_keyboard_interactive(user, &mut prompter)
+            }
+        };
+        if result.is_ok() {
+            return Ok(());
+        }
+    }
+    let offered = if methods.is_empty() {
+        "none".to_string()
+    } else {
+        methods
+    };
+    Err(format!(
+        "password auth failed: server offers only: {offered}"
+    ))
+}
+
 /// Dials, authenticates, and opens the SFTP subsystem for one config.
 /// The factory uses it for the primary session; every transfer pump
 /// uses it again for its own session.
@@ -116,15 +204,19 @@ fn connect_session(
     let user = config.username.as_str();
     // Error strings must never include secret material.
     match auth {
-        PreparedAuth::Password(password) => session
-            .userauth_password(user, &password)
-            .map_err(|e| format!("password auth failed: {e}"))?,
+        PreparedAuth::Password(password) => {
+            userauth_password_with_fallback(&session, user, &password)?
+        }
         PreparedAuth::Key {
             key_path,
             passphrase,
-        } => session
-            .userauth_pubkey_file(user, None, &key_path, passphrase.as_deref())
-            .map_err(|e| format!("key auth failed: {e}"))?,
+        } => {
+            let cert_path = cert_path_for_key(&key_path);
+            let cert = cert_path.is_file().then_some(cert_path.as_path());
+            session
+                .userauth_pubkey_file(user, cert, &key_path, passphrase.as_deref())
+                .map_err(|e| format!("key auth failed: {e}"))?
+        }
         PreparedAuth::Agent => session
             .userauth_agent(user)
             .map_err(|e| format!("agent auth failed: {e}"))?,
@@ -775,6 +867,64 @@ mod tests {
         assert_eq!(
             expand_key_path("/etc/key").unwrap(),
             PathBuf::from("/etc/key")
+        );
+    }
+
+    #[test]
+    fn password_auth_plan_prefers_password_then_keyboard_interactive() {
+        assert_eq!(
+            password_auth_plan("publickey,password,keyboard-interactive"),
+            vec![
+                PasswordAuthStep::Password,
+                PasswordAuthStep::KeyboardInteractive
+            ]
+        );
+        // Case and surrounding whitespace must not matter.
+        assert_eq!(
+            password_auth_plan(" PASSWORD , Keyboard-Interactive "),
+            vec![
+                PasswordAuthStep::Password,
+                PasswordAuthStep::KeyboardInteractive
+            ]
+        );
+    }
+
+    #[test]
+    fn password_auth_plan_covers_password_only_servers() {
+        assert_eq!(
+            password_auth_plan("publickey,password"),
+            vec![PasswordAuthStep::Password]
+        );
+    }
+
+    #[test]
+    fn password_auth_plan_covers_keyboard_interactive_only_servers() {
+        assert_eq!(
+            password_auth_plan("publickey,keyboard-interactive"),
+            vec![PasswordAuthStep::KeyboardInteractive]
+        );
+    }
+
+    #[test]
+    fn password_auth_plan_is_empty_when_server_offers_neither() {
+        assert_eq!(password_auth_plan("publickey"), Vec::new());
+        assert_eq!(password_auth_plan(""), Vec::new());
+    }
+
+    #[test]
+    fn cert_path_for_key_appends_cert_pub_suffix() {
+        assert_eq!(
+            cert_path_for_key(Path::new("/home/liam/.ssh/id_ed25519")),
+            PathBuf::from("/home/liam/.ssh/id_ed25519-cert.pub")
+        );
+        // A path already carrying the expanded home directory keeps it,
+        // since the derivation runs on the already-expanded key path.
+        assert_eq!(
+            cert_path_for_key(&expand_key_path("~/.ssh/id_ed25519").unwrap()),
+            PathBuf::from(format!(
+                "{}/.ssh/id_ed25519-cert.pub",
+                std::env::var("HOME").unwrap()
+            ))
         );
     }
 
