@@ -9,7 +9,9 @@
   - NFS (mount_nfs, no sign-in needed)
   - Google Drive (OAuth token)
   - Dropbox (OAuth token)
-  - FTP (Password or No Auth for anonymous login)
+  - FTP and FTPS (Password or No Auth for anonymous login; FTPS
+    supports implicit TLS on port 990 and explicit `AUTH TLS`
+    elsewhere)
   - S3 (AWS profile or access keys; buckets list at the connection root)
 - Compression and extraction: zip, tar, and tar.gz through context
   menus, with progress, cancel, and undo.
@@ -24,8 +26,6 @@
   OAuth). Connections today paste an access token.
 - Proactive cleanup of stale SMB/NFS mounts left by a killed process.
 - Tab color persistence across launches.
-- FTPS (explicit TLS) for the FTP backend. Plain FTP sends credentials
-  and data in the clear.
 - Multipart S3 uploads. Uploads today buffer the whole object, so very
   large files may fail.
 - An explicit region field for S3 connections. Region comes from the
