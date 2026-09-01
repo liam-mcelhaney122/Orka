@@ -11,6 +11,10 @@ BIN="$APP/Contents/MacOS/Orka"
 FRAMEWORKS="$APP/Contents/Frameworks"
 DYLIB=liborka_ffi.dylib
 
+# Sign with the same stable identity as the Xcode build.
+# An ad-hoc signature here would drop TCC grants on every build.
+SIGN_IDENTITY="${ORKA_SIGN_IDENTITY:-Apple Development}"
+
 # Find the absolute load path that the linker recorded.
 OLD_PATH=$(otool -L "$BIN" | awk "/$DYLIB/ {print \$1}")
 if [ -z "$OLD_PATH" ]; then
@@ -28,8 +32,8 @@ case "$OLD_PATH" in
     install_name_tool -id "@rpath/$DYLIB" "$FRAMEWORKS/$DYLIB"
     install_name_tool -change "$OLD_PATH" "@rpath/$DYLIB" "$BIN"
     # install_name_tool breaks the signature. Sign inside-out.
-    codesign --force --sign - "$FRAMEWORKS/$DYLIB"
-    codesign --force --sign - "$APP"
+    codesign --force --sign "$SIGN_IDENTITY" "$FRAMEWORKS/$DYLIB"
+    codesign --force --sign "$SIGN_IDENTITY" "$APP"
     ;;
 esac
 
