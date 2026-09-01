@@ -12,8 +12,12 @@ nucleo-matcher = "0.3.1"
 # vendored-libgit2 compiles the C library in; no system dependency.
 git2 = { version = "0.21.0", default-features = false, features = ["vendored-libgit2"] }
 ssh2 = { version = "0.9.6", features = ["vendored-openssl"] }
-# FTP backend.
-suppaftp = { version = "6", default-features = false, features = ["rustls"] }
+# FTP backend. "deprecated" unlocks connect_secure_implicit, needed for
+# implicit-TLS FTPS (port 990); the FTP spec deprecated implicit TLS in
+# favor of explicit AUTH TLS, but many servers still expect it on 990.
+suppaftp = { version = "6", default-features = false, features = ["rustls", "deprecated"] }
+# Trust roots for the FTPS TLS connector.
+webpki-roots = "1"
 # REST file-server backends (Dropbox, Google Drive, ADLS) and their JSON.
 ureq = { version = "2", features = ["json", "tls"] }
 serde = { version = "1", features = ["derive"] }
