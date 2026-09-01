@@ -208,7 +208,9 @@ fn normalize_sas_token(raw: &str) -> Result<String, String> {
         return Err("SAS token is empty".to_string());
     }
     if !trimmed.contains('=') {
-        return Err("SAS token is malformed: expected a query string of 'key=value' pairs".to_string());
+        return Err(
+            "SAS token is malformed: expected a query string of 'key=value' pairs".to_string(),
+        );
     }
     Ok(trimmed.to_string())
 }
@@ -371,7 +373,8 @@ impl AdlsCore {
                 }
             }
         }
-        let fetched = fetch_service_principal_token(&self.agent, tenant_id, client_id, client_secret)?;
+        let fetched =
+            fetch_service_principal_token(&self.agent, tenant_id, client_id, client_secret)?;
         let token = fetched.access_token.clone();
         *cache.lock().unwrap() = Some(fetched);
         Ok(token)
@@ -411,7 +414,8 @@ impl AdlsCore {
         let provider = Provider::Azure {
             tenant_id: tenant_id.clone(),
         };
-        let token = oauth::ensure_fresh_token(provider, client_id, connection_id, secrets.as_ref())?;
+        let token =
+            oauth::ensure_fresh_token(provider, client_id, connection_id, secrets.as_ref())?;
         *cache.lock().unwrap() = Some(CachedToken {
             access_token: token.clone(),
             expires_at_ms: now_ms() + 60_000,
@@ -496,12 +500,14 @@ impl AdlsCore {
             // A SAS token authorizes through its own query parameters;
             // no Authorization header goes on the wire.
             AdlsCredential::Sas(_) => None,
-            AdlsCredential::ServicePrincipal { .. } => {
-                Some(format!("Bearer {}", self.service_principal_token().map_err(ReqError::Auth)?))
-            }
-            AdlsCredential::OAuthApp { .. } => {
-                Some(format!("Bearer {}", self.oauth_app_token(false).map_err(ReqError::Auth)?))
-            }
+            AdlsCredential::ServicePrincipal { .. } => Some(format!(
+                "Bearer {}",
+                self.service_principal_token().map_err(ReqError::Auth)?
+            )),
+            AdlsCredential::OAuthApp { .. } => Some(format!(
+                "Bearer {}",
+                self.oauth_app_token(false).map_err(ReqError::Auth)?
+            )),
         };
         let mut req = match method {
             Method::Get => self.agent.get(&url),
@@ -519,7 +525,9 @@ impl AdlsCore {
             req = req.set("Authorization", auth);
         }
         match body {
-            Some(bytes) => req.send_bytes(bytes).map_err(|e| ReqError::Http(Box::new(e))),
+            Some(bytes) => req
+                .send_bytes(bytes)
+                .map_err(|e| ReqError::Http(Box::new(e))),
             None => req.call().map_err(|e| ReqError::Http(Box::new(e))),
         }
     }
@@ -969,9 +977,7 @@ impl FsBackend for AdlsBackend {
                 ureq::Error::Status(status, _) => status,
                 e => return Err(format!("cannot rename {from}: {}", error_string(e))),
             },
-            Err(ReqError::Auth(message)) => {
-                return Err(format!("cannot rename {from}: {message}"))
-            }
+            Err(ReqError::Auth(message)) => return Err(format!("cannot rename {from}: {message}")),
         };
         if rename_dest_exists(status)? {
             return Err(format!("an item with this name already exists: {to}"));
@@ -1453,7 +1459,11 @@ mod tests {
         let not_found =
             ureq::Error::Status(404, ureq::Response::new(404, "Not Found", "").unwrap());
         assert_eq!(
-            request_error("cannot stat", "/missing", ReqError::Http(Box::new(not_found))),
+            request_error(
+                "cannot stat",
+                "/missing",
+                ReqError::Http(Box::new(not_found))
+            ),
             "/missing: not found"
         );
         let server_error = ureq::Error::Status(
@@ -1472,7 +1482,10 @@ mod tests {
             "/x",
             ReqError::Auth("cannot get service-principal token: timed out".to_string()),
         );
-        assert_eq!(message, "cannot list /x: cannot get service-principal token: timed out");
+        assert_eq!(
+            message,
+            "cannot list /x: cannot get service-principal token: timed out"
+        );
     }
 
     #[test]
@@ -1646,8 +1659,14 @@ mod tests {
 
     #[test]
     fn normalize_sas_token_strips_leading_question_mark() {
-        assert_eq!(normalize_sas_token("?sv=2023&sig=abc").unwrap(), "sv=2023&sig=abc");
-        assert_eq!(normalize_sas_token("sv=2023&sig=abc").unwrap(), "sv=2023&sig=abc");
+        assert_eq!(
+            normalize_sas_token("?sv=2023&sig=abc").unwrap(),
+            "sv=2023&sig=abc"
+        );
+        assert_eq!(
+            normalize_sas_token("sv=2023&sig=abc").unwrap(),
+            "sv=2023&sig=abc"
+        );
         assert_eq!(normalize_sas_token("  ?sv=2023  ").unwrap(), "sv=2023");
     }
 
@@ -1738,8 +1757,8 @@ mod tests {
 
     #[test]
     fn parse_client_credentials_response_rejects_missing_token() {
-        let err = parse_client_credentials_response(r#"{"error":"invalid_client"}"#, 0)
-            .unwrap_err();
+        let err =
+            parse_client_credentials_response(r#"{"error":"invalid_client"}"#, 0).unwrap_err();
         assert!(err.contains("access_token"), "got: {err}");
         let err = parse_client_credentials_response("not json", 0).unwrap_err();
         assert!(err.contains("cannot parse"), "got: {err}");
