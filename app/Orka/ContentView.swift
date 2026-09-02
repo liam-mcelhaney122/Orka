@@ -382,12 +382,10 @@ struct MainWindowView: View {
     private var actionCluster: some View {
         HStack(spacing: 2) {
             toolbarIconButton(
-                "folder.badge.plus", help: "New Folder",
-                disabled: !OrkaPath.isLocal(pane.directory.path)
+                "folder.badge.plus", help: "New Folder", disabled: false
             ) { model.newFolder(in: window) }
             toolbarIconButton(
-                "doc.badge.plus", help: "New File",
-                disabled: !OrkaPath.isLocal(pane.directory.path)
+                "doc.badge.plus", help: "New File", disabled: false
             ) { model.newFile(in: window) }
             toolbarIconButton(
                 "arrow.clockwise", help: "Refresh", disabled: false

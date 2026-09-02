@@ -392,12 +392,15 @@ impl OrkaEngine {
             orka_core::vfs::Scheme::Dropbox,
             Arc::new(orka_core::vfs::dropbox::DropboxFactory),
         );
+        // Shares the ops router so a remote folder size is walked
+        // through the same connected backend as everything else.
+        let sizes = orka_core::sizes::SizeEngine::new(sink.clone(), inner.router());
         Arc::new(Self {
             inner,
             // A watcher failure disables live refresh but not the app.
             watcher: orka_core::watch::DirWatcher::new(sink.clone()).ok(),
-            search: orka_core::search::SearchEngine::new(sink.clone()),
-            sizes: orka_core::sizes::SizeEngine::new(sink),
+            search: orka_core::search::SearchEngine::new(sink),
+            sizes,
             git,
             gitlog,
             connections,
@@ -455,6 +458,9 @@ impl OrkaEngine {
         )
     }
 
+    /// Duplicates local and remote items alike. A remote item is copied
+    /// on its own backend, using a native copy when the backend offers
+    /// one.
     pub fn duplicate_items(&self, sources: Vec<String>) -> u64 {
         self.inner
             .duplicate(sources.into_iter().map(PathBuf::from).collect())
@@ -522,6 +528,8 @@ impl OrkaEngine {
         self.inner.extract(PathBuf::from(archive))
     }
 
+    /// Renames a local item or a remote item through its connection.
+    /// Returns the new path in the same form as `path`.
     pub fn rename_item(&self, path: String, new_name: String) -> Result<String, OrkaError> {
         self.inner
             .rename(std::path::Path::new(&path), &new_name)
@@ -529,6 +537,9 @@ impl OrkaEngine {
             .map_err(item_error_to_orka)
     }
 
+    /// Creates a new folder under a local or a remote parent. Appends
+    /// " 2", " 3", … when the name is taken. Returns the new path in
+    /// the same form as `parent`.
     pub fn create_folder(&self, parent: String, name: String) -> Result<String, OrkaError> {
         self.inner
             .create_folder(std::path::Path::new(&parent), &name)
@@ -536,8 +547,9 @@ impl OrkaEngine {
             .map_err(item_error_to_orka)
     }
 
-    /// Creates an empty file. Appends " 2", " 3", … when the name is
-    /// taken. Local paths only.
+    /// Creates an empty file under a local or a remote parent. Appends
+    /// " 2", " 3", … when the name is taken. Returns the new path in
+    /// the same form as `parent`.
     pub fn create_file(&self, parent: String, name: String) -> Result<String, OrkaError> {
         self.inner
             .create_file(std::path::Path::new(&parent), &name)
@@ -563,9 +575,10 @@ impl OrkaEngine {
         self.search.cancel(query_id);
     }
 
-    /// Starts a recursive size request for the given directories.
-    /// Cancels any earlier request; a navigation supersedes it. Totals
-    /// arrive as `FolderSizes` events for the returned request id.
+    /// Starts a recursive size request for the given local or remote
+    /// directories. Cancels any earlier request; a navigation supersedes
+    /// it. Totals arrive as `FolderSizes` events for the returned
+    /// request id.
     pub fn compute_folder_sizes(&self, dirs: Vec<String>) -> u64 {
         self.sizes.compute(dirs)
     }
@@ -868,6 +881,30 @@ impl OrkaEngine {
                 FsEntry::from(e)
             })
             .collect())
+    }
+
+    /// Reads one entry's metadata for a local path or a remote URI
+    /// through the router. Synchronous and can block on the network;
+    /// Swift calls it off the main actor.
+    pub fn stat_path(&self, path: String) -> Result<FsEntry, OrkaError> {
+        use orka_core::vfs::VPath;
+        let (backend, backend_path) = self
+            .inner
+            .router()
+            .resolve(&path)
+            .map_err(|message| OrkaError::Io { message })?;
+        let mut entry = backend
+            .stat(&backend_path)
+            .map_err(|message| OrkaError::Io { message })?;
+        // A remote backend returns a backend-local path; Swift treats
+        // entry.path as a full path, so rewrite it to the full URI.
+        if let VPath::Remote {
+            scheme, connection, ..
+        } = VPath::parse(&path)
+        {
+            entry.path = orka_core::vfs::join_uri(scheme, &connection, &entry.path);
+        }
+        Ok(FsEntry::from(entry))
     }
 }
 

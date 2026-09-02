@@ -1,9 +1,78 @@
 use orka_core::sizes::{PathSize, SizeEngine, SizeSink};
+use orka_core::vfs::{BackendRouter, Capabilities, FsBackend, WriteFinish};
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+/// Minimal remote backend for the folder-size walk: `list_dir` serves a
+/// fixed tree, keyed by backend-local path. The other operations are
+/// stubs the size walk never calls.
+struct FakeRemoteFs {
+    listings: HashMap<String, Vec<orka_core::Entry>>,
+}
+
+impl FsBackend for FakeRemoteFs {
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            is_local: false,
+            can_trash: false,
+            can_watch: false,
+            can_rename: false,
+            server_side_copy: false,
+            preserves_permissions: false,
+        }
+    }
+
+    fn list_dir(&self, path: &str, _opts: &orka_core::ListOptions) -> Result<Vec<orka_core::Entry>, String> {
+        self.listings
+            .get(path)
+            .cloned()
+            .ok_or_else(|| format!("not found: {path}"))
+    }
+
+    fn stat(&self, _path: &str) -> Result<orka_core::Entry, String> {
+        Err("not supported".to_string())
+    }
+
+    fn open_read(&self, _path: &str) -> Result<Box<dyn std::io::Read + Send>, String> {
+        Err("not supported".to_string())
+    }
+
+    fn create_write(
+        &self,
+        _path: &str,
+        _size_hint: Option<u64>,
+    ) -> Result<Box<dyn WriteFinish>, String> {
+        Err("not supported".to_string())
+    }
+
+    fn delete(&self, _path: &str, _recursive: bool) -> Result<(), String> {
+        Err("not supported".to_string())
+    }
+
+    fn rename(&self, _from: &str, _to: &str) -> Result<(), String> {
+        Err("not supported".to_string())
+    }
+
+    fn mkdir(&self, _path: &str) -> Result<(), String> {
+        Err("not supported".to_string())
+    }
+}
+
+fn remote_entry(path: &str, is_dir: bool, size: u64) -> orka_core::Entry {
+    orka_core::Entry {
+        name: path.rsplit('/').next().unwrap_or(path).to_string(),
+        path: path.to_string(),
+        is_dir,
+        size,
+        modified_ms: 0,
+        is_hidden: false,
+        is_symlink: false,
+    }
+}
 
 struct Event {
     request_id: u64,
@@ -26,9 +95,15 @@ impl SizeSink for TestSink {
 }
 
 fn engine() -> (SizeEngine, Receiver<Event>) {
+    let (engine, rx, _router) = engine_with_router();
+    (engine, rx)
+}
+
+fn engine_with_router() -> (SizeEngine, Receiver<Event>, Arc<BackendRouter>) {
     let (tx, rx) = channel();
     let sink = Arc::new(TestSink { tx: Mutex::new(tx) });
-    (SizeEngine::new(sink), rx)
+    let router = Arc::new(BackendRouter::new());
+    (SizeEngine::new(sink, router.clone()), rx, router)
 }
 
 /// Collects every per-directory event of `id` until the done event.
@@ -203,4 +278,31 @@ fn concurrent_requests_both_complete() {
     }
     assert_eq!(bytes.get(&first), Some(&4));
     assert_eq!(bytes.get(&second), Some(&4));
+}
+
+#[test]
+fn remote_folder_size_sums_nested_files() {
+    let (engine, rx, router) = engine_with_router();
+    let mut listings = HashMap::new();
+    listings.insert(
+        "/dir".to_string(),
+        vec![
+            remote_entry("/dir/a.bin", false, 10),
+            remote_entry("/dir/sub", true, 0),
+        ],
+    );
+    listings.insert(
+        "/dir/sub".to_string(),
+        vec![remote_entry("/dir/sub/b.bin", false, 5)],
+    );
+    router.register("fake".to_string(), Arc::new(FakeRemoteFs { listings }));
+
+    let id = engine.compute(vec!["sftp://fake/dir".to_string()]);
+    let sizes = collect(&rx, id);
+
+    assert_eq!(sizes.len(), 1);
+    assert_eq!(sizes[0].path, "sftp://fake/dir");
+    assert_eq!(sizes[0].bytes, 15);
+    // a.bin, the sub directory, and b.bin.
+    assert_eq!(sizes[0].items, 3);
 }

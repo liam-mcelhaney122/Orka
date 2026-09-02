@@ -354,45 +354,59 @@ impl OpsEngine {
             .map(|e| e.description.clone())
     }
 
-    /// Synchronous rename with an undo entry.
+    /// Synchronous rename with an undo entry. Works for a local path or
+    /// a remote URI. Undo is recorded only for a local rename; a remote
+    /// backend has no restore-from-trash step yet.
     pub fn rename(&self, path: &Path, new_name: &str) -> Result<PathBuf, ItemError> {
-        let old_name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let dest = rename_item(path, new_name)?;
-        self.push_undo(UndoEntry {
-            description: format!("Rename of \u{201c}{old_name}\u{201d}"),
-            actions: vec![UndoAction::Move {
-                from: dest.clone(),
-                to: path.to_path_buf(),
-            }],
-        });
-        Ok(dest)
+        let path_str = path.to_string_lossy().into_owned();
+        let dest = rename_item_at(&self.router, &path_str, new_name)?;
+        if crate::vfs::VPath::parse(&path_str).is_local() {
+            let old_name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            self.push_undo(UndoEntry {
+                description: format!("Rename of \u{201c}{old_name}\u{201d}"),
+                actions: vec![UndoAction::Move {
+                    from: PathBuf::from(&dest),
+                    to: path.to_path_buf(),
+                }],
+            });
+        }
+        Ok(PathBuf::from(dest))
     }
 
-    /// Synchronous folder creation with an undo entry.
+    /// Synchronous folder creation with an undo entry. Works for a local
+    /// path or a remote URI. Undo is recorded only for a local folder.
     pub fn create_folder(&self, parent: &Path, name: &str) -> Result<PathBuf, ItemError> {
-        let created = create_folder(parent, name)?;
-        self.push_undo(UndoEntry {
-            description: "New Folder".to_string(),
-            actions: vec![UndoAction::Trash {
-                path: created.clone(),
-            }],
-        });
-        Ok(created)
+        let parent_str = parent.to_string_lossy().into_owned();
+        let created = create_folder_at(&self.router, &parent_str, name)?;
+        if crate::vfs::VPath::parse(&parent_str).is_local() {
+            self.push_undo(UndoEntry {
+                description: "New Folder".to_string(),
+                actions: vec![UndoAction::Trash {
+                    path: PathBuf::from(&created),
+                }],
+            });
+        }
+        Ok(PathBuf::from(created))
     }
 
-    /// Synchronous empty-file creation with an undo entry.
+    /// Synchronous empty-file creation with an undo entry. Works for a
+    /// local path or a remote URI. Undo is recorded only for a local
+    /// file.
     pub fn create_file(&self, parent: &Path, name: &str) -> Result<PathBuf, ItemError> {
-        let created = create_file(parent, name)?;
-        self.push_undo(UndoEntry {
-            description: "New File".to_string(),
-            actions: vec![UndoAction::Trash {
-                path: created.clone(),
-            }],
-        });
-        Ok(created)
+        let parent_str = parent.to_string_lossy().into_owned();
+        let created = create_file_at(&self.router, &parent_str, name)?;
+        if crate::vfs::VPath::parse(&parent_str).is_local() {
+            self.push_undo(UndoEntry {
+                description: "New File".to_string(),
+                actions: vec![UndoAction::Trash {
+                    path: PathBuf::from(&created),
+                }],
+            });
+        }
+        Ok(PathBuf::from(created))
     }
 
     fn push_undo(&self, entry: UndoEntry) {
@@ -448,8 +462,54 @@ fn count_phrase(count: usize) -> String {
     }
 }
 
+/// Rejects a remote URI. A function that only supports the local
+/// filesystem must call this first, so a URI string can never turn into
+/// a meaningless relative `PathBuf` that reaches `std::fs`.
+fn require_local(path: &str) -> Result<PathBuf, ItemError> {
+    match crate::vfs::VPath::parse(path) {
+        crate::vfs::VPath::Local(p) => Ok(p),
+        crate::vfs::VPath::Remote { .. } => Err(ItemError {
+            path: path.to_string(),
+            message: "remote locations are not supported here".to_string(),
+        }),
+    }
+}
+
+/// The first path in `paths` that is not local, reported as an error.
+/// `None` means every path is local. Used as a defense-in-depth check
+/// ahead of a local-only code path that a remote job should never reach.
+fn first_remote<'a>(paths: impl IntoIterator<Item = &'a Path>) -> Option<ItemError> {
+    paths
+        .into_iter()
+        .find_map(|p| require_local(&p.to_string_lossy()).err())
+}
+
+/// Picks a name that is not already taken, appending " 2", " 3", … like
+/// Finder's "untitled folder" behavior. `candidate_for(n)` builds the
+/// name to try at step `n` (starting at 2); `exists` reports whether a
+/// candidate name is taken. Local and remote callers share this rule
+/// through their own `exists` closure, so the two can never drift apart.
+fn numbered_name(
+    name: &str,
+    candidate_for: impl Fn(u32) -> String,
+    exists: impl Fn(&str) -> bool,
+) -> String {
+    if !exists(name) {
+        return name.to_string();
+    }
+    let mut counter = 2;
+    loop {
+        let candidate = candidate_for(counter);
+        if !exists(&candidate) {
+            return candidate;
+        }
+        counter += 1;
+    }
+}
+
 /// Renames an item inside its directory. Synchronous: a single atomic
-/// `rename(2)`; the UI needs the result inline.
+/// `rename(2)`; the UI needs the result inline. Local paths only; see
+/// [`rename_item_at`] for a path that may be remote.
 pub fn rename_item(path: &Path, new_name: &str) -> Result<PathBuf, ItemError> {
     if new_name.is_empty() || new_name.contains('/') {
         return Err(item_error(path, "invalid name"));
@@ -463,37 +523,183 @@ pub fn rename_item(path: &Path, new_name: &str) -> Result<PathBuf, ItemError> {
 }
 
 /// Creates a new folder. Appends " 2", " 3", … when the name is taken,
-/// like Finder's "untitled folder" behavior.
+/// like Finder's "untitled folder" behavior. Local paths only; see
+/// [`create_folder_at`] for a path that may be remote.
 pub fn create_folder(parent: &Path, name: &str) -> Result<PathBuf, ItemError> {
-    let mut candidate = parent.join(name);
-    let mut counter = 2;
-    while candidate.symlink_metadata().is_ok() {
-        candidate = parent.join(format!("{name} {counter}"));
-        counter += 1;
-    }
+    let exists = |candidate: &str| parent.join(candidate).symlink_metadata().is_ok();
+    let chosen = numbered_name(name, |n| format!("{name} {n}"), exists);
+    let candidate = parent.join(chosen);
     std::fs::create_dir(&candidate).map_err(|e| item_error(parent, &e.to_string()))?;
     Ok(candidate)
 }
 
 /// Creates an empty file. Appends " 2", " 3", … when the name is taken,
-/// mirroring the folder behavior.
+/// mirroring the folder behavior. Local paths only; see
+/// [`create_file_at`] for a path that may be remote.
 pub fn create_file(parent: &Path, name: &str) -> Result<PathBuf, ItemError> {
     if name.is_empty() || name.contains('/') {
         return Err(item_error(parent, "invalid name"));
     }
-    let mut candidate = parent.join(name);
     let stem_ext = split_stem(name);
-    let mut counter = 2;
-    while candidate.symlink_metadata().is_ok() {
-        let unique = match &stem_ext {
-            Some((stem, ext)) => format!("{stem} {counter}.{ext}"),
-            None => format!("{name} {counter}"),
-        };
-        candidate = parent.join(unique);
-        counter += 1;
-    }
+    let exists = |candidate: &str| parent.join(candidate).symlink_metadata().is_ok();
+    let chosen = numbered_name(
+        name,
+        |n| match &stem_ext {
+            Some((stem, ext)) => format!("{stem} {n}.{ext}"),
+            None => format!("{name} {n}"),
+        },
+        exists,
+    );
+    let candidate = parent.join(chosen);
     std::fs::File::create(&candidate).map_err(|e| item_error(parent, &e.to_string()))?;
     Ok(candidate)
+}
+
+/// Splits a backend-local path into its parent directory and final
+/// name component. The root path itself yields an empty name.
+fn split_backend_path(path: &str) -> (&str, &str) {
+    let trimmed = path.trim_end_matches('/');
+    match trimmed.rfind('/') {
+        Some(0) => ("/", &trimmed[1..]),
+        Some(idx) => (&trimmed[..idx], &trimmed[idx + 1..]),
+        None => ("", trimmed),
+    }
+}
+
+/// Renames an item through the router: the local fast path for a local
+/// path, or the item's backend for a remote URI. Returns the new path
+/// in the same form as `path` — a plain local path or a full URI.
+pub fn rename_item_at(
+    router: &crate::vfs::BackendRouter,
+    path: &str,
+    new_name: &str,
+) -> Result<String, ItemError> {
+    match crate::vfs::VPath::parse(path) {
+        crate::vfs::VPath::Local(p) => {
+            rename_item(&p, new_name).map(|dest| dest.display().to_string())
+        }
+        crate::vfs::VPath::Remote {
+            scheme, connection, ..
+        } => {
+            if new_name.is_empty() || new_name.contains('/') {
+                return Err(ItemError {
+                    path: path.to_string(),
+                    message: "invalid name".to_string(),
+                });
+            }
+            let (backend, backend_path) = router.resolve(path).map_err(|message| ItemError {
+                path: path.to_string(),
+                message,
+            })?;
+            if !backend.capabilities().can_rename {
+                return Err(ItemError {
+                    path: path.to_string(),
+                    message: "rename is not supported on this connection".to_string(),
+                });
+            }
+            let (parent, _name) = split_backend_path(&backend_path);
+            let dest_path = join_backend_path(parent, new_name);
+            if backend.stat(&dest_path).is_ok() {
+                return Err(ItemError {
+                    path: crate::vfs::join_uri(scheme, &connection, &dest_path),
+                    message: "an item with this name already exists".to_string(),
+                });
+            }
+            backend
+                .rename(&backend_path, &dest_path)
+                .map_err(|message| ItemError {
+                    path: path.to_string(),
+                    message,
+                })?;
+            Ok(crate::vfs::join_uri(scheme, &connection, &dest_path))
+        }
+    }
+}
+
+/// Creates a new folder through the router. Appends " 2", " 3", … when
+/// the name is taken, using the same rule as the local fast path.
+/// Returns the new path in the same form as `parent`.
+pub fn create_folder_at(
+    router: &crate::vfs::BackendRouter,
+    parent: &str,
+    name: &str,
+) -> Result<String, ItemError> {
+    match crate::vfs::VPath::parse(parent) {
+        crate::vfs::VPath::Local(p) => {
+            create_folder(&p, name).map(|dest| dest.display().to_string())
+        }
+        crate::vfs::VPath::Remote {
+            scheme, connection, ..
+        } => {
+            let (backend, backend_parent) =
+                router.resolve(parent).map_err(|message| ItemError {
+                    path: parent.to_string(),
+                    message,
+                })?;
+            let exists =
+                |candidate: &str| backend.stat(&join_backend_path(&backend_parent, candidate)).is_ok();
+            let chosen = numbered_name(name, |n| format!("{name} {n}"), exists);
+            let dest_path = join_backend_path(&backend_parent, &chosen);
+            backend.mkdir(&dest_path).map_err(|message| ItemError {
+                path: parent.to_string(),
+                message,
+            })?;
+            Ok(crate::vfs::join_uri(scheme, &connection, &dest_path))
+        }
+    }
+}
+
+/// Creates an empty file through the router. Appends " 2", " 3", … into
+/// the stem when the name is taken, mirroring the folder behavior.
+/// Returns the new path in the same form as `parent`.
+pub fn create_file_at(
+    router: &crate::vfs::BackendRouter,
+    parent: &str,
+    name: &str,
+) -> Result<String, ItemError> {
+    if name.is_empty() || name.contains('/') {
+        return Err(ItemError {
+            path: parent.to_string(),
+            message: "invalid name".to_string(),
+        });
+    }
+    match crate::vfs::VPath::parse(parent) {
+        crate::vfs::VPath::Local(p) => {
+            create_file(&p, name).map(|dest| dest.display().to_string())
+        }
+        crate::vfs::VPath::Remote {
+            scheme, connection, ..
+        } => {
+            let (backend, backend_parent) =
+                router.resolve(parent).map_err(|message| ItemError {
+                    path: parent.to_string(),
+                    message,
+                })?;
+            let stem_ext = split_stem(name);
+            let exists =
+                |candidate: &str| backend.stat(&join_backend_path(&backend_parent, candidate)).is_ok();
+            let chosen = numbered_name(
+                name,
+                |n| match &stem_ext {
+                    Some((stem, ext)) => format!("{stem} {n}.{ext}"),
+                    None => format!("{name} {n}"),
+                },
+                exists,
+            );
+            let dest_path = join_backend_path(&backend_parent, &chosen);
+            let writer = backend
+                .create_write(&dest_path, Some(0))
+                .map_err(|message| ItemError {
+                    path: parent.to_string(),
+                    message,
+                })?;
+            writer.finish().map_err(|message| ItemError {
+                path: parent.to_string(),
+                message,
+            })?;
+            Ok(crate::vfs::join_uri(scheme, &connection, &dest_path))
+        }
+    }
 }
 
 /// Splits "report.txt" into ("report", "txt"). None for names without
@@ -629,10 +835,20 @@ fn run_job(
                     }],
                 );
             }
-            OpKind::Duplicate { .. }
-            | OpKind::Trash { .. }
-            | OpKind::Archive { .. }
-            | OpKind::Extract { .. } => {
+            OpKind::Duplicate { sources } => {
+                run_duplicate_via_router(job, sink, router, sources);
+            }
+            OpKind::Trash { .. } | OpKind::Archive { .. } => {
+                sink.job_finished(
+                    job.id,
+                    JobState::Failed,
+                    vec![ItemError {
+                        path: String::new(),
+                        message: "not supported on remote locations yet".to_string(),
+                    }],
+                );
+            }
+            OpKind::Extract { .. } => {
                 sink.job_finished(
                     job.id,
                     JobState::Failed,
@@ -766,76 +982,104 @@ fn run_job(
             dest_dir,
             format,
         } => {
-            let dest = crate::archives::choose_archive_name(dest_dir, sources, *format);
-            let mut last_done: u64 = 0;
-            // Each progress callback closes one walked member, so item and
-            // byte counters track the pre-scan exactly.
-            let mut progress = |done: u64, _total: u64, current: &str| {
-                let delta = done.saturating_sub(last_done);
-                last_done = done;
-                ctx.item_finished(Path::new(current), delta);
-            };
-            let cancel_check = || job.cancel.load(Ordering::Relaxed);
-            match crate::archives::create_archive(
-                sources,
-                &dest,
-                *format,
-                &mut progress,
-                &cancel_check,
-            ) {
-                Ok(()) => {
-                    // Undo trashes the archive; it never deletes user data.
-                    ctx.recorded.push(UndoAction::Trash { path: dest });
-                }
-                Err(message) => {
-                    // A partial archive is worthless; remove it always.
-                    let _ = remove_recursively(&dest);
-                    if message != "cancelled" {
-                        let path = sources.first().cloned().unwrap_or_default();
-                        ctx.fail_item(&path, &message);
+            // job_is_local already guarantees this, but a local-only
+            // operation must never build a relative PathBuf from a URI,
+            // so the check runs again here at the point of use.
+            let remote_source = first_remote(
+                sources
+                    .iter()
+                    .map(PathBuf::as_path)
+                    .chain(std::iter::once(dest_dir.as_path())),
+            );
+            if let Some(error) = remote_source {
+                ctx.fail_item(Path::new(&error.path), &error.message);
+            } else {
+                let dest = crate::archives::choose_archive_name(dest_dir, sources, *format);
+                let mut last_done: u64 = 0;
+                // Each progress callback closes one walked member, so item and
+                // byte counters track the pre-scan exactly.
+                let mut progress = |done: u64, _total: u64, current: &str| {
+                    let delta = done.saturating_sub(last_done);
+                    last_done = done;
+                    ctx.item_finished(Path::new(current), delta);
+                };
+                let cancel_check = || job.cancel.load(Ordering::Relaxed);
+                match crate::archives::create_archive(
+                    sources,
+                    &dest,
+                    *format,
+                    &mut progress,
+                    &cancel_check,
+                ) {
+                    Ok(()) => {
+                        // Undo trashes the archive; it never deletes user data.
+                        ctx.recorded.push(UndoAction::Trash { path: dest });
+                    }
+                    Err(message) => {
+                        // A partial archive is worthless; remove it always.
+                        let _ = remove_recursively(&dest);
+                        if message != "cancelled" {
+                            let path = sources.first().cloned().unwrap_or_default();
+                            ctx.fail_item(&path, &message);
+                        }
                     }
                 }
             }
         }
         OpKind::Extract { archive } => {
-            let dest_dir = crate::archives::choose_extract_dir(archive);
-            let existed_before = dest_dir.symlink_metadata().is_ok();
-            match std::fs::create_dir_all(&dest_dir) {
-                Ok(()) => {
-                    let mut last_done: u64 = 0;
-                    let mut progress = |done: u64, _total: u64, current: &str| {
-                        let delta = done.saturating_sub(last_done);
-                        last_done = done;
-                        ctx.add_bytes(Path::new(current), delta);
-                    };
-                    let cancel_check = || job.cancel.load(Ordering::Relaxed);
-                    match crate::archives::extract(archive, &dest_dir, &mut progress, &cancel_check)
-                    {
-                        Ok(items) => {
-                            for item in items {
-                                if item.symlink_metadata().is_ok() {
-                                    ctx.recorded.push(UndoAction::Trash { path: item });
+            let remote_source = first_remote(std::iter::once(archive.as_path()));
+            if let Some(error) = remote_source {
+                ctx.fail_item(Path::new(&error.path), &error.message);
+            } else {
+                let dest_dir = crate::archives::choose_extract_dir(archive);
+                let existed_before = dest_dir.symlink_metadata().is_ok();
+                match std::fs::create_dir_all(&dest_dir) {
+                    Ok(()) => {
+                        let mut last_done: u64 = 0;
+                        let mut progress = |done: u64, _total: u64, current: &str| {
+                            let delta = done.saturating_sub(last_done);
+                            last_done = done;
+                            ctx.add_bytes(Path::new(current), delta);
+                        };
+                        let cancel_check = || job.cancel.load(Ordering::Relaxed);
+                        match crate::archives::extract(
+                            archive,
+                            &dest_dir,
+                            &mut progress,
+                            &cancel_check,
+                        ) {
+                            Ok(items) => {
+                                for item in items {
+                                    if item.symlink_metadata().is_ok() {
+                                        ctx.recorded.push(UndoAction::Trash { path: item });
+                                    }
                                 }
+                                ctx.item_finished(archive, 0);
                             }
-                            ctx.item_finished(archive, 0);
-                        }
-                        Err(message) => {
-                            // A cancelled or failed extract leaves no undo
-                            // entry, so its fresh empty folder is clutter.
-                            if message != "cancelled" {
-                                ctx.fail_item(archive, &message);
+                            Err(message) => {
+                                // A cancelled or failed extract leaves no undo
+                                // entry, so its fresh empty folder is clutter.
+                                if message != "cancelled" {
+                                    ctx.fail_item(archive, &message);
+                                }
+                                remove_dir_if_empty_and_fresh(&dest_dir, existed_before);
                             }
-                            remove_dir_if_empty_and_fresh(&dest_dir, existed_before);
                         }
                     }
+                    Err(e) => ctx.fail_item(archive, &e.to_string()),
                 }
-                Err(e) => ctx.fail_item(archive, &e.to_string()),
             }
         }
         OpKind::Trash { sources } => {
             for source in sources {
                 if ctx.cancelled() {
                     break;
+                }
+                // job_is_local already guarantees this item is local; the
+                // check runs again so trash_one never receives a URI.
+                if let Err(error) = require_local(&source.to_string_lossy()) {
+                    ctx.errors.push(error);
+                    continue;
                 }
                 trash_one(&mut ctx, delegate, source);
             }
@@ -1091,6 +1335,93 @@ fn run_generic_transfer(
 /// or a bare "/" both yield "/name".
 fn join_backend_path(base: &str, name: &str) -> String {
     format!("{}/{name}", base.trim_end_matches('/'))
+}
+
+/// Duplicate with at least one remote source. Every item resolves
+/// through the router, so a local item in the same list is served by
+/// the router's built-in local backend and a mixed list works per item
+/// with no special-casing. A duplicate always stays on one backend, so
+/// [`transfer_entry`] can use a native copy when the backend has one.
+fn run_duplicate_via_router(
+    job: &Job,
+    sink: &dyn EventSink,
+    router: &crate::vfs::BackendRouter,
+    sources: &[PathBuf],
+) {
+    sink.job_progress(preparing_progress(job.id));
+    if job.cancel.load(Ordering::Relaxed) {
+        sink.job_finished(job.id, JobState::Cancelled, Vec::new());
+        return;
+    }
+    let (items_total, bytes_total) = measure_via_router(router, sources);
+    let mut ctx = JobContext {
+        job_id: job.id,
+        cancel: &job.cancel,
+        sink,
+        bytes_done: 0,
+        bytes_total,
+        items_done: 0,
+        items_total,
+        errors: Vec::new(),
+        recorded: Vec::new(),
+        committed: false,
+        last_emit: Instant::now(),
+    };
+    for source in sources {
+        if ctx.cancelled() {
+            break;
+        }
+        let source_uri = source.to_string_lossy();
+        let (backend, src_path) = match router.resolve(&source_uri) {
+            Ok(resolved) => resolved,
+            Err(message) => {
+                ctx.fail_item(source, &message);
+                continue;
+            }
+        };
+        let dest_path = match duplicate_backend_name(&backend, &src_path) {
+            Ok(path) => path,
+            Err(message) => {
+                ctx.fail_item(source, &message);
+                continue;
+            }
+        };
+        transfer_entry(&mut ctx, &backend, &src_path, &backend, &dest_path);
+    }
+    let state = finish_state(&ctx);
+    sink.job_finished(job.id, state, std::mem::take(&mut ctx.errors));
+}
+
+/// "photo.jpg" -> "photo copy.jpg", then "photo copy 2.jpg", … using a
+/// backend's own existence check. Mirrors [`duplicate_name`] for the
+/// local filesystem. A directory keeps its whole name as the stem, the
+/// same rule [`copy_name_in`] uses locally.
+fn duplicate_backend_name(
+    backend: &Arc<dyn crate::vfs::FsBackend>,
+    src_path: &str,
+) -> Result<String, String> {
+    let (parent, name) = split_backend_path(src_path);
+    let is_dir = backend
+        .stat(src_path)
+        .map(|entry| entry.is_dir)
+        .unwrap_or(false);
+    let (stem, ext) = if is_dir {
+        (name.to_string(), String::new())
+    } else {
+        match name.rsplit_once('.') {
+            Some((stem, ext)) if !stem.is_empty() && !ext.is_empty() => {
+                (stem.to_string(), format!(".{ext}"))
+            }
+            _ => (name.to_string(), String::new()),
+        }
+    };
+    let exists = |candidate: &str| backend.stat(&join_backend_path(parent, candidate)).is_ok();
+    let chosen = numbered_name(
+        &format!("{stem} copy{ext}"),
+        |n| format!("{stem} copy {n}{ext}"),
+        exists,
+    );
+    Ok(join_backend_path(parent, &chosen))
 }
 
 /// Pre-scan through the router: item count and byte size for progress.
@@ -2728,7 +3059,7 @@ mod tests {
 
         assert_eq!(state, JobState::Failed);
         assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].message, "not supported for remote items");
+        assert_eq!(errors[0].message, "not supported on remote locations yet");
         assert!(engine.undo_description().is_none());
         engine.shutdown();
     }
@@ -3062,5 +3393,297 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         engine.shutdown();
+    }
+
+    // -----------------------------------------------------------------
+    // Remote routing: rename, create folder/file, duplicate
+    // -----------------------------------------------------------------
+
+    /// Minimal in-memory backend for remote-routing tests: only the
+    /// operations `ops.rs` exercises (stat, list, mkdir, create_write,
+    /// rename, delete). Not a general-purpose fake.
+    #[derive(Default)]
+    struct MemFsState {
+        dirs: std::collections::HashSet<String>,
+        files: HashMap<String, Vec<u8>>,
+    }
+
+    struct MemFs {
+        state: Arc<Mutex<MemFsState>>,
+        can_rename: bool,
+    }
+
+    impl MemFs {
+        fn new() -> Self {
+            let mut state = MemFsState::default();
+            state.dirs.insert("/".to_string());
+            Self {
+                state: Arc::new(Mutex::new(state)),
+                can_rename: true,
+            }
+        }
+
+        fn without_rename(mut self) -> Self {
+            self.can_rename = false;
+            self
+        }
+
+        fn add_dir(&self, path: &str) {
+            self.state.lock().unwrap().dirs.insert(path.to_string());
+        }
+
+        fn add_file(&self, path: &str, bytes: &[u8]) {
+            self.state
+                .lock()
+                .unwrap()
+                .files
+                .insert(path.to_string(), bytes.to_vec());
+        }
+
+        fn file(&self, path: &str) -> Option<Vec<u8>> {
+            self.state.lock().unwrap().files.get(path).cloned()
+        }
+    }
+
+    fn mem_name_of(path: &str) -> &str {
+        path.trim_end_matches('/').rsplit('/').next().unwrap_or(path)
+    }
+
+    fn mem_parent_of(path: &str) -> &str {
+        let trimmed = path.trim_end_matches('/');
+        match trimmed.rfind('/') {
+            Some(0) => "/",
+            Some(i) => &trimmed[..i],
+            None => "/",
+        }
+    }
+
+    fn mem_entry(path: &str, is_dir: bool, size: u64) -> crate::Entry {
+        crate::Entry {
+            name: mem_name_of(path).to_string(),
+            path: path.to_string(),
+            is_dir,
+            size,
+            modified_ms: 0,
+            is_hidden: false,
+            is_symlink: false,
+        }
+    }
+
+    /// Commits its buffer to the shared map on finish, mirroring the
+    /// close-time commit real network backends need.
+    struct MemWriter {
+        state: Arc<Mutex<MemFsState>>,
+        path: String,
+        buf: Vec<u8>,
+    }
+
+    impl std::io::Write for MemWriter {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.buf.extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl crate::vfs::WriteFinish for MemWriter {
+        fn finish(self: Box<Self>) -> Result<(), String> {
+            self.state
+                .lock()
+                .unwrap()
+                .files
+                .insert(self.path.clone(), self.buf.clone());
+            Ok(())
+        }
+    }
+
+    impl crate::vfs::FsBackend for MemFs {
+        fn capabilities(&self) -> crate::vfs::Capabilities {
+            crate::vfs::Capabilities {
+                is_local: false,
+                can_trash: false,
+                can_watch: false,
+                can_rename: self.can_rename,
+                server_side_copy: false,
+                preserves_permissions: false,
+            }
+        }
+
+        fn list_dir(
+            &self,
+            path: &str,
+            _opts: &crate::ListOptions,
+        ) -> Result<Vec<crate::Entry>, String> {
+            let state = self.state.lock().unwrap();
+            let dir = if path == "/" {
+                "/"
+            } else {
+                path.trim_end_matches('/')
+            };
+            if !state.dirs.contains(dir) {
+                return Err(format!("not found: {path}"));
+            }
+            let mut entries = Vec::new();
+            for d in &state.dirs {
+                if d != dir && mem_parent_of(d) == dir {
+                    entries.push(mem_entry(d, true, 0));
+                }
+            }
+            for (f, bytes) in &state.files {
+                if mem_parent_of(f) == dir {
+                    entries.push(mem_entry(f, false, bytes.len() as u64));
+                }
+            }
+            Ok(entries)
+        }
+
+        fn stat(&self, path: &str) -> Result<crate::Entry, String> {
+            let state = self.state.lock().unwrap();
+            let key = if path == "/" {
+                "/"
+            } else {
+                path.trim_end_matches('/')
+            };
+            if state.dirs.contains(key) {
+                return Ok(mem_entry(key, true, 0));
+            }
+            if let Some(bytes) = state.files.get(key) {
+                return Ok(mem_entry(key, false, bytes.len() as u64));
+            }
+            Err(format!("not found: {path}"))
+        }
+
+        fn open_read(&self, path: &str) -> Result<Box<dyn std::io::Read + Send>, String> {
+            let bytes = self.file(path).ok_or_else(|| format!("not found: {path}"))?;
+            Ok(Box::new(std::io::Cursor::new(bytes)))
+        }
+
+        fn create_write(
+            &self,
+            path: &str,
+            _size_hint: Option<u64>,
+        ) -> Result<Box<dyn crate::vfs::WriteFinish>, String> {
+            Ok(Box::new(MemWriter {
+                state: self.state.clone(),
+                path: path.to_string(),
+                buf: Vec::new(),
+            }))
+        }
+
+        fn delete(&self, path: &str, _recursive: bool) -> Result<(), String> {
+            let mut state = self.state.lock().unwrap();
+            if state.files.remove(path).is_some() {
+                return Ok(());
+            }
+            if state.dirs.remove(path) {
+                return Ok(());
+            }
+            Err(format!("not found: {path}"))
+        }
+
+        fn rename(&self, from: &str, to: &str) -> Result<(), String> {
+            let mut state = self.state.lock().unwrap();
+            if let Some(bytes) = state.files.remove(from) {
+                state.files.insert(to.to_string(), bytes);
+                return Ok(());
+            }
+            if state.dirs.remove(from) {
+                state.dirs.insert(to.to_string());
+                return Ok(());
+            }
+            Err(format!("not found: {from}"))
+        }
+
+        fn mkdir(&self, path: &str) -> Result<(), String> {
+            let mut state = self.state.lock().unwrap();
+            if state.dirs.contains(path) || state.files.contains_key(path) {
+                return Err(format!("already exists: {path}"));
+            }
+            state.dirs.insert(path.to_string());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn remote_rename_happy_path() {
+        let router = crate::vfs::BackendRouter::new();
+        let backend = Arc::new(MemFs::new());
+        backend.add_dir("/dir");
+        backend.add_file("/dir/old.txt", b"hi");
+        router.register("fake".to_string(), backend.clone());
+
+        let new_path = rename_item_at(&router, "sftp://fake/dir/old.txt", "new.txt").unwrap();
+
+        assert_eq!(new_path, "sftp://fake/dir/new.txt");
+        assert_eq!(backend.file("/dir/new.txt"), Some(b"hi".to_vec()));
+        assert!(backend.file("/dir/old.txt").is_none());
+    }
+
+    #[test]
+    fn remote_rename_refused_when_backend_disallows_it() {
+        let router = crate::vfs::BackendRouter::new();
+        let backend = Arc::new(MemFs::new().without_rename());
+        backend.add_file("/a.txt", b"x");
+        router.register("fake".to_string(), backend.clone());
+
+        let error = rename_item_at(&router, "sftp://fake/a.txt", "b.txt").unwrap_err();
+
+        assert_eq!(error.message, "rename is not supported on this connection");
+        assert!(backend.file("/a.txt").is_some());
+    }
+
+    #[test]
+    fn remote_create_folder_numbers_duplicates() {
+        let router = crate::vfs::BackendRouter::new();
+        let backend = Arc::new(MemFs::new());
+        backend.add_dir("/dir");
+        backend.add_dir("/dir/untitled folder");
+        router.register("fake".to_string(), backend.clone());
+
+        let created = create_folder_at(&router, "sftp://fake/dir", "untitled folder").unwrap();
+
+        assert_eq!(created, "sftp://fake/dir/untitled folder 2");
+    }
+
+    #[test]
+    fn remote_create_file_numbers_duplicates_into_the_stem() {
+        let router = crate::vfs::BackendRouter::new();
+        let backend = Arc::new(MemFs::new());
+        backend.add_dir("/dir");
+        backend.add_file("/dir/report.txt", b"x");
+        router.register("fake".to_string(), backend.clone());
+
+        let created = create_file_at(&router, "sftp://fake/dir", "report.txt").unwrap();
+
+        assert_eq!(created, "sftp://fake/dir/report 2.txt");
+        assert_eq!(backend.file("/dir/report 2.txt"), Some(Vec::new()));
+    }
+
+    #[test]
+    fn remote_duplicate_produces_a_copy_with_the_same_content() {
+        let trash = tempfile::tempdir().unwrap();
+        let (engine, rx) = engine(trash.path());
+        let backend = Arc::new(MemFs::new());
+        backend.add_file("/photo.jpg", b"bytes");
+        engine.router().register("fake".to_string(), backend.clone());
+
+        let job = engine.duplicate(vec![PathBuf::from("sftp://fake/photo.jpg")]);
+        let (_, state, errors) = wait(&rx, job);
+
+        assert_eq!(state, JobState::Done, "errors: {errors:?}");
+        assert_eq!(backend.file("/photo copy.jpg"), Some(b"bytes".to_vec()));
+        assert_eq!(backend.file("/photo.jpg"), Some(b"bytes".to_vec()));
+        // Duplicate records no undo for a remote item.
+        assert!(engine.undo_description().is_none());
+        engine.shutdown();
+    }
+
+    #[test]
+    fn require_local_rejects_a_uri() {
+        assert!(require_local("/Users/x/Documents").is_ok());
+        let error = require_local("sftp://work/etc/hosts").unwrap_err();
+        assert_eq!(error.message, "remote locations are not supported here");
     }
 }

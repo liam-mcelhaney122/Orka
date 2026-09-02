@@ -59,5 +59,16 @@ enum OrkaPath {
         return parentPath.isEmpty ? root : root + parentPath
     }
 
+    /// True when both remote URIs name the same connection. A remote
+    /// path has no volume to compare the way two local paths do, so this
+    /// is the closest equivalent for deciding whether a remote-to-remote
+    /// drag can move instead of copy. False when either path is local.
+    static func sameConnection(_ a: String, _ b: String) -> Bool {
+        guard let ca = splitRemote(a)?.connection,
+            let cb = splitRemote(b)?.connection
+        else { return false }
+        return ca == cb
+    }
+
     private static let slashes = CharacterSet(charactersIn: "/")
 }

@@ -278,6 +278,9 @@ final class WindowState: Identifiable {
     /// Requests recursive totals for the subdirectories shown in the
     /// active pane. Only misses are requested; cached totals carry over.
     func requestFolderSizesForActivePane() {
+        // A remote walk is one round trip per directory with no bound.
+        // Remote sizes come only from an explicit Get Info request.
+        guard OrkaPath.isLocal(activePane.directory.path) else { return }
         let dirs = activePane.directory.entries
             .filter(\.isDir)
             .map(\.path)
@@ -293,6 +296,7 @@ final class WindowState: Identifiable {
     /// in the status bar next to the free space.
     func requestPaneFolderSize() {
         let path = activePane.directory.path
+        // Same bound as above: no automatic walk of a remote tree.
         guard OrkaPath.isLocal(path) else { return }
         guard !app.folderSizes.isFresh(path) else { return }
         if let previous = paneSizeRequestId {
