@@ -73,7 +73,10 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::connections::{AuthMethod, BackendFactory, ConnectionConfig, SecretProvider};
-use super::http::{agent, error_string, parse_rfc1123_to_ms, parse_rfc3339_to_ms, response_reader, url_encode};
+use super::http::{
+    agent, error_string, parse_rfc1123_to_ms, parse_rfc3339_to_ms, response_reader, url_encode,
+};
+use super::secret::SecretFields;
 use super::{Capabilities, FsBackend, WriteFinish};
 use crate::{Entry, ListOptions};
 
@@ -163,7 +166,7 @@ fn credentials_from_secret(access_key: &str, secret: &str) -> Result<Credentials
     let fields = SecretFields::parse(secret);
     let secret_key = match &fields {
         SecretFields::Plain(s) => s.clone(),
-        SecretFields::Json(_) => fields
+        SecretFields::Structured(_) => fields
             .field("secret_access_key")
             .ok_or_else(|| "s3 secret is missing secret_access_key".to_string())?
             .to_string(),
@@ -174,45 +177,6 @@ fn credentials_from_secret(access_key: &str, secret: &str) -> Result<Credentials
         secret_key,
         session_token,
     })
-}
-
-/// Reads a keychain secret that is either a plain string or a JSON
-/// object of named fields.
-///
-/// This mirrors the shape the shared `vfs::secret` module is meant to
-/// provide for the other backends' new auth methods; that module is
-/// not on this branch yet (see the delivery notes), so this backend
-/// carries its own copy rather than reach across a file boundary that
-/// does not exist. A raw value that starts with `{` and parses as a
-/// JSON object is structured; anything else is plain.
-enum SecretFields {
-    Plain(String),
-    Json(HashMap<String, String>),
-}
-
-impl SecretFields {
-    fn parse(raw: &str) -> Self {
-        if raw.trim_start().starts_with('{') {
-            if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(raw)
-            {
-                let fields = map
-                    .into_iter()
-                    .filter_map(|(k, v)| v.as_str().map(|s| (k, s.to_string())))
-                    .collect();
-                return SecretFields::Json(fields);
-            }
-        }
-        SecretFields::Plain(raw.to_string())
-    }
-
-    /// The named field of a structured secret. `None` for a plain
-    /// secret or a missing field.
-    fn field(&self, name: &str) -> Option<&str> {
-        match self {
-            SecretFields::Json(map) => map.get(name).map(|s| s.as_str()),
-            SecretFields::Plain(_) => None,
-        }
-    }
 }
 
 /// Derives the AWS region from the endpoint host. Recognizes the
@@ -382,10 +346,7 @@ fn parse_ini_section(contents: &str, section_name: &str) -> Option<HashMap<Strin
         }
         if in_section {
             if let Some((key, value)) = line.split_once('=') {
-                map.insert(
-                    key.trim().to_ascii_lowercase(),
-                    value.trim().to_string(),
-                );
+                map.insert(key.trim().to_ascii_lowercase(), value.trim().to_string());
             }
         }
     }
@@ -486,7 +447,11 @@ fn parse_credential_process_json(json: &str) -> Result<Credentials, String> {
 /// endpoint for `region` (`sts.amazonaws.com` for `us-east-1`,
 /// `sts.<region>.amazonaws.com` otherwise), since STS is regional
 /// everywhere except that legacy global endpoint.
-fn assume_role(source_creds: &Credentials, role_arn: &str, region: &str) -> Result<Credentials, String> {
+fn assume_role(
+    source_creds: &Credentials,
+    role_arn: &str,
+    region: &str,
+) -> Result<Credentials, String> {
     let host = sts_host(region);
     let query = vec![
         ("Action".to_string(), "AssumeRole".to_string()),
@@ -621,7 +586,11 @@ fn load_sso_credentials(
             .cloned()
             .or_else(|| session_section.get("sso_region").cloned())
             .ok_or_else(|| format!("AWS profile '{profile}' has no sso_region"))?;
-        (region, session_section.get("sso_start_url").cloned(), Some(session.clone()))
+        (
+            region,
+            session_section.get("sso_start_url").cloned(),
+            Some(session.clone()),
+        )
     } else {
         let region = section
             .get("sso_region")
@@ -636,7 +605,8 @@ fn load_sso_credentials(
             format!("no valid SSO session found for AWS profile '{profile}'; run `aws sso login --profile {profile}`")
         })?;
 
-    let body = fetch_sso_role_credentials(&agent(), &sso_region, account_id, role_name, &access_token)?;
+    let body =
+        fetch_sso_role_credentials(&agent(), &sso_region, account_id, role_name, &access_token)?;
     parse_sso_role_credentials(&body)
 }
 
@@ -897,10 +867,10 @@ impl S3Core {
     ///
     /// `credentials` being `None` (`AuthMethod::None`, anonymous
     /// access) returns a `None` authorization and skips signing
-    /// entirely, so the caller sends the request with no
-    /// `Authorization` header at all — pure and network-free, so both
-    /// the signed and the anonymous path are unit-testable without a
-    /// server.
+    /// entirely. The caller then sends the request with no
+    /// `Authorization` header at all. This function is pure and
+    /// network-free, so both the signed and the anonymous path are
+    /// unit-testable without a server.
     #[allow(clippy::too_many_arguments)]
     fn build_request_headers(
         credentials: Option<&Credentials>,
@@ -1252,7 +1222,14 @@ impl FsBackend for S3Backend {
         }
         let response = self
             .core
-            .request(Method::Get, &bucket, key.trim_end_matches('/'), &[], &[], None)
+            .request(
+                Method::Get,
+                &bucket,
+                key.trim_end_matches('/'),
+                &[],
+                &[],
+                None,
+            )
             .map_err(|e| request_error("cannot open", path, *e))?;
         Ok(response_reader(response))
     }
@@ -1341,7 +1318,10 @@ impl FsBackend for S3Backend {
         }
         let exact = key.trim_end_matches('/');
         if exact.is_empty() {
-            return Err("cannot create a bucket from a folder path; add it as its own connection".to_string());
+            return Err(
+                "cannot create a bucket from a folder path; add it as its own connection"
+                    .to_string(),
+            );
         }
         self.core.put_object(&bucket, &format!("{exact}/"), &[])
     }
@@ -1354,7 +1334,11 @@ impl FsBackend for S3Backend {
         let (dst_bucket, dst_key) = split_bucket_key(to);
         let src_exact = src_key.trim_end_matches('/');
         let dst_exact = dst_key.trim_end_matches('/');
-        if src_bucket.is_empty() || dst_bucket.is_empty() || src_exact.is_empty() || dst_exact.is_empty() {
+        if src_bucket.is_empty()
+            || dst_bucket.is_empty()
+            || src_exact.is_empty()
+            || dst_exact.is_empty()
+        {
             return None;
         }
         Some(
@@ -1459,7 +1443,9 @@ fn canonical_request(
     signed_headers: &str,
     payload_hash: &str,
 ) -> String {
-    format!("{method}\n{uri}\n{query_string}\n{canonical_headers}\n{signed_headers}\n{payload_hash}")
+    format!(
+        "{method}\n{uri}\n{query_string}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
+    )
 }
 
 /// Builds the SigV4 string to sign from the canonical request's hash.
@@ -1473,7 +1459,10 @@ fn string_to_sign(amz_date: &str, credential_scope: &str, canonical_request: &st
 /// Derives the SigV4 signing key through the date/region/service/
 /// request chain of HMACs.
 fn signing_key(secret_key: &str, date_stamp: &str, region: &str, service: &str) -> Vec<u8> {
-    let k_date = hmac_sha256(format!("AWS4{secret_key}").as_bytes(), date_stamp.as_bytes());
+    let k_date = hmac_sha256(
+        format!("AWS4{secret_key}").as_bytes(),
+        date_stamp.as_bytes(),
+    );
     let k_region = hmac_sha256(&k_date, region.as_bytes());
     let k_service = hmac_sha256(&k_region, service.as_bytes());
     hmac_sha256(&k_service, b"aws4_request")
@@ -1736,10 +1725,7 @@ mod tests {
     #[test]
     fn region_from_host_defaults_for_custom_endpoints() {
         assert_eq!(region_from_host("minio.example.com"), "us-east-1");
-        assert_eq!(
-            region_from_host("nyc3.digitaloceanspaces.com"),
-            "us-east-1"
-        );
+        assert_eq!(region_from_host("nyc3.digitaloceanspaces.com"), "us-east-1");
         assert_eq!(region_from_host(""), "us-east-1");
     }
 
@@ -1824,9 +1810,13 @@ mod tests {
         );
         assert_eq!(authorization, None);
         assert!(!headers.iter().any(|(k, _)| k == "x-amz-security-token"));
-        assert!(!headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("authorization")));
+        assert!(!headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("authorization")));
         // The unsigned request still carries the standard headers.
-        assert!(headers.iter().any(|(k, v)| k == "host" && v == "s3.amazonaws.com"));
+        assert!(headers
+            .iter()
+            .any(|(k, v)| k == "host" && v == "s3.amazonaws.com"));
     }
 
     #[test]
@@ -2013,8 +2003,14 @@ mod tests {
 
     #[test]
     fn authorization_header_has_the_documented_shape() {
-        let header =
-            authorization_header("AKIDEXAMPLE", "20150830", "us-east-1", "s3", "host;x-amz-date", "deadbeef");
+        let header = authorization_header(
+            "AKIDEXAMPLE",
+            "20150830",
+            "us-east-1",
+            "s3",
+            "host;x-amz-date",
+            "deadbeef",
+        );
         assert_eq!(
             header,
             "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/s3/aws4_request, \
@@ -2025,7 +2021,10 @@ mod tests {
     #[test]
     fn signing_key_changes_with_any_input() {
         let base = signing_key("secret", "20150830", "us-east-1", "s3");
-        assert_ne!(base, signing_key("other-secret", "20150830", "us-east-1", "s3"));
+        assert_ne!(
+            base,
+            signing_key("other-secret", "20150830", "us-east-1", "s3")
+        );
         assert_ne!(base, signing_key("secret", "20150831", "us-east-1", "s3"));
         assert_ne!(base, signing_key("secret", "20150830", "eu-west-1", "s3"));
         assert_ne!(base, signing_key("secret", "20150830", "us-east-1", "iam"));
@@ -2083,7 +2082,10 @@ mod tests {
         </ListBucketResult>"#;
         let page = parse_list_objects(xml);
         assert_eq!(page.contents.len(), 2);
-        assert_eq!(page.contents[0], ("photos/a.jpg".to_string(), 1024, 1_685_546_063_000));
+        assert_eq!(
+            page.contents[0],
+            ("photos/a.jpg".to_string(), 1024, 1_685_546_063_000)
+        );
         assert_eq!(page.common_prefixes, vec!["photos/2023/".to_string()]);
         assert_eq!(page.next_continuation_token, Some("token-1".to_string()));
     }
@@ -2167,9 +2169,10 @@ mod tests {
     }
 
     /// The `[profile <name>]` section in `config` holds `role_arn` and
-    /// friends; the section named exactly `<name>` in `credentials`
-    /// holds the static keys. `profile_section` must merge both, with
-    /// `credentials` winning on any key both files define.
+    /// the other role-assumption keys. The section named exactly
+    /// `<name>` in `credentials` holds the static keys.
+    /// `profile_section` must merge both, with `credentials` winning
+    /// on any key both files define.
     #[test]
     fn profile_section_merges_config_and_credentials_files() {
         let dir = tempfile::tempdir().unwrap();
@@ -2254,8 +2257,8 @@ mod tests {
 
     #[test]
     fn parse_assume_role_credentials_rejects_a_response_with_no_credentials() {
-        let err = parse_assume_role_credentials("<AssumeRoleResponse></AssumeRoleResponse>")
-            .unwrap_err();
+        let err =
+            parse_assume_role_credentials("<AssumeRoleResponse></AssumeRoleResponse>").unwrap_err();
         assert!(err.contains("Credentials"), "got: {err}");
     }
 
@@ -2296,11 +2299,8 @@ mod tests {
             "abc123.json",
             r#"{"startUrl":"https://example.awsapps.com/start","accessToken":"cached-token","expiresAt":"2099-01-01T00:00:00Z"}"#,
         );
-        let token = find_cached_sso_token(
-            dir.path(),
-            Some("https://example.awsapps.com/start"),
-            None,
-        );
+        let token =
+            find_cached_sso_token(dir.path(), Some("https://example.awsapps.com/start"), None);
         assert_eq!(token.as_deref(), Some("cached-token"));
     }
 
@@ -2324,11 +2324,8 @@ mod tests {
             "expired.json",
             r#"{"startUrl":"https://example.awsapps.com/start","accessToken":"stale-token","expiresAt":"2000-01-01T00:00:00Z"}"#,
         );
-        let token = find_cached_sso_token(
-            dir.path(),
-            Some("https://example.awsapps.com/start"),
-            None,
-        );
+        let token =
+            find_cached_sso_token(dir.path(), Some("https://example.awsapps.com/start"), None);
         assert_eq!(token, None);
     }
 
@@ -2340,11 +2337,8 @@ mod tests {
             "other.json",
             r#"{"startUrl":"https://other.awsapps.com/start","accessToken":"other-token","expiresAt":"2099-01-01T00:00:00Z"}"#,
         );
-        let token = find_cached_sso_token(
-            dir.path(),
-            Some("https://example.awsapps.com/start"),
-            None,
-        );
+        let token =
+            find_cached_sso_token(dir.path(), Some("https://example.awsapps.com/start"), None);
         assert_eq!(token, None);
     }
 
@@ -2393,6 +2387,17 @@ mod tests {
             AuthMethod::SshKey {
                 key_path: "~/.ssh/id_ed25519".to_string(),
             },
+            AuthMethod::SasToken,
+            AuthMethod::ServicePrincipal {
+                tenant_id: "tenant".to_string(),
+                client_id: "client".to_string(),
+            },
+            AuthMethod::OAuthApp {
+                client_id: "client".to_string(),
+                tenant_id: "tenant".to_string(),
+            },
+            AuthMethod::ServiceAccount,
+            AuthMethod::Kerberos,
         ] {
             let start = std::time::Instant::now();
             let err = S3Factory
@@ -2409,10 +2414,7 @@ mod tests {
         let err = build_core(&config(AuthMethod::S3Keys), &NoSecrets)
             .err()
             .expect("must fail");
-        assert!(
-            err.contains("no secret access key stored"),
-            "got: {err}"
-        );
+        assert!(err.contains("no secret access key stored"), "got: {err}");
     }
 
     #[test]
@@ -2486,8 +2488,7 @@ mod tests {
         // HOME (Rust runs unit tests on parallel threads in one
         // process), which is exactly what made this test flaky before.
         let empty_aws_dir = tempfile::tempdir().unwrap();
-        let err = load_profile_from_dir("default", empty_aws_dir.path())
-            .expect_err("must fail");
+        let err = load_profile_from_dir("default", empty_aws_dir.path()).expect_err("must fail");
         assert!(err.contains("no credentials found"), "got: {err}");
     }
 
