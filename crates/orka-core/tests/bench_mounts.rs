@@ -173,7 +173,7 @@ fn nfs_via_orka_mounts_and_meets_conformance() {
         eprintln!("skipping: set ORKA_BENCH=1 to run the mount bench tier");
         return;
     }
-    let _guard = MOUNT_LOCK.lock().unwrap();
+    let _guard = MOUNT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     let export = tempfile::tempdir().expect("create the NFS export directory");
     let port = spawn_nfs_server(export.path().to_path_buf());
@@ -223,7 +223,7 @@ fn nfs_server_meets_conformance_with_the_documented_mount_options() {
         eprintln!("skipping: set ORKA_BENCH=1 to run the mount bench tier");
         return;
     }
-    let _guard = MOUNT_LOCK.lock().unwrap();
+    let _guard = MOUNT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     let export = tempfile::tempdir().expect("create the NFS export directory");
     let port = spawn_nfs_server(export.path().to_path_buf());
@@ -303,7 +303,7 @@ fn smb_password_login_meets_conformance() {
         "skipping: nothing is listening on 127.0.0.1:{SMB_PORT}; run `just bench-up` first \
          (needs Homebrew samba's smbd, not macOS's own /usr/sbin/smbd)"
     );
-    let _guard = MOUNT_LOCK.lock().unwrap();
+    let _guard = MOUNT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     let id = "bench-smb-password";
     let config = smb_config(id, "secure", SMB_USER, AuthMethod::Password);
@@ -328,7 +328,7 @@ fn smb_workgroup_qualified_username_connects() {
         smb_daemon_reachable(),
         "skipping: nothing is listening on 127.0.0.1:{SMB_PORT}; run `just bench-up` first"
     );
-    let _guard = MOUNT_LOCK.lock().unwrap();
+    let _guard = MOUNT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     let id = "bench-smb-workgroup";
     let config = smb_config(id, "secure", "WORKGROUP;orka", AuthMethod::Password);
@@ -351,7 +351,7 @@ fn smb_guest_share_connects_with_no_auth() {
         smb_daemon_reachable(),
         "skipping: nothing is listening on 127.0.0.1:{SMB_PORT}; run `just bench-up` first"
     );
-    let _guard = MOUNT_LOCK.lock().unwrap();
+    let _guard = MOUNT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     let id = "bench-smb-guest";
     let config = smb_config(id, "guest", "", AuthMethod::None);
@@ -378,7 +378,7 @@ fn smb_wrong_password_fails_promptly() {
         smb_daemon_reachable(),
         "skipping: nothing is listening on 127.0.0.1:{SMB_PORT}; run `just bench-up` first"
     );
-    let _guard = MOUNT_LOCK.lock().unwrap();
+    let _guard = MOUNT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     let id = "bench-smb-wrong-password";
     let config = smb_config(id, "secure", SMB_USER, AuthMethod::Password);
@@ -412,7 +412,7 @@ fn smb_unmount_on_drop_removes_the_mount_point() {
         smb_daemon_reachable(),
         "skipping: nothing is listening on 127.0.0.1:{SMB_PORT}; run `just bench-up` first"
     );
-    let _guard = MOUNT_LOCK.lock().unwrap();
+    let _guard = MOUNT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     let id = "bench-smb-unmount";
     let config = smb_config(id, "secure", SMB_USER, AuthMethod::Password);

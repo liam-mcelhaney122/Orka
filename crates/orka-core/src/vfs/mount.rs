@@ -65,9 +65,12 @@ impl MountFactory {
         let url = build_smb_url(config, secret.as_deref())?;
         let binary = find_binary("mount_smbfs")
             .ok_or_else(|| "mount_smbfs not found on this system".to_string())?;
-        let kerberos = config.auth == AuthMethod::Kerberos;
+        // A URL without a password must not wait for a prompt.
+        let has_password =
+            config.auth == AuthMethod::Password && secret.as_deref().is_some_and(|s| !s.is_empty());
+        let no_prompt = !has_password;
         let mut command = Command::new(binary);
-        for arg in smb_argv(&url, &dir, kerberos) {
+        for arg in smb_argv(&url, &dir, no_prompt) {
             command.arg(arg);
         }
         let outcome = run_with_timeout(command, MOUNT_TIMEOUT)?;
@@ -263,7 +266,8 @@ impl Drop for MountBackend {
 /// keeps special characters from splitting the URL. Error text never
 /// contains the secret.
 ///
-/// `AuthMethod::None` always builds a guest URL and never looks at
+/// `AuthMethod::None` always builds a guest URL (`//guest@server/share`,
+/// the form mount_smbfs recognizes as a guest login) and never looks at
 /// `secret`, even if a stale secret is still stored from an earlier
 /// `Password` config: switching a saved connection to No Auth must not
 /// silently keep authenticating with a leftover credential.
@@ -287,7 +291,7 @@ fn build_smb_url(config: &ConnectionConfig, secret: Option<&str>) -> Result<Stri
         return Err("share name required".to_string());
     }
     if config.auth == AuthMethod::None {
-        return Ok(format!("//{server}/{share}"));
+        return Ok(format!("//guest@{server}/{share}"));
     }
     if config.auth == AuthMethod::Kerberos {
         if config.username.is_empty() {
@@ -306,18 +310,20 @@ fn build_smb_url(config: &ConnectionConfig, secret: Option<&str>) -> Result<Stri
                 url_encode(password)
             ))
         }
-        // No stored secret means guest access.
-        _ => Ok(format!("//{server}/{share}")),
+        // No stored secret means guest access. mount_smbfs treats
+        // the user name `guest` as a guest login.
+        _ => Ok(format!("//guest@{server}/{share}")),
     }
 }
 
 /// Builds the `mount_smbfs` argv (excluding the binary itself). A
-/// Kerberos URL carries no password, so without `-N` mount_smbfs
-/// would block on an interactive prompt; `-N` makes it fail instead,
-/// surfacing a missing ticket as the mount_smbfs error text.
-fn smb_argv(url: &str, dir: &Path, kerberos: bool) -> Vec<std::ffi::OsString> {
+/// Kerberos or guest URL carries no password, so without `-N`
+/// mount_smbfs would block on an interactive prompt; `-N` makes it
+/// fail instead, surfacing a missing ticket or a refused guest login
+/// as the mount_smbfs error text.
+fn smb_argv(url: &str, dir: &Path, no_prompt: bool) -> Vec<std::ffi::OsString> {
     let mut argv: Vec<std::ffi::OsString> = Vec::new();
-    if kerberos {
+    if no_prompt {
         argv.push("-N".into());
     }
     argv.push(url.into());
@@ -518,8 +524,14 @@ mod tests {
     #[test]
     fn smb_url_without_secret_is_guest() {
         let config = smb_config("server/share", AuthMethod::Password);
-        assert_eq!(build_smb_url(&config, None).unwrap(), "//server/share");
-        assert_eq!(build_smb_url(&config, Some("")).unwrap(), "//server/share");
+        assert_eq!(
+            build_smb_url(&config, None).unwrap(),
+            "//guest@server/share"
+        );
+        assert_eq!(
+            build_smb_url(&config, Some("")).unwrap(),
+            "//guest@server/share"
+        );
     }
 
     #[test]
@@ -529,9 +541,12 @@ mod tests {
         // reach the URL once the connection is set to No Auth.
         assert_eq!(
             build_smb_url(&config, Some("stale-password")).unwrap(),
-            "//server/share"
+            "//guest@server/share"
         );
-        assert_eq!(build_smb_url(&config, None).unwrap(), "//server/share");
+        assert_eq!(
+            build_smb_url(&config, None).unwrap(),
+            "//guest@server/share"
+        );
     }
 
     #[test]
@@ -590,7 +605,10 @@ mod tests {
         let err = build_smb_url(&config, Some("pw")).unwrap_err();
         assert_eq!(err, "username required");
         // An empty username with no password is still guest access.
-        assert_eq!(build_smb_url(&config, None).unwrap(), "//server/share");
+        assert_eq!(
+            build_smb_url(&config, None).unwrap(),
+            "//guest@server/share"
+        );
     }
 
     #[test]
@@ -620,7 +638,7 @@ mod tests {
     }
 
     #[test]
-    fn smb_argv_adds_no_prompt_flag_only_for_kerberos() {
+    fn smb_argv_adds_no_prompt_flag_only_when_asked() {
         let dir = Path::new("/tmp/mnt");
         assert_eq!(
             smb_argv("//server/share", dir, false),

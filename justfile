@@ -133,7 +133,9 @@ bench-up:
         # vsftpd refuses a config file that is not owned by root.
         sudo chown root "$RUN/vsftpd.conf"
         if [ ! -f bench/run/vsftpd.pid ] || ! sudo kill -0 "$(cat bench/run/vsftpd.pid)" 2>/dev/null; then
-            if sudo "$VSFTPD" "$RUN/vsftpd.conf" > "$RUN/vsftpd.out" 2>&1; then
+            # vsftpd writes a startup failure to file descriptor 0, so
+            # that descriptor is opened on the output file as well.
+            if sudo "$VSFTPD" "$RUN/vsftpd.conf" 0<> "$RUN/vsftpd.out" 1>&0 2>&0; then
                 sleep 1
                 sudo cp "$RUN/vsftpd.pid" bench/run/vsftpd.pid 2>/dev/null || true
                 sudo chmod 644 bench/run/vsftpd.pid 2>/dev/null || true
@@ -203,6 +205,11 @@ bench-down:
             kill "$(cat "$pid_file")" 2>/dev/null || true
             rm -f "$pid_file"
         fi
+    done
+    # Daemon output helps diagnose a refused mount or a failed start
+    # on a CI runner, where nobody can read the files afterwards.
+    for log in bench/run/samba/log.smbd bench/run/samba/smbd.out bench/run/vsftpd/vsftpd.out bench/run/nfs.log; do
+        if [ -s "$log" ]; then echo "== $log (last 40 lines)"; tail -n 40 "$log"; fi
     done
     if [ -f bench/run/vsftpd.pid ]; then
         sudo kill "$(cat bench/run/vsftpd.pid)" 2>/dev/null || true
