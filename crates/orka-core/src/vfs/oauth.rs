@@ -9,10 +9,13 @@
 //! after an HTTP 401. A refresh writes the updated [`TokenSet`] back
 //! through [`SecretProvider::set_secret`].
 //!
-//! [`TokenSource`] and [`call_with_auth_retry`] give the REST backends
-//! (gdrive, dropbox) one shared place to resolve a bearer token lazily
-//! and to retry once after an HTTP 401, instead of repeating that
-//! policy in each backend.
+//! [`TokenSource`] gives every REST backend (gdrive, dropbox, ADLS)
+//! one shared place to resolve a bearer token lazily and cache it in
+//! memory. [`call_with_auth_retry`] (and [`call_with_auth_retry_and`],
+//! for a backend that needs its own hint on the final error) shares
+//! the retry-once-after-401 policy the same way; Dropbox uses it
+//! directly, and gdrive's own retry wraps [`TokenSource`] to also
+//! cover its Google-service-account token source.
 
 use super::connections::SecretProvider;
 use super::http;
@@ -20,9 +23,10 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// How long [`sign_in`] waits for the browser redirect before giving up.
@@ -91,11 +95,38 @@ impl Provider {
             )],
         }
     }
+
+    /// Checks a provider's own identifiers before they enter a URL.
+    /// Only Azure carries caller-supplied text (the tenant id); Google
+    /// and Dropbox have no per-connection identifier to check.
+    fn validate(&self) -> Result<(), String> {
+        match self {
+            Provider::Azure { tenant_id } => validate_azure_tenant_id(tenant_id),
+            Provider::Google | Provider::Dropbox => Ok(()),
+        }
+    }
+}
+
+/// Accepts only letters, digits, `.`, `-`, and `_`, which covers both
+/// forms Azure issues a tenant id in: a GUID and a domain name. The
+/// tenant id goes straight into a URL path segment, so anything else
+/// must be rejected before that URL is built.
+fn validate_azure_tenant_id(tenant_id: &str) -> Result<(), String> {
+    let is_valid = !tenant_id.is_empty()
+        && tenant_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'));
+    if is_valid {
+        Ok(())
+    } else {
+        Err(format!("invalid Azure tenant ID: {tenant_id}"))
+    }
 }
 
 /// A refreshable OAuth credential, stored as the connection's keychain
-/// secret in JSON form.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// secret in JSON form. No `Debug` derive: every field but the expiry
+/// is a secret, and a stray `{:?}` in a log must never print one.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenSet {
     pub access_token: String,
     pub refresh_token: Option<String>,
@@ -225,6 +256,19 @@ impl TokenSource {
 /// reused for the retry.
 pub fn call_with_auth_retry<T>(
     tokens: &TokenSource,
+    call: impl FnMut(&str) -> Result<T, ureq::Error>,
+) -> Result<T, String> {
+    call_with_auth_retry_and(tokens, http::error_string, call)
+}
+
+/// [`call_with_auth_retry`], but with `format_error` used in place of
+/// [`http::error_string`] for the final failure. Lets a backend keep
+/// its own hint on a failure that survives the retry (Dropbox's
+/// expired-token message, for example) while still sharing the retry
+/// policy itself.
+pub fn call_with_auth_retry_and<T>(
+    tokens: &TokenSource,
+    format_error: impl Fn(ureq::Error) -> String,
     mut call: impl FnMut(&str) -> Result<T, ureq::Error>,
 ) -> Result<T, String> {
     let token = tokens.token()?;
@@ -232,9 +276,9 @@ pub fn call_with_auth_retry<T>(
         Ok(value) => Ok(value),
         Err(ureq::Error::Status(401, _)) => {
             let token = tokens.refresh()?;
-            call(&token).map_err(http::error_string)
+            call(&token).map_err(format_error)
         }
-        Err(e) => Err(http::error_string(e)),
+        Err(e) => Err(format_error(e)),
     }
 }
 
@@ -294,11 +338,24 @@ fn authorize_url(
 
 /// Opens `url` in the system's default browser.
 fn open_in_browser(url: &str) -> Result<(), String> {
-    std::process::Command::new("open")
+    let status = std::process::Command::new("open")
         .arg(url)
         .status()
         .map_err(|e| format!("cannot open the browser: {e}"))?;
-    Ok(())
+    open_status_result(status)
+}
+
+/// Turns a finished `open` command's exit status into a result. Pure
+/// over the status, so a non-zero exit is testable without actually
+/// launching `open`.
+fn open_status_result(status: std::process::ExitStatus) -> Result<(), String> {
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "cannot open the browser: the open command exited with {status}"
+        ))
+    }
 }
 
 /// The query parameters the loopback redirect carries.
@@ -370,11 +427,23 @@ fn percent_decode(value: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Reads the loopback HTTP request, replies with a small confirmation
-/// page, and returns the parsed redirect parameters. Draining the
-/// request headers before writing the response lets the browser read
-/// a clean reply instead of a connection reset.
-fn handle_redirect_connection(mut stream: TcpStream) -> Result<RedirectParams, String> {
+/// Reads the loopback HTTP request, replies, and returns the parsed
+/// redirect parameters. Draining the request headers before writing
+/// the response lets the browser read a clean reply instead of a
+/// connection reset.
+///
+/// Returns `None` for a request that carries neither `code` nor
+/// `state`, such as the browser's automatic favicon fetch on the
+/// redirect tab: that request is not the OAuth redirect, so it gets a
+/// 404 and the caller keeps waiting for the real one instead of ending
+/// the sign-in flow on it.
+fn handle_redirect_connection(mut stream: TcpStream) -> Result<Option<RedirectParams>, String> {
+    // The accepted stream can inherit the listener's non-blocking mode
+    // on macOS, which would make the read below fail immediately with
+    // `WouldBlock` instead of waiting up to the timeout set next.
+    stream
+        .set_nonblocking(false)
+        .map_err(|e| format!("cannot configure the redirect connection: {e}"))?;
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .map_err(|e| format!("cannot configure the redirect connection: {e}"))?;
@@ -397,6 +466,12 @@ fn handle_redirect_connection(mut stream: TcpStream) -> Result<RedirectParams, S
         }
     }
     let params = parse_redirect_request_line(&request_line);
+    if params.code.is_none() && params.state.is_none() {
+        let response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+        return Ok(None);
+    }
     let body = if params.error.is_none() {
         SIGN_IN_COMPLETE_HTML
     } else {
@@ -409,12 +484,14 @@ fn handle_redirect_connection(mut stream: TcpStream) -> Result<RedirectParams, S
     );
     let _ = stream.write_all(response.as_bytes());
     let _ = stream.flush();
-    Ok(params)
+    Ok(Some(params))
 }
 
-/// Blocks until one connection arrives on `listener` or `timeout`
-/// elapses. Polls a non-blocking listener rather than spawning an
-/// accept thread, so a timed-out sign-in leaves nothing running.
+/// Blocks until the real OAuth redirect arrives on `listener` or
+/// `timeout` elapses. Polls a non-blocking listener rather than
+/// spawning an accept thread, so a timed-out sign-in leaves nothing
+/// running. An unrelated connection (a favicon fetch, a stray probe)
+/// does not end the wait; only one carrying `code` or `state` does.
 fn accept_redirect(listener: &TcpListener, timeout: Duration) -> Result<RedirectParams, String> {
     listener
         .set_nonblocking(true)
@@ -422,7 +499,14 @@ fn accept_redirect(listener: &TcpListener, timeout: Duration) -> Result<Redirect
     let deadline = Instant::now() + timeout;
     loop {
         match listener.accept() {
-            Ok((stream, _)) => return handle_redirect_connection(stream),
+            Ok((stream, _)) => {
+                if let Some(params) = handle_redirect_connection(stream)? {
+                    return Ok(params);
+                }
+                if Instant::now() >= deadline {
+                    return Err("sign-in timed out waiting for the browser".to_string());
+                }
+            }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 if Instant::now() >= deadline {
                     return Err("sign-in timed out waiting for the browser".to_string());
@@ -502,6 +586,7 @@ pub fn sign_in(
     client_id: &str,
     client_secret: Option<&str>,
 ) -> Result<TokenSet, String> {
+    provider.validate()?;
     let listener = TcpListener::bind("127.0.0.1:0")
         .map_err(|e| format!("cannot open a local port for sign-in: {e}"))?;
     let port = listener
@@ -575,6 +660,24 @@ fn should_refresh(force: bool, expires_at_ms: u64, now_ms: u64) -> bool {
 /// [`refresh_stored_token`] calls this with `force: true`. A refresh
 /// stores the new [`TokenSet`] back through
 /// [`SecretProvider::set_secret`] before returning.
+/// The lock that serializes a refresh for one connection id, process
+/// wide. Two backends (or two pump threads on the same backend) can
+/// both hit an HTTP 401 for the same connection at once; without this,
+/// both could race to POST the same refresh grant, and most providers
+/// invalidate a refresh token the moment it is used, so the loser
+/// would fail with `invalid_grant` instead of reusing the winner's
+/// result.
+fn refresh_lock_for(connection_id: &str) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+    let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    locks
+        .lock()
+        .unwrap()
+        .entry(connection_id.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
 fn ensure_fresh_token_with(
     provider: Provider,
     client_id: &str,
@@ -592,9 +695,31 @@ fn ensure_fresh_token_with(
             expires_at_ms: token_set.expires_at_ms,
         });
     }
+
+    // Serialize the refresh per connection: two pump threads racing a
+    // 401 for the same connection must not both rotate the stored
+    // refresh token, since most providers invalidate one the moment
+    // it is used.
+    let lock = refresh_lock_for(connection_id);
+    let _guard = lock.lock().unwrap();
+
+    // Another thread may have refreshed this connection while this
+    // one waited for the lock. Its result already covers this call,
+    // so there is no need to rotate the refresh token a second time.
+    if let Some(current_raw) = secrets.get_secret(connection_id) {
+        if current_raw != raw {
+            let reloaded = TokenSet::from_json(&current_raw)?;
+            return Ok(FreshToken {
+                access_token: reloaded.access_token,
+                expires_at_ms: reloaded.expires_at_ms,
+            });
+        }
+    }
+
     let refresh_token = token_set.refresh_token.as_deref().ok_or_else(|| {
         "stored token has no refresh token; sign in again to renew this connection".to_string()
     })?;
+    provider.validate()?;
 
     let mut form: Vec<(&str, &str)> = vec![
         ("grant_type", "refresh_token"),
@@ -664,7 +789,10 @@ mod tests {
             client_secret: Some("shh".to_string()),
         };
         let json = set.to_json().unwrap();
-        assert_eq!(TokenSet::from_json(&json).unwrap(), set);
+        // TokenSet carries no Debug impl, so assert_eq! (which needs
+        // one to print a failure) is not available here; PartialEq
+        // alone is enough to check the round trip.
+        assert!(TokenSet::from_json(&json).unwrap() == set);
     }
 
     #[test]
@@ -676,7 +804,7 @@ mod tests {
             client_secret: None,
         };
         let json = set.to_json().unwrap();
-        assert_eq!(TokenSet::from_json(&json).unwrap(), set);
+        assert!(TokenSet::from_json(&json).unwrap() == set);
     }
 
     #[test]
@@ -712,6 +840,16 @@ mod tests {
         assert!(!should_refresh(false, now + REFRESH_SKEW_MS + 1, now));
         assert!(should_refresh(false, now + REFRESH_SKEW_MS, now));
         assert!(should_refresh(false, now - 1, now));
+    }
+
+    #[test]
+    fn open_status_result_fails_clearly_on_a_nonzero_exit() {
+        use std::os::unix::process::ExitStatusExt;
+        assert!(open_status_result(std::process::ExitStatus::from_raw(0)).is_ok());
+        let err = open_status_result(std::process::ExitStatus::from_raw(1 << 8))
+            .err()
+            .expect("must fail");
+        assert!(err.contains("cannot open the browser"), "got: {err}");
     }
 
     #[test]
@@ -820,6 +958,76 @@ mod tests {
     }
 
     #[test]
+    fn azure_tenant_id_accepts_guid_and_domain_forms() {
+        assert!(Provider::Azure {
+            tenant_id: "11111111-2222-3333-4444-555555555555".to_string(),
+        }
+        .validate()
+        .is_ok());
+        assert!(Provider::Azure {
+            tenant_id: "contoso.onmicrosoft.com".to_string(),
+        }
+        .validate()
+        .is_ok());
+        assert!(Provider::Azure {
+            tenant_id: "under_score".to_string(),
+        }
+        .validate()
+        .is_ok());
+    }
+
+    #[test]
+    fn azure_tenant_id_rejects_empty_and_unexpected_characters() {
+        let err = Provider::Azure {
+            tenant_id: String::new(),
+        }
+        .validate()
+        .err()
+        .expect("must fail");
+        assert!(err.contains("invalid Azure tenant ID"), "got: {err}");
+
+        let err = Provider::Azure {
+            tenant_id: "tenant/../evil".to_string(),
+        }
+        .validate()
+        .err()
+        .expect("must fail");
+        assert!(err.contains("invalid Azure tenant ID"), "got: {err}");
+
+        let err = Provider::Azure {
+            tenant_id: "tenant?whoami".to_string(),
+        }
+        .validate()
+        .err()
+        .expect("must fail");
+        assert!(err.contains("invalid Azure tenant ID"), "got: {err}");
+    }
+
+    #[test]
+    fn google_and_dropbox_have_no_tenant_id_to_validate() {
+        assert!(Provider::Google.validate().is_ok());
+        assert!(Provider::Dropbox.validate().is_ok());
+    }
+
+    #[test]
+    fn refresh_rejects_a_malformed_tenant_id_before_building_a_url() {
+        let set = TokenSet {
+            access_token: "stale".to_string(),
+            refresh_token: Some("r".to_string()),
+            expires_at_ms: 0,
+            client_secret: None,
+        };
+        let secrets = RecordingSecrets::seeded("conn", &set.to_json().unwrap());
+        let bad = Provider::Azure {
+            tenant_id: "tenant/../evil".to_string(),
+        };
+        let err = ensure_fresh_token(bad, "client", "conn", &secrets)
+            .err()
+            .expect("must fail");
+        assert!(err.contains("invalid Azure tenant ID"), "got: {err}");
+    }
+
+    #[test]
     fn redirect_line_extracts_code_and_state() {
         let params =
             parse_redirect_request_line("GET /callback?code=abc123&state=xyz789 HTTP/1.1\r\n");
@@ -890,6 +1098,37 @@ mod tests {
         assert_eq!(params.state.as_deref(), Some("abc"));
         let body = client.join().unwrap();
         assert!(body.contains("Sign-in finished"), "{body}");
+    }
+
+    #[test]
+    fn accept_redirect_skips_an_unrelated_request_then_parses_the_real_one() {
+        // The browser's automatic favicon fetch on the redirect tab
+        // carries neither `code` nor `state` and must not end the
+        // sign-in flow; the real redirect that follows must still be
+        // read and parsed.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            use std::io::Read;
+            let mut probe = TcpStream::connect(addr).unwrap();
+            probe
+                .write_all(b"GET /favicon.ico HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+                .unwrap();
+            let mut probe_body = String::new();
+            probe.read_to_string(&mut probe_body).unwrap();
+
+            let mut real = TcpStream::connect(addr).unwrap();
+            real.write_all(b"GET /callback?code=xyz&state=abc HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+                .unwrap();
+            let mut real_body = String::new();
+            real.read_to_string(&mut real_body).unwrap();
+            (probe_body, real_body)
+        });
+        let params = accept_redirect(&listener, Duration::from_secs(5)).unwrap();
+        assert_eq!(params.code.as_deref(), Some("xyz"));
+        let (probe_body, real_body) = client.join().unwrap();
+        assert!(probe_body.starts_with("HTTP/1.1 404"), "{probe_body}");
+        assert!(real_body.contains("Sign-in finished"), "{real_body}");
     }
 
     #[test]
@@ -992,6 +1231,58 @@ mod tests {
         let err = refresh_stored_token(Provider::Google, "client", "conn", &secrets).unwrap_err();
         assert!(err.contains("no refresh token"), "got: {err}");
         assert!(err.contains("sign in again"), "got: {err}");
+    }
+
+    /// Returns a different secret on its second call. Simulates
+    /// another thread refreshing the same connection while this one
+    /// waits for the per-connection lock.
+    struct SecretsThatChangeOnSecondRead {
+        calls: Mutex<u32>,
+        first: String,
+        second: String,
+    }
+
+    impl SecretProvider for SecretsThatChangeOnSecondRead {
+        fn get_secret(&self, _connection_id: &str) -> Option<String> {
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            Some(if *calls == 1 {
+                self.first.clone()
+            } else {
+                self.second.clone()
+            })
+        }
+    }
+
+    #[test]
+    fn ensure_fresh_token_picks_up_a_concurrent_refresh_instead_of_rotating_again() {
+        let expired = TokenSet {
+            access_token: "old".to_string(),
+            refresh_token: Some("r1".to_string()),
+            expires_at_ms: 0,
+            client_secret: None,
+        };
+        let refreshed_elsewhere = TokenSet {
+            access_token: "new-from-other-thread".to_string(),
+            refresh_token: Some("r2".to_string()),
+            expires_at_ms: now_ms() + 3_600_000,
+            client_secret: None,
+        };
+        let secrets = SecretsThatChangeOnSecondRead {
+            calls: Mutex::new(0),
+            first: expired.to_json().unwrap(),
+            second: refreshed_elsewhere.to_json().unwrap(),
+        };
+        // If this incorrectly attempted a network refresh instead of
+        // noticing the secret changed, it would fail (or hang) trying
+        // to reach Google's real token endpoint with no mock server.
+        let fresh = ensure_fresh_token(Provider::Google, "client", "conn-race", &secrets).unwrap();
+        assert_eq!(fresh.access_token, "new-from-other-thread");
+        assert_eq!(
+            *secrets.calls.lock().unwrap(),
+            2,
+            "exactly the initial read and the post-lock re-read; no third call"
+        );
     }
 
     #[test]

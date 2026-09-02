@@ -177,8 +177,8 @@ fn build_core(
 }
 
 /// One bearer token fetched for a service-principal or OAuth-app
-/// credential, with the time it stops being safe to reuse.
-#[derive(Debug)]
+/// credential, with the time it stops being safe to reuse. No `Debug`
+/// derive: `access_token` is a secret and must never print in a log.
 struct CachedToken {
     access_token: String,
     expires_at_ms: i64,
@@ -1818,8 +1818,8 @@ mod tests {
     fn oauth_app_token_401_path_forces_exactly_one_refresh_attempt() {
         // `oauth_app_token(true)` is exactly the call the 401 handler
         // in `request` makes. With no refresh token on file the forced
-        // refresh must fail cleanly after reading the keychain exactly
-        // once more, never looping or resending the rejected token.
+        // refresh must fail cleanly, never looping or resending the
+        // rejected token.
         let no_refresh_token = oauth::TokenSet {
             access_token: "app-token".to_string(),
             refresh_token: None,
@@ -1832,10 +1832,14 @@ mod tests {
         assert_eq!(secrets.call_count(), 1);
         let err = core.oauth_app_token(true).unwrap_err();
         assert!(err.contains("no refresh token"), "got: {err}");
+        // Two reads for the forced attempt: the initial load, and the
+        // re-check taken under the per-connection refresh lock (so a
+        // concurrent refresh from another thread is not repeated).
+        // Neither call loops or retries further.
         assert_eq!(
             secrets.call_count(),
-            2,
-            "the forced refresh must read the keychain exactly once"
+            3,
+            "the forced refresh must not read the keychain more than that"
         );
     }
 
@@ -1856,10 +1860,15 @@ mod tests {
 
     #[test]
     fn parse_client_credentials_response_rejects_missing_token() {
-        let err =
-            parse_client_credentials_response(r#"{"error":"invalid_client"}"#, 0).unwrap_err();
+        // CachedToken carries no Debug impl, so unwrap_err() (which
+        // needs one) is not available here; .err().expect(..) is.
+        let err = parse_client_credentials_response(r#"{"error":"invalid_client"}"#, 0)
+            .err()
+            .expect("must fail");
         assert!(err.contains("access_token"), "got: {err}");
-        let err = parse_client_credentials_response("not json", 0).unwrap_err();
+        let err = parse_client_credentials_response("not json", 0)
+            .err()
+            .expect("must fail");
         assert!(err.contains("cannot parse"), "got: {err}");
     }
 

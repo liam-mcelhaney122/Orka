@@ -259,8 +259,9 @@ fn root_entry() -> Entry {
 
 /// The fields this backend needs from a Google service-account JSON
 /// key file. The file carries other fields (`project_id`, `client_id`,
-/// a key id); they are not needed to sign a JWT-bearer request.
-#[derive(Debug)]
+/// a key id); they are not needed to sign a JWT-bearer request. No
+/// `Debug` derive: `private_key_pem` is a secret and must never print
+/// in a log.
 struct ServiceAccountKey {
     client_email: String,
     private_key_pem: String,
@@ -1189,7 +1190,11 @@ mod tests {
 
     #[test]
     fn service_account_key_missing_a_required_field_is_rejected() {
-        let err = parse_service_account_key(r#"{"client_email":"a@b.com"}"#).unwrap_err();
+        // ServiceAccountKey carries no Debug impl, so unwrap_err()
+        // (which needs one) is not available here; .err().expect(..) is.
+        let err = parse_service_account_key(r#"{"client_email":"a@b.com"}"#)
+            .err()
+            .expect("must fail");
         assert!(err.contains("private_key"), "got: {err}");
     }
 

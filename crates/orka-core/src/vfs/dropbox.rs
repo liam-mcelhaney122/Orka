@@ -106,28 +106,16 @@ fn request_error(e: ureq::Error) -> String {
 }
 
 /// Runs one Dropbox call against a token source, retrying once with a
-/// forced refresh when the first attempt fails with HTTP 401. `call`
-/// must build a fresh request on every invocation; `ureq` consumes a
-/// request builder on send, so the same builder cannot be reused for
-/// the retry.
-///
-/// Wraps [`oauth::TokenSource`]'s own token resolution rather than
-/// [`oauth::call_with_auth_retry`] so a final 401 (the retry also
-/// rejected) keeps Dropbox's expired-token hint from [`request_error`]
-/// instead of the generic message the shared helper uses.
+/// forced refresh when the first attempt fails with HTTP 401. Shares
+/// its retry policy with [`oauth::call_with_auth_retry`], with
+/// [`request_error`] as the error hook so a failure that survives the
+/// retry keeps Dropbox's expired-token hint instead of the generic
+/// message the shared helper uses by default.
 fn call_with_auth_retry<T>(
     tokens: &oauth::TokenSource,
-    mut call: impl FnMut(&str) -> Result<T, ureq::Error>,
+    call: impl FnMut(&str) -> Result<T, ureq::Error>,
 ) -> Result<T, String> {
-    let token = tokens.token()?;
-    match call(&token) {
-        Ok(value) => Ok(value),
-        Err(ureq::Error::Status(401, _)) => {
-            let token = tokens.refresh()?;
-            call(&token).map_err(request_error)
-        }
-        Err(e) => Err(request_error(e)),
-    }
+    oauth::call_with_auth_retry_and(tokens, request_error, call)
 }
 
 /// A chunk from a read pump. `Err` carries the pump's failure once,
