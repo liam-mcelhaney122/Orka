@@ -184,6 +184,10 @@ bench-down:
     for log in bench/run/samba/log.smbd bench/run/samba/smbd.out bench/run/nfs.log; do
         if [ -s "$log" ]; then echo "== $log (last 40 lines)"; tail -n 40 "$log"; fi
     done
+    if [ -s bench/run/samba/log.smbd ]; then
+        echo "== bench/run/samba/log.smbd (denials and errors)"
+        grep -i 'denied\|mkdir\|dir1\|failed\|error' bench/run/samba/log.smbd | grep -v 'WRONG_PASSWORD\|gensec' | tail -n 60
+    fi
     # A bench test that panicked mid-mount can leave a share mounted;
     # sweep anything still mounted under Orka's mount directory.
     mounts_dir="$HOME/Library/Application Support/Orka/mounts"
