@@ -186,9 +186,9 @@ bench-down:
     done
     if [ -s bench/run/samba/log.smbd ]; then
         echo "== bench/run/samba/log.smbd (denials and errors)"
-        grep -n -m1 -B90 'NT_STATUS_ACCESS_DENIED' bench/run/samba/log.smbd | grep -v 'class=acls' | head -n 150
-        echo "== bench/run/samba/log.smbd (mkdir and access checks)"
-        grep -n -i 'mkdirat\|EACCES\|Permission denied\|check_access\|check_parent_access\|access_mask\|unix_mode\|dir1' bench/run/samba/log.smbd | head -n 80
+        grep -n -m1 -B60 'NT_STATUS_ACCESS_DENIED' bench/run/samba/log.smbd | grep -v '^[0-9]*-\[20' | head -n 120
+        echo "== bench/run/samba/log.smbd (token and access checks)"
+        grep -n -i 'se_access_check\|se_file_access_check\|check_parent_access\|smbd_check_access_rights\|access_mask\|S-1-5-21\|S-1-22\|token' bench/run/samba/log.smbd | grep -v 'class=acls' | tail -n 80
     fi
     # A bench test that panicked mid-mount can leave a share mounted;
     # sweep anything still mounted under Orka's mount directory.
