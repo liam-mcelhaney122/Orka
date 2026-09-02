@@ -262,7 +262,15 @@ fn nfs_server_meets_conformance_with_the_documented_mount_options() {
 // ---------------------------------------------------------------
 
 const SMB_PORT: u16 = 4450;
-const SMB_USER: &str = "orka";
+/// The Samba user `just bench-up` registers. Samba with `security =
+/// user` maps every login to a Unix account, so the recipe uses the
+/// current account and the same name is read here. `ORKA_BENCH_SMB_USER`
+/// overrides it.
+fn smb_user() -> String {
+    std::env::var("ORKA_BENCH_SMB_USER")
+        .or_else(|_| std::env::var("USER"))
+        .expect("USER or ORKA_BENCH_SMB_USER must be set")
+}
 const SMB_PASSWORD: &str = "orka-bench";
 
 fn smb_daemon_reachable() -> bool {
@@ -306,7 +314,7 @@ fn smb_password_login_meets_conformance() {
     let _guard = MOUNT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     let id = "bench-smb-password";
-    let config = smb_config(id, "secure", SMB_USER, AuthMethod::Password);
+    let config = smb_config(id, "secure", &smb_user(), AuthMethod::Password);
     let backend = MountFactory
         .connect(&config, secret(SMB_PASSWORD))
         .expect("password login to the secure share must connect");
@@ -331,7 +339,8 @@ fn smb_workgroup_qualified_username_connects() {
     let _guard = MOUNT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     let id = "bench-smb-workgroup";
-    let config = smb_config(id, "secure", "WORKGROUP;orka", AuthMethod::Password);
+    let user = format!("WORKGROUP;{}", smb_user());
+    let config = smb_config(id, "secure", &user, AuthMethod::Password);
     let backend = MountFactory
         .connect(&config, secret(SMB_PASSWORD))
         .expect("a WORKGROUP;user login must connect");
@@ -381,7 +390,7 @@ fn smb_wrong_password_fails_promptly() {
     let _guard = MOUNT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     let id = "bench-smb-wrong-password";
-    let config = smb_config(id, "secure", SMB_USER, AuthMethod::Password);
+    let config = smb_config(id, "secure", &smb_user(), AuthMethod::Password);
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let result = MountFactory.connect(&config, secret("not-the-real-password"));
@@ -415,7 +424,7 @@ fn smb_unmount_on_drop_removes_the_mount_point() {
     let _guard = MOUNT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     let id = "bench-smb-unmount";
-    let config = smb_config(id, "secure", SMB_USER, AuthMethod::Password);
+    let config = smb_config(id, "secure", &smb_user(), AuthMethod::Password);
     let backend = MountFactory
         .connect(&config, secret(SMB_PASSWORD))
         .expect("password login must connect");

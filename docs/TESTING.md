@@ -152,6 +152,12 @@ portmapper, which has no mapping for the bench server's port and
 fails quickly with `Connection refused`. That is why `nfs_argv`
 passes `ConnectionConfig::port` as both options.
 
+The SMB bench signs in as the current Unix account with the password
+`orka-bench`. Samba with `security = user` maps every login to a Unix
+account, so `just bench-up` registers `$(id -un)` with `smbpasswd`
+and the tests read the same name from `USER`. Set
+`ORKA_BENCH_SMB_USER` in both places to use another account.
+
 ### Running just the mount bench
 
 ```

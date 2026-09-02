@@ -86,10 +86,13 @@ bench-up:
         if [ ! -x "$SMBPASSWD" ]; then SMBPASSWD="$(dirname "$(dirname "$SMBD")")/bin/smbpasswd"; fi
         RUN="$(pwd)/bench/run/samba"
         mkdir -p "$RUN/shares/secure" "$RUN/shares/guest" "$RUN/private" "$RUN/pid"
-        sed "s#@BENCH_RUN@#$RUN#g" bench/smb.conf > "$RUN/smb.conf"
+        # Samba maps every login to a Unix account, so the bench user
+        # is the current account. bench_mounts.rs reads the same name.
+        BENCH_USER="${ORKA_BENCH_SMB_USER:-$(id -un)}"
+        sed -e "s#@BENCH_RUN@#$RUN#g" -e "s#@BENCH_USER@#$BENCH_USER#g" bench/smb.conf > "$RUN/smb.conf"
         if [ ! -f "$RUN/passdb.tdb" ]; then
             printf 'orka-bench\norka-bench\n' \
-                | "$SMBPASSWD" -c "$RUN/smb.conf" -s -a orka \
+                | "$SMBPASSWD" -c "$RUN/smb.conf" -s -a "$BENCH_USER" \
                 || echo "smbpasswd: failed (see output above); the SMB bench will skip"
         fi
         if [ ! -f bench/run/smbd.pid ] || ! kill -0 "$(cat bench/run/smbd.pid)" 2>/dev/null; then
@@ -132,13 +135,11 @@ bench-up:
             bench/vsftpd.conf > "$RUN/vsftpd.conf"
         # vsftpd refuses a config file that is not owned by root.
         sudo chown root "$RUN/vsftpd.conf"
-        if [ ! -f bench/run/vsftpd.pid ] || ! sudo kill -0 "$(cat bench/run/vsftpd.pid)" 2>/dev/null; then
+        if ! pgrep -f "$RUN/vsftpd.conf" > /dev/null 2>&1; then
             # vsftpd writes a startup failure to file descriptor 0, so
             # that descriptor is opened on the output file as well.
             if sudo "$VSFTPD" "$RUN/vsftpd.conf" 0<> "$RUN/vsftpd.out" 1>&0 2>&0; then
                 sleep 1
-                sudo cp "$RUN/vsftpd.pid" bench/run/vsftpd.pid 2>/dev/null || true
-                sudo chmod 644 bench/run/vsftpd.pid 2>/dev/null || true
                 echo "vsftpd: listening on 127.0.0.1:990 (implicit TLS, started with sudo)"
             else
                 echo "vsftpd: failed to start; the FTPS bench will skip"
@@ -211,9 +212,8 @@ bench-down:
     for log in bench/run/samba/log.smbd bench/run/samba/smbd.out bench/run/vsftpd/vsftpd.out bench/run/nfs.log; do
         if [ -s "$log" ]; then echo "== $log (last 40 lines)"; tail -n 40 "$log"; fi
     done
-    if [ -f bench/run/vsftpd.pid ]; then
-        sudo kill "$(cat bench/run/vsftpd.pid)" 2>/dev/null || true
-        sudo rm -f bench/run/vsftpd.pid
+    if pgrep -f "bench/run/vsftpd/vsftpd.conf" > /dev/null 2>&1; then
+        sudo pkill -f "bench/run/vsftpd/vsftpd.conf" 2>/dev/null || true
     fi
     # A bench test that panicked mid-mount can leave a share mounted;
     # sweep anything still mounted under Orka's mount directory.
