@@ -86,6 +86,9 @@ bench-up:
         if [ ! -x "$SMBPASSWD" ]; then SMBPASSWD="$(dirname "$(dirname "$SMBD")")/bin/smbpasswd"; fi
         RUN="$(pwd)/bench/run/samba"
         mkdir -p "$RUN/shares/secure" "$RUN/shares/guest" "$RUN/private" "$RUN/pid"
+        # Both shares run as the bench user; make the trees writable so
+        # a forced-user session can create files and directories.
+        chmod -R 0777 "$RUN/shares"
         # Samba maps every login to a Unix account, so the bench user
         # is the current account. bench_mounts.rs reads the same name.
         # `-L` must come first: without it a non-root smbpasswd talks
@@ -200,7 +203,7 @@ bench-down:
     done
     if [ -s bench/run/samba/log.smbd ]; then
         echo "== bench/run/samba/log.smbd (denials and errors)"
-        grep -i 'NT_STATUS_ACCESS_DENIED\|failed\|denied' bench/run/samba/log.smbd | tail -n 20
+        grep -n -m1 -B40 'NT_STATUS_ACCESS_DENIED\|RENAMEAT failed\|mkdir.*failed' bench/run/samba/log.smbd | grep -v 'class=acls' | tail -n 80
     fi
     # A bench test that panicked mid-mount can leave a share mounted;
     # sweep anything still mounted under Orka's mount directory.
