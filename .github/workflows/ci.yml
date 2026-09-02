@@ -30,9 +30,9 @@ jobs:
 
   # Opt-in daemon bench tier: SMB (Homebrew samba) and the NFS bench
   # server, driven through `cargo test --test bench_mounts` under
-  # ORKA_BENCH=1. This tier is allowed to be slower than the main
-  # `rust` job (it starts and stops real daemons) and is not a merge
-  # gate yet: `continue-on-error: true` means a failure here shows up
+  # ORKA_BENCH=1. This tier is slower than the main `rust` job (it
+  # starts and stops real daemons) and is not a merge gate:
+  # `continue-on-error: true` means a failure here shows up
   # as a warning, not a red build, while the tier is still new.
   bench:
     name: Opt-in daemon bench
