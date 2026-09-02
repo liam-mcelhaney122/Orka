@@ -186,7 +186,7 @@ bench-down:
     done
     if [ -s bench/run/samba/log.smbd ]; then
         echo "== bench/run/samba/log.smbd (denials and errors)"
-        grep -i 'denied\|mkdir\|dir1\|failed\|error' bench/run/samba/log.smbd | grep -v 'WRONG_PASSWORD\|gensec' | tail -n 60
+        grep -n -B12 -A4 'NT_STATUS_ACCESS_DENIED' bench/run/samba/log.smbd | head -n 120
     fi
     # A bench test that panicked mid-mount can leave a share mounted;
     # sweep anything still mounted under Orka's mount directory.
