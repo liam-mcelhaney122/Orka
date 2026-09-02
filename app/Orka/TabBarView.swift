@@ -301,9 +301,6 @@ private struct TabDropDelegate: DropDelegate {
                 let sources = DropTransferPolicy.transferSources(
                     loaded, destDir: destination)
                 guard !sources.isEmpty else { return }
-                guard OrkaPath.isLocal(destination)
-                    || sources.allSatisfy(OrkaPath.isLocal)
-                else { return }
                 model.transfer(
                     sources: sources,
                     to: destination,

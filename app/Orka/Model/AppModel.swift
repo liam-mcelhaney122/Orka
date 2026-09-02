@@ -403,15 +403,27 @@ final class AppModel {
             return
         }
         guard OrkaPath.isLocal(entry.path) else {
-            // Opening a remote file needs a downloaded copy to hand to
-            // NSWorkspace; that path is not wired yet. Quick Look (Space)
-            // already downloads and previews it.
-            lastJobErrors = [JobItemError(
-                path: entry.path,
-                message: "Opening a remote file isn't supported yet. Press Space to preview it.")]
+            openRemoteFile(entry)
             return
         }
         NSWorkspace.shared.open(URL(fileURLWithPath: entry.path))
+    }
+
+    /// Downloads a remote file to a staging directory, then hands the
+    /// local copy to its default app. Download progress shows in the
+    /// jobs UI like any other transfer, because it runs as a normal
+    /// engine copy job.
+    private func openRemoteFile(_ entry: FsEntry) {
+        RemotePromiseStager.download(remotePath: entry.path, model: self) { result in
+            switch result {
+            case .success(let localURL):
+                NSWorkspace.shared.open(localURL)
+            case .failure(let error):
+                AppModel.shared.lastJobErrors = [JobItemError(
+                    path: entry.path,
+                    message: "Could not open \(entry.name): \(error.localizedDescription)")]
+            }
+        }
     }
 
     func shutdown() {
@@ -600,23 +612,13 @@ final class AppModel {
     }
 
     func copySelection(in window: WindowState? = nil) {
-        guard let pane = pane(in: window),
-            OrkaPath.isLocal(pane.directory.path)
-        else {
-            NSSound.beep()
-            return
-        }
+        guard pane(in: window) != nil else { return }
         writeToPasteboard(paths: selectedPaths(in: window))
         cutPaths = []
     }
 
     func cutSelection(in window: WindowState? = nil) {
-        guard let pane = pane(in: window),
-            OrkaPath.isLocal(pane.directory.path)
-        else {
-            NSSound.beep()
-            return
-        }
+        guard pane(in: window) != nil else { return }
         let paths = selectedPaths(in: window)
         writeToPasteboard(paths: paths)
         cutPaths = Set(paths)
@@ -625,13 +627,9 @@ final class AppModel {
 
     func paste(in window: WindowState? = nil) {
         let pasteboard = NSPasteboard.general
-        guard let urls = pasteboard.readObjects(
-            forClasses: [NSURL.self],
-            options: [.urlReadingFileURLsOnly: true]) as? [URL],
-            !urls.isEmpty,
-            let dest = pane(in: window)?.directory.path
-        else { return }
-        let sources = urls.map(\.path)
+        guard let dest = pane(in: window)?.directory.path else { return }
+        let sources = pasteboardSources(pasteboard)
+        guard !sources.isEmpty else { return }
         let isCut = !cutPaths.isEmpty
             && pasteboard.changeCount == cutChangeCount
             && Set(sources) == cutPaths
@@ -641,17 +639,45 @@ final class AppModel {
         }
     }
 
-    var canPaste: Bool {
-        NSPasteboard.general.canReadObject(
+    /// Paths on the general pasteboard, from either a local file-URL copy
+    /// or a remote-row copy (see `writeToPasteboard`). A pasteboard only
+    /// ever carries one kind, since a selection comes from one directory.
+    private func pasteboardSources(_ pasteboard: NSPasteboard) -> [String] {
+        if let urls = pasteboard.readObjects(
             forClasses: [NSURL.self],
-            options: [.urlReadingFileURLsOnly: true])
+            options: [.urlReadingFileURLsOnly: true]) as? [URL],
+            !urls.isEmpty
+        {
+            return urls.map(\.path)
+        }
+        guard let items = pasteboard.pasteboardItems else { return [] }
+        return items.compactMap {
+            $0.string(forType: .orkaRemotePath)
+        }
     }
 
+    var canPaste: Bool {
+        !pasteboardSources(NSPasteboard.general).isEmpty
+    }
+
+    /// A local selection writes file URLs, so Finder and other apps can
+    /// read the copy too. A remote selection has no local file to hand
+    /// them, so it writes each URI under a private Orka pasteboard type
+    /// instead (see `NSPasteboard.PasteboardType.orkaRemotePath`).
     private func writeToPasteboard(paths: [String]) {
         guard !paths.isEmpty else { return }
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
-        pasteboard.writeObjects(paths.map { NSURL(fileURLWithPath: $0) })
+        if paths.allSatisfy(OrkaPath.isLocal) {
+            pasteboard.writeObjects(paths.map { NSURL(fileURLWithPath: $0) })
+        } else {
+            let items = paths.map { path -> NSPasteboardItem in
+                let item = NSPasteboardItem()
+                item.setString(path, forType: .orkaRemotePath)
+                return item
+            }
+            pasteboard.writeObjects(items)
+        }
     }
 
     /// Writes paths to the pasteboard as newline-joined text, for the
@@ -689,13 +715,16 @@ final class AppModel {
         return ext == "zip" || ext == "tar" || ext == "tgz"
     }
 
+    /// Reports an action that stays local-only, for a menu command or
+    /// keyboard shortcut that would otherwise fail with no feedback.
+    private func reportRemoteUnsupported(_ action: String, path: String) {
+        lastJobErrors = [JobItemError(
+            path: path,
+            message: "\(action) is not supported on remote locations yet.")]
+    }
+
     func duplicateSelection(in window: WindowState? = nil) {
-        guard let pane = pane(in: window),
-            OrkaPath.isLocal(pane.directory.path)
-        else {
-            NSSound.beep()
-            return
-        }
+        guard pane(in: window) != nil else { return }
         let paths = selectedPaths(in: window)
         guard !paths.isEmpty else { return }
         _ = engine.duplicateItems(sources: paths)
@@ -801,14 +830,13 @@ final class AppModel {
     /// Compresses the selection into an archive in the active directory.
     /// The engine picks the archive file name and dedupes it inside the
     /// job; progress shows in the existing jobs UI. Remote directories
-    /// cannot archive, so they beep.
+    /// cannot archive, so this reports the limitation instead.
     func compressSelection(
         as format: ArchiveFormat, in window: WindowState? = nil
     ) {
-        guard let pane = pane(in: window),
-            OrkaPath.isLocal(pane.directory.path)
-        else {
-            NSSound.beep()
+        guard let pane = pane(in: window) else { return }
+        guard OrkaPath.isLocal(pane.directory.path) else {
+            reportRemoteUnsupported("Compress", path: pane.directory.path)
             return
         }
         let paths = selectedPaths(in: window)
@@ -819,13 +847,12 @@ final class AppModel {
 
     /// Extracts the one selected archive into a sibling folder named
     /// after the archive stem. Anything other than a single selected
-    /// archive reports an error; a remote directory just beeps because
-    /// the menu never offers extraction there.
+    /// archive reports an error; a remote directory reports the same
+    /// limitation, because the menu never offers extraction there.
     func extractSelection(in window: WindowState? = nil) {
-        guard let pane = pane(in: window),
-            OrkaPath.isLocal(pane.directory.path)
-        else {
-            NSSound.beep()
+        guard let pane = pane(in: window) else { return }
+        guard OrkaPath.isLocal(pane.directory.path) else {
+            reportRemoteUnsupported("Extract", path: pane.directory.path)
             return
         }
         let paths = selectedPaths(in: window)
@@ -904,65 +931,92 @@ final class AppModel {
     }
 
     func newFolder(in window: WindowState? = nil) {
-        guard let pane = pane(in: window),
-            OrkaPath.isLocal(pane.directory.path)
-        else {
-            NSSound.beep()
-            return
-        }
-        do {
-            let created = try engine.createFolder(
-                parent: pane.directory.path, name: "untitled folder")
-            refreshJournal()
-            pane.directory.reload(showHidden: showHidden)
-            pane.directory.selection = [created]
-        } catch {
-            lastJobErrors = [JobItemError(
-                path: pane.directory.path,
-                message: String(describing: error))]
+        guard let pane = pane(in: window) else { return }
+        let parent = pane.directory.path
+        let engine = engine
+        runItemOperation(in: pane, directoryPath: parent, errorPath: parent) {
+            try engine.createFolder(parent: parent, name: "untitled folder")
         }
     }
 
     func newFile(in window: WindowState? = nil) {
-        guard let pane = pane(in: window),
-            OrkaPath.isLocal(pane.directory.path)
-        else {
-            NSSound.beep()
-            return
-        }
-        do {
-            let created = try engine.createFile(
-                parent: pane.directory.path, name: "untitled.txt")
-            refreshJournal()
-            pane.directory.reload(showHidden: showHidden)
-            pane.directory.selection = [created]
-        } catch {
-            lastJobErrors = [JobItemError(
-                path: pane.directory.path,
-                message: String(describing: error))]
+        guard let pane = pane(in: window) else { return }
+        let parent = pane.directory.path
+        let engine = engine
+        runItemOperation(in: pane, directoryPath: parent, errorPath: parent) {
+            try engine.createFile(parent: parent, name: "untitled.txt")
         }
     }
 
-    /// Returns the new path, or nil after showing the error in the status bar.
+    /// Returns the new path of a local rename, or nil after showing the
+    /// error in the status bar. A remote rename returns nil at once and
+    /// completes off the main actor; see `runItemOperation`.
     func rename(
         path: String, to newName: String, in window: WindowState? = nil
     ) -> String? {
         guard let pane = pane(in: window),
-            OrkaPath.isLocal(pane.directory.path)
+            pane.directory.capabilities.canRename
         else {
             NSSound.beep()
             return nil
         }
-        do {
-            let newPath = try engine.renameItem(path: path, newName: newName)
+        let engine = engine
+        return runItemOperation(
+            in: pane, directoryPath: pane.directory.path, errorPath: path
+        ) {
+            try engine.renameItem(path: path, newName: newName)
+        }
+    }
+
+    /// Runs one synchronous engine call that creates or renames an item
+    /// in `directoryPath`, then reloads the pane and selects the result.
+    /// A local call completes inline and returns the new path. A remote
+    /// call is a network round trip, so it runs off the main actor and
+    /// returns nil; the pane updates when the call completes.
+    @discardableResult
+    private func runItemOperation(
+        in pane: PaneState, directoryPath: String, errorPath: String,
+        _ operation: @escaping @Sendable () throws -> String
+    ) -> String? {
+        if OrkaPath.isLocal(directoryPath) {
+            let result = Result { try operation() }
+            finishItemOperation(
+                in: pane, directoryPath: directoryPath, errorPath: errorPath,
+                result: result)
+            return try? result.get()
+        }
+        Task {
+            let result = await Task.detached(priority: .userInitiated) {
+                Result { try operation() }
+            }.value
+            finishItemOperation(
+                in: pane, directoryPath: directoryPath, errorPath: errorPath,
+                result: result)
+        }
+        return nil
+    }
+
+    private func finishItemOperation(
+        in pane: PaneState, directoryPath: String, errorPath: String,
+        result: Result<String, any Error>
+    ) {
+        // A remote call can finish after the pane navigated away. The
+        // reload and the selection then belong to another directory.
+        let paneStillShowsDirectory = pane.directory.path == directoryPath
+        switch result {
+        case .success(let newPath):
             refreshJournal()
+            guard paneStillShowsDirectory else { return }
             pane.directory.reload(showHidden: showHidden)
             pane.directory.selection = [newPath]
-            return newPath
-        } catch {
+        case .failure(let error):
             lastJobErrors = [JobItemError(
-                path: path, message: String(describing: error))]
-            return nil
+                path: errorPath, message: String(describing: error))]
+            // A failed remote rename leaves the typed name in its row
+            // until the listing reloads.
+            if !OrkaPath.isLocal(directoryPath), paneStillShowsDirectory {
+                pane.directory.reload(showHidden: showHidden)
+            }
         }
     }
 
@@ -1074,9 +1128,11 @@ final class AppModel {
     /// `open -a` resolves the user's chosen terminal; Terminal.app is
     /// the fallback when the preference is unset.
     func openInTerminal(in window: WindowState? = nil) {
-        guard let path = pane(in: window)?.directory.path,
-            OrkaPath.isLocal(path)
-        else { return }
+        guard let path = pane(in: window)?.directory.path else { return }
+        guard OrkaPath.isLocal(path) else {
+            reportRemoteUnsupported("Open in Terminal", path: path)
+            return
+        }
         let defaultApp = UserDefaults.standard.string(
             forKey: "defaultTerminalApp") ?? "Terminal"
         let process = Process()

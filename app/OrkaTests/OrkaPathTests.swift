@@ -118,4 +118,30 @@ final class OrkaPathTests: XCTestCase {
     func testRemoteParentNilForLocalPath() {
         XCTAssertNil(OrkaPath.remoteParent(of: "/some/local/path"))
     }
+
+    // MARK: - sameConnection
+
+    func testSameConnectionTrueForSameHostDifferentPaths() {
+        XCTAssertTrue(OrkaPath.sameConnection(
+            "sftp://myhost/some/dir", "sftp://myhost/other/dir"))
+    }
+
+    func testSameConnectionFalseForDifferentHosts() {
+        XCTAssertFalse(OrkaPath.sameConnection(
+            "sftp://hostA/some/dir", "sftp://hostB/some/dir"))
+    }
+
+    func testSameConnectionFalseWhenFirstPathIsLocal() {
+        XCTAssertFalse(OrkaPath.sameConnection(
+            "/local/dir", "sftp://myhost/some/dir"))
+    }
+
+    func testSameConnectionFalseWhenSecondPathIsLocal() {
+        XCTAssertFalse(OrkaPath.sameConnection(
+            "sftp://myhost/some/dir", "/local/dir"))
+    }
+
+    func testSameConnectionFalseForTwoLocalPaths() {
+        XCTAssertFalse(OrkaPath.sameConnection("/local/a", "/local/b"))
+    }
 }

@@ -427,6 +427,10 @@ final class FileListCoordinator: NSObject, @preconcurrency NSFilePromiseProvider
     // MARK: Inline rename
 
     func beginRenameOnSelection() {
+        guard directory.capabilities.canRename else {
+            NSSound.beep()
+            return
+        }
         let row = tableView.selectedRow
         guard row >= 0, tableView.selectedRowIndexes.count == 1,
             row < displayed.count
@@ -708,12 +712,14 @@ extension FileListCoordinator: NSTableViewDataSource {
     ) -> NSDragOperation {
         let destDir = dropDestination(row: row, operation: dropOperation)
         if let remoteSources = droppedRemotePaths(info) {
-            // A backend-to-backend transfer with no local endpoint is out
-            // of scope; only a local destination accepts remote rows.
-            guard OrkaPath.isLocal(destDir), !remoteSources.isEmpty
-            else { return [] }
             retargetDropRow(row: row, dropOperation: dropOperation)
-            return .copy
+            let effective = transferSources(remoteSources, destDir: destDir)
+            guard !effective.isEmpty else { return [] }
+            let preferred: NSDragOperation = DropTransferPolicy.shouldMove(
+                sources: effective, destDir: destDir,
+                forceCopy: !info.draggingSourceOperationMask.contains(.move)
+            ) ? .move : .copy
+            return allowedOperation(info, preferred: preferred)
         }
         guard info.draggingPasteboard.availableType(from: [.fileURL]) != nil else {
             return []
@@ -737,10 +743,17 @@ extension FileListCoordinator: NSTableViewDataSource {
     ) -> Bool {
         let destDir = dropDestination(row: row, operation: dropOperation)
         if let remoteSources = droppedRemotePaths(info) {
-            guard OrkaPath.isLocal(destDir), !remoteSources.isEmpty
-            else { return false }
+            let effective = transferSources(remoteSources, destDir: destDir)
+            guard !effective.isEmpty else { return false }
+            let preferred: NSDragOperation = DropTransferPolicy.shouldMove(
+                sources: effective, destDir: destDir,
+                forceCopy: !info.draggingSourceOperationMask.contains(.move)
+            ) ? .move : .copy
+            let operation = allowedOperation(info, preferred: preferred)
+            guard !operation.isEmpty else { return false }
             model.transfer(
-                sources: remoteSources, to: destDir, move: false, in: window)
+                sources: effective, to: destDir,
+                move: operation == .move, in: window)
             return true
         }
         guard let sources = droppedPaths(info) else { return false }
@@ -1105,7 +1118,11 @@ extension FileListCoordinator: NSTextFieldDelegate {
             textField.stringValue = oldName
             return
         }
-        if model.rename(path: path, to: newName, in: window) == nil {
+        // A remote rename returns nil while it runs off the main actor;
+        // the listing reloads with the outcome, so the row keeps its text.
+        if model.rename(path: path, to: newName, in: window) == nil,
+            OrkaPath.isLocal(path)
+        {
             textField.stringValue = oldName
         }
     }
@@ -1297,9 +1314,10 @@ extension FileListCoordinator: NSMenuDelegate {
         OpenWithApps.chooseAndOpen(paths: openWithPaths)
     }
 
-    /// Remote rename and file drag-out to other apps are a later
-    /// milestone; the menu offers what already works today. Delete is
-    /// permanent (no server trash) and confirms before running.
+    /// File drag-out to other apps already works through the promise
+    /// provider. Rename shows only when the backend allows it (see
+    /// `PathCapabilities.canRename`). Delete is permanent (no server
+    /// trash) and confirms before running.
     private func remoteMenuNeedsUpdate(_ menu: NSMenu, targets: [FsEntry]) {
         let hasTarget = !targets.isEmpty
         if hasTarget {
@@ -1307,11 +1325,20 @@ extension FileListCoordinator: NSMenuDelegate {
                 menu.addItem(makeItem("Open", action: #selector(contextOpen)))
                 menu.addItem(.separator())
             }
+            if directory.capabilities.canRename {
+                menu.addItem(makeItem("Rename", action: #selector(contextRename)))
+            }
+            menu.addItem(makeItem(
+                "Duplicate", action: #selector(contextDuplicate)))
+            menu.addItem(.separator())
             menu.addItem(makeItem(
                 "Copy Path", action: #selector(contextCopyPath)))
             menu.addItem(makeItem(
                 "Copy Relative Path",
                 action: #selector(contextCopyRelativePath)))
+            menu.addItem(.separator())
+            menu.addItem(makeItem("Cut", action: #selector(contextCut)))
+            menu.addItem(makeItem("Copy", action: #selector(contextCopy)))
             menu.addItem(.separator())
             menu.addItem(makeItem(
                 "Download to Downloads",
@@ -1326,6 +1353,11 @@ extension FileListCoordinator: NSMenuDelegate {
             menu.addItem(.separator())
             menu.addItem(makeItem("Delete", action: #selector(contextTrash)))
         }
+        menu.addItem(.separator())
+        menu.addItem(makeItem(
+            "New Folder", action: #selector(contextNewFolder)))
+        menu.addItem(makeItem(
+            "New File", action: #selector(contextNewFile)))
     }
 }
 

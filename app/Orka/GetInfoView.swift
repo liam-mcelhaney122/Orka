@@ -10,20 +10,21 @@ struct GetInfoView: View {
     @Environment(\.dismiss) private var dismiss
     private var model: AppModel { AppModel.shared }
 
-    private let details: Details
+    @State private var details: Details
 
     init(path: String) {
         self.path = path
         if OrkaPath.isLocal(path) {
-            details = Details(localPath: path)
+            _details = State(initialValue: Details(localPath: path))
         } else {
             // `Details` has no access to app state; the lookup happens
             // here and the result is handed in. `focusedPane` is nil
             // when no window has focus; the entry lookup then fails and
-            // `Details` falls back to path-derived metadata.
+            // `Details` falls back to path-derived metadata until the
+            // `stat_path` task below fills in the real size and date.
             let entry = AppModel.shared.focusedPane?.directory.entries
                 .first { $0.path == path }
-            details = Details(remotePath: path, entry: entry)
+            _details = State(initialValue: Details(remotePath: path, entry: entry))
         }
     }
 
@@ -45,11 +46,29 @@ struct GetInfoView: View {
         }
         .frame(width: 380)
         .task(id: path) {
-            // Recursive folder totals are a local-disk walk; remote
-            // directories skip the request and show no size here.
-            guard details.isDir, details.isLocal else { return }
+            guard details.isDir else { return }
             model.requestFolderSize(path: path)
         }
+        .task(id: path) {
+            // A local stat already ran synchronously in `Details.init`;
+            // only a remote path needs the round trip.
+            guard !details.isLocal else { return }
+            await refreshRemoteStat()
+        }
+    }
+
+    /// Runs `stat_path` off the main thread and folds the authoritative
+    /// size and modified time into `details`. Owner, permissions, and
+    /// created stay nil: there is no local stat to source them from.
+    private func refreshRemoteStat() async {
+        let engine = model.engine
+        let target = path
+        let stat = await Task.detached(priority: .userInitiated) {
+            try? engine.statPath(path: target)
+        }.value
+        // The view can close during the round trip; its state is gone.
+        guard let stat, !Task.isCancelled else { return }
+        details.applyRemoteStat(stat)
     }
 
     private var header: some View {
@@ -77,6 +96,8 @@ struct GetInfoView: View {
             row("Where", details.parent)
             if let created = details.created {
                 row("Created", Self.dateFormatter.string(from: created))
+            } else if !details.isLocal {
+                row("Created", Self.remoteUnavailableCaption)
             }
             if let modified = details.modified {
                 row("Modified", Self.dateFormatter.string(from: modified))
@@ -86,9 +107,13 @@ struct GetInfoView: View {
             }
             if let owner = details.owner {
                 row("Owner", owner)
+            } else if !details.isLocal {
+                row("Owner", Self.remoteUnavailableCaption)
             }
             if let permissions = details.permissions {
                 row("Permissions", permissions)
+            } else if !details.isLocal {
+                row("Permissions", Self.remoteUnavailableCaption)
             }
         }
         .padding(16)
@@ -110,9 +135,6 @@ struct GetInfoView: View {
 
     private var sizeText: String {
         if details.isDir {
-            // Remote folder totals are a later milestone; core skips the
-            // recursive walk for them, so nothing ever arrives here.
-            guard details.isLocal else { return "—" }
             guard let total = model.folderSizes.sizes[path] else {
                 return "Calculating…"
             }
@@ -123,6 +145,9 @@ struct GetInfoView: View {
         guard let size = details.fileSize else { return "—" }
         return ByteCountFormatter.string(fromByteCount: size, countStyle: .file)
     }
+
+    private static let remoteUnavailableCaption =
+        "Not available for remote locations"
 
     private static let dateFormatter: DateFormatter = {
         let formatter = DateFormatter()
@@ -144,10 +169,10 @@ private struct Details {
     let owner: String?
     let permissions: String?
     let created: Date?
-    let modified: Date?
+    var modified: Date?
     let isDir: Bool
     let isLocal: Bool
-    let fileSize: Int64?
+    var fileSize: Int64?
     let symlinkTarget: String?
     let icon: NSImage
 
@@ -214,6 +239,15 @@ private struct Details {
             let type = ext.isEmpty ? nil : UTType(filenameExtension: ext)
             icon = NSWorkspace.shared.icon(for: type ?? .data)
         }
+    }
+
+    /// Folds in the authoritative size and modified time from a
+    /// `stat_path` call, once it returns. Owner, permissions, and created
+    /// are not part of `FsEntry`, so they stay nil for a remote path.
+    mutating func applyRemoteStat(_ stat: FsEntry) {
+        fileSize = Int64(stat.size)
+        modified = stat.modifiedMs > 0
+            ? Date(timeIntervalSince1970: Double(stat.modifiedMs) / 1000) : nil
     }
 
     private static func describe(posix: Int) -> String {

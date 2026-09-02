@@ -14,16 +14,25 @@ enum DropTransferPolicy {
         _ sources: [String], destDir: String
     ) -> [String] {
         sources.filter { source in
-            if OrkaPath.isLocal(source) {
-                let parent = URL(fileURLWithPath: source)
-                    .deletingLastPathComponent().path
-                if parent == destDir { return false }
-            }
-            if destDir == source || destDir.hasPrefix(source + "/") {
+            let parent = OrkaPath.isLocal(source)
+                ? URL(fileURLWithPath: source).deletingLastPathComponent().path
+                : OrkaPath.remoteParent(of: source)
+            if let parent, samePath(parent, destDir) { return false }
+            if samePath(destDir, source) || destDir.hasPrefix(source + "/") {
                 return false
             }
             return true
         }
+    }
+
+    /// A remote directory can arrive with or without a trailing slash;
+    /// `remoteParent` never returns one.
+    private static func samePath(_ a: String, _ b: String) -> Bool {
+        a == b || trimSlash(a) == trimSlash(b)
+    }
+
+    private static func trimSlash(_ path: String) -> Substring {
+        path.count > 1 && path.hasSuffix("/") ? path.dropLast() : path[...]
     }
 
     static func sameVolume(_ a: String, _ b: String) -> Bool {
@@ -36,27 +45,38 @@ enum DropTransferPolicy {
         return va == vb
     }
 
-    /// Move only when the copy is not forced, every endpoint is local,
-    /// and every source shares the destination volume.
+    /// Move only when the copy is not forced, and the transfer stays on
+    /// one backend: every endpoint local and on the same volume, or
+    /// every endpoint remote on the same connection. A transfer that
+    /// crosses volumes, connections, or local/remote always copies.
     static func shouldMove(
         sources: [String], destDir: String, forceCopy: Bool
     ) -> Bool {
-        guard !forceCopy, OrkaPath.isLocal(destDir),
-            sources.allSatisfy(OrkaPath.isLocal)
-        else { return false }
-        return sources.allSatisfy { sameVolume($0, destDir) }
+        guard !forceCopy else { return false }
+        if OrkaPath.isLocal(destDir) {
+            guard sources.allSatisfy(OrkaPath.isLocal) else { return false }
+            return sources.allSatisfy { sameVolume($0, destDir) }
+        }
+        guard sources.allSatisfy({ !OrkaPath.isLocal($0) }) else { return false }
+        return sources.allSatisfy { OrkaPath.sameConnection($0, destDir) }
     }
 
-    /// Hover proposal: move when the destination is local, every
-    /// provider vends a file URL, and the Option key is up.
+    /// Hover proposal: move when the Option key is up and the drag stays
+    /// on one side. A local destination moves when every provider vends
+    /// a file URL. A remote destination moves when no provider vends
+    /// one, which marks an internal drag of remote rows. The drop itself
+    /// still copies across volumes or connections; see `shouldMove`.
     @MainActor
     static func proposedOperation(
         providers: [NSItemProvider], destDir: String
     ) -> DropOperation {
-        let allLocal = providers.allSatisfy {
+        guard !NSEvent.modifierFlags.contains(.option) else { return .copy }
+        let vendsFileURL = providers.map {
             $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier)
         }
-        return OrkaPath.isLocal(destDir) && allLocal
-            && !NSEvent.modifierFlags.contains(.option) ? .move : .copy
+        if OrkaPath.isLocal(destDir) {
+            return vendsFileURL.allSatisfy { $0 } ? .move : .copy
+        }
+        return vendsFileURL.contains(true) ? .copy : .move
     }
 }

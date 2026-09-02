@@ -102,9 +102,10 @@ struct IconGridView: View {
         }
     }
 
-    /// Remote rename and file drag-out to other apps are a later
-    /// milestone; the menu offers what already works today. Delete is
-    /// permanent (no server trash) and confirms before running.
+    /// File drag-out to other apps already works through the item
+    /// provider. Rename is not offered here: this grid has no inline
+    /// name editor, local or remote (see `FileListView` for that). Delete
+    /// is permanent (no server trash) and confirms before running.
     @ViewBuilder
     private func remoteItemMenu(for entry: FsEntry) -> some View {
         if entry.isDir {
@@ -112,6 +113,18 @@ struct IconGridView: View {
                 selectForMenu(entry)
                 model.open(entry)
             }
+        }
+        Button("Duplicate") {
+            selectForMenu(entry)
+            model.duplicateSelection(in: window)
+        }
+        Button("Cut") {
+            selectForMenu(entry)
+            model.cutSelection(in: window)
+        }
+        Button("Copy") {
+            selectForMenu(entry)
+            model.copySelection(in: window)
         }
         Button("Copy Path") {
             selectForMenu(entry)
@@ -256,10 +269,8 @@ struct IconGridView: View {
 
     @ViewBuilder
     private var backgroundMenu: some View {
-        if OrkaPath.isLocal(directory.path) {
-            Button("New Folder") { model.newFolder(in: window) }
-            Button("New File") { model.newFile(in: window) }
-        }
+        Button("New Folder") { model.newFolder(in: window) }
+        Button("New File") { model.newFile(in: window) }
         if model.canPaste {
             Button("Paste") { model.paste(in: window) }
         }
@@ -460,9 +471,6 @@ private struct IconGridDropDelegate: DropDelegate {
                 let sources = DropTransferPolicy.transferSources(
                     loaded, destDir: destination)
                 guard !sources.isEmpty else { return }
-                guard OrkaPath.isLocal(destination)
-                    || sources.allSatisfy(OrkaPath.isLocal)
-                else { return }
                 model.transfer(
                     sources: sources,
                     to: destination,
