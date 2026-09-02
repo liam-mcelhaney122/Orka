@@ -5,7 +5,7 @@
 //! service caches results briefly; the watch pipeline invalidates them.
 
 use crate::vfs::VPath;
-use git2::{Repository, Status, StatusOptions};
+use git2::{BranchType, Repository, Status, StatusOptions};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -306,6 +306,121 @@ fn head_info(repo: &Repository) -> (Option<String>, String) {
             (name, String::new())
         }
     }
+}
+
+/// One branch in the repository. Remote-tracking branches carry their
+/// short name without the `origin/` prefix stripped; the name is the
+/// reference shorthand verbatim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchEntry {
+    pub name: String,
+    pub is_head: bool,
+    pub is_local: bool,
+}
+
+/// Why a branch switch failed.
+#[derive(Debug, thiserror::Error)]
+pub enum BranchError {
+    #[error("branch not found: {0}")]
+    NotFound(String),
+    #[error("{0}")]
+    Checkout(String),
+}
+
+/// Lists every local and remote-tracking branch of the repo around
+/// `dir`. Local branches come first, both groups sorted by name.
+pub fn list_branches(dir: &str) -> Option<Vec<BranchEntry>> {
+    if !VPath::parse(dir).is_local() {
+        return None;
+    }
+    let dir = std::fs::canonicalize(dir).ok()?;
+    let repo = Repository::discover(&dir).ok()?;
+    let head = repo.head().ok().and_then(|h| h.shorthand().ok().map(str::to_owned));
+
+    let mut branches = Vec::new();
+    for (kind, is_local) in [(BranchType::Local, true), (BranchType::Remote, false)] {
+        let iter = repo.branches(Some(kind)).ok()?;
+        let mut group: Vec<BranchEntry> = Vec::new();
+        for entry in iter.flatten() {
+            let (branch_ref, _) = entry;
+            let Ok(Some(name)) = branch_ref.name() else {
+                continue;
+            };
+            group.push(BranchEntry {
+                name: name.to_string(),
+                is_head: is_local && head.as_deref() == Some(name),
+                is_local,
+            });
+        }
+        group.sort_by(|a, b| a.name.cmp(&b.name));
+        branches.extend(group);
+    }
+    Some(branches)
+}
+
+/// Checks out the local branch `name` in the repo around `dir`.
+///
+/// When `create` is set and the branch does not exist, it is created
+/// from `base`, a branch shorthand such as "main" or "origin/main",
+/// or from HEAD when `base` is `None`. A remote-tracking base makes
+/// the new branch track it, like `git checkout -b name origin/name`.
+/// An existing branch is checked out either way; `base` is ignored.
+///
+/// The checkout uses the safe strategy, so git refuses to overwrite
+/// uncommitted changes instead of discarding them. Detached HEAD is
+/// fine as a base; the new branch starts at the current commit.
+pub fn checkout_branch(
+    dir: &str,
+    name: &str,
+    base: Option<&str>,
+    create: bool,
+) -> Result<(), BranchError> {
+    if !VPath::parse(dir).is_local() {
+        return Err(BranchError::Checkout(format!(
+            "not a local path: {dir}"
+        )));
+    }
+    let dir = std::fs::canonicalize(dir)
+        .map_err(|e| BranchError::Checkout(format!("{dir}: {e}")))?;
+    let repo = Repository::discover(&dir)
+        .map_err(|e| BranchError::Checkout(format!("no git repo at {}: {e}", dir.display())))?;
+
+    if repo.find_branch(name, BranchType::Local).is_err() {
+        if !create {
+            return Err(BranchError::NotFound(name.to_string()));
+        }
+        let base_ref = base.unwrap_or("HEAD");
+        let commit = repo
+            .revparse_single(base_ref)
+            .and_then(|obj| obj.peel_to_commit())
+            .map_err(|e| BranchError::Checkout(format!("cannot resolve {base_ref}: {e}")))?;
+        repo.branch(name, &commit, false)
+            .map_err(|e| BranchError::Checkout(format!("cannot create {name}: {e}")))?;
+        // A remote-tracking base marks the new branch as tracking it.
+        // Failures here are best effort; the branch itself is usable.
+        if repo.find_branch(base_ref, BranchType::Remote).is_ok() {
+            if let Ok(mut local) = repo.find_branch(name, BranchType::Local) {
+                let _ = local.set_upstream(Some(base_ref));
+            }
+        }
+    }
+
+    let commit = repo
+        .find_branch(name, BranchType::Local)
+        .and_then(|b| b.get().peel_to_commit())
+        .map_err(|e| BranchError::Checkout(format!("{name}: {e}")))?;
+    let mut opts = git2::build::CheckoutBuilder::new();
+    opts.safe();
+    repo.checkout_tree(commit.as_object(), Some(&mut opts))
+        .map_err(|e| {
+            BranchError::Checkout(format!(
+                "git refused to switch (uncommitted changes?): {e}"
+            ))
+        })?;
+    let refname = format!("refs/heads/{name}");
+    repo.set_head(&refname)
+        .map_err(|e| BranchError::Checkout(format!("cannot set HEAD to {name}: {e}")))?;
+    Ok(())
 }
 
 /// Maps raw status bits to one child state. `None` means clean.

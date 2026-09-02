@@ -3,9 +3,20 @@
 //! Fixture repos are built with the git2 API in tempdirs. No test runs
 //! a git command or touches a repo outside its tempdir.
 
-use orka_core::git::{DirGitStatus, FileGitState, GitStatusService};
+use orka_core::git::{
+    checkout_branch, list_branches, BranchError, DirGitStatus, FileGitState, GitStatusService,
+};
 use std::fs;
 use std::path::Path;
+
+/// Shorthand of the branch HEAD points at, for assertions.
+fn head_branch_of(dir: &str) -> Option<String> {
+    let repo = git2::Repository::discover(dir).expect("discover repo");
+    let head = repo.head().ok()?;
+    let name = head.shorthand().ok().map(str::to_owned);
+    drop(head);
+    name
+}
 
 /// Creates a repo with initial branch "main" so branch assertions do
 /// not depend on the user's git config.
@@ -212,4 +223,186 @@ fn unborn_head_reports_default_branch() {
     let status = status_of(tmp.path()).expect("status");
     assert_eq!(status.branch.as_deref(), Some("main"));
     assert_eq!(status.head_short, "");
+}
+
+#[test]
+fn checkout_existing_branch_switches_head() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = committed_repo(tmp.path());
+    let head = repo.find_commit(repo.head().unwrap().target().unwrap()).unwrap();
+    repo.branch("feature", &head, false).expect("create branch");
+    let dir = tmp.path().display().to_string();
+
+    checkout_branch(&dir, "feature", None, false).expect("checkout");
+    assert_eq!(head_branch_of(&dir).as_deref(), Some("feature"));
+}
+
+#[test]
+fn checkout_with_create_makes_branch_from_head() {
+    let tmp = tempfile::tempdir().unwrap();
+    committed_repo(tmp.path());
+    let dir = tmp.path().display().to_string();
+
+    checkout_branch(&dir, "new-branch", None, true).expect("create and checkout");
+    assert_eq!(head_branch_of(&dir).as_deref(), Some("new-branch"));
+}
+
+#[test]
+fn checkout_existing_branch_with_create_flag_just_switches() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = committed_repo(tmp.path());
+    let head = repo.find_commit(repo.head().unwrap().target().unwrap()).unwrap();
+    repo.branch("feature", &head, false).expect("create branch");
+    let dir = tmp.path().display().to_string();
+
+    checkout_branch(&dir, "feature", None, true).expect("switch to existing");
+    assert_eq!(head_branch_of(&dir).as_deref(), Some("feature"));
+}
+
+#[test]
+fn checkout_missing_branch_without_create_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    committed_repo(tmp.path());
+    let dir = tmp.path().display().to_string();
+
+    let err = checkout_branch(&dir, "missing", None, false).unwrap_err();
+    assert!(matches!(err, BranchError::NotFound(_)));
+}
+
+#[test]
+fn checkout_refuses_to_overwrite_uncommitted_changes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = committed_repo(tmp.path());
+    let head = repo.find_commit(repo.head().unwrap().target().unwrap()).unwrap();
+    repo.branch("feature", &head, false).expect("create branch");
+
+    // A different committed file on feature makes main and feature
+    // trees diverge, so the edit below would be lost on switch.
+    repo.set_head("refs/heads/feature").expect("set head");
+    write_file(&repo, "feature.txt", "feature\n");
+    stage(&repo, "feature.txt");
+    commit(&repo, "feature work");
+    repo.set_head("refs/heads/main").expect("back to main");
+
+    fs::write(tmp.path().join("base.txt"), "edited\n").expect("edit file");
+    let dir = tmp.path().display().to_string();
+    let err = checkout_branch(&dir, "feature", None, false).unwrap_err();
+    assert!(matches!(err, BranchError::Checkout(_)));
+    assert_eq!(head_branch_of(&dir).as_deref(), Some("main"));
+}
+
+#[test]
+fn list_branches_reports_local_and_remote_sorted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = committed_repo(tmp.path());
+    let head = repo.find_commit(repo.head().unwrap().target().unwrap()).unwrap();
+    repo.branch("zeta", &head, false).expect("create zeta");
+    repo.branch("alpha", &head, false).expect("create alpha");
+    // Fake a remote-tracking branch with an unusual but valid ref shape.
+    let refname = "refs/remotes/origin/main";
+    repo.reference(refname, head.id(), true, "test").expect("remote ref");
+
+    let branches = list_branches(&tmp.path().display().to_string()).expect("branches");
+    let names: Vec<&str> = branches.iter().map(|b| b.name.as_str()).collect();
+    assert_eq!(names, vec!["alpha", "main", "zeta", "origin/main"]);
+    let head_flags: Vec<bool> = branches.iter().map(|b| b.is_head).collect();
+    assert_eq!(head_flags, vec![false, true, false, false]);
+    assert!(branches[0].is_local);
+    assert!(!branches[3].is_local);
+}
+
+#[test]
+fn list_branches_non_repo_returns_none() {
+    let tmp = tempfile::tempdir().unwrap();
+    assert!(list_branches(&tmp.path().display().to_string()).is_none());
+}
+
+#[test]
+fn create_from_explicit_base_starts_there() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = committed_repo(tmp.path());
+    let base_oid = repo.head().unwrap().target().unwrap();
+
+    // Commit once more on main so the base differs from HEAD.
+    write_file(&repo, "second.txt", "second\n");
+    stage(&repo, "second.txt");
+    commit(&repo, "second");
+    let head_oid = repo.head().unwrap().target().unwrap();
+    assert_ne!(base_oid, head_oid);
+
+    let dir = tmp.path().display().to_string();
+    checkout_branch(&dir, "from-base", Some("main"), true).expect("create from main");
+    let repo2 = git2::Repository::discover(&dir).unwrap();
+    assert_eq!(
+        repo2.find_branch("from-base", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .target()
+            .unwrap(),
+        head_oid
+    );
+}
+
+#[test]
+fn create_from_remote_base_sets_upstream() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = committed_repo(tmp.path());
+    let oid = repo.head().unwrap().target().unwrap();
+    // libgit2 resolves the upstream through the remote's fetch
+    // refspec, so the remote config must match a real clone.
+    let mut cfg = repo.config().unwrap();
+    cfg.set_str("remote.origin.url", "https://example.com/repo.git").unwrap();
+    cfg.set_str(
+        "remote.origin.fetch",
+        "+refs/heads/*:refs/remotes/origin/*",
+    )
+    .unwrap();
+    repo.reference("refs/remotes/origin/main", oid, true, "test")
+        .expect("remote ref");
+    let dir = tmp.path().display().to_string();
+
+    checkout_branch(&dir, "tracked", Some("origin/main"), true).expect("create from remote");
+    let repo2 = git2::Repository::discover(&dir).unwrap();
+    let upstream = repo2
+        .find_branch("tracked", git2::BranchType::Local)
+        .unwrap()
+        .upstream()
+        .expect("upstream");
+    assert_eq!(upstream.get().shorthand().unwrap(), "origin/main");
+}
+
+#[test]
+fn detached_head_can_create_branch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = committed_repo(tmp.path());
+    let oid = repo.head().unwrap().target().unwrap();
+    repo.set_head_detached(oid).expect("detach");
+    let dir = tmp.path().display().to_string();
+
+    checkout_branch(&dir, "from-detached", None, true).expect("create while detached");
+    assert_eq!(head_branch_of(&dir).as_deref(), Some("from-detached"));
+    let repo2 = git2::Repository::discover(&dir).unwrap();
+    assert_eq!(
+        repo2.find_branch("from-detached", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .target()
+            .unwrap(),
+        oid
+    );
+}
+
+#[test]
+fn checkout_local_branch_matching_remote_name_prefers_existing_local() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = committed_repo(tmp.path());
+    let oid = repo.head().unwrap().target().unwrap();
+    repo.reference("refs/remotes/origin/main", oid, true, "test")
+        .expect("remote ref");
+    let dir = tmp.path().display().to_string();
+
+    // "main" exists locally, so the base is ignored and main is
+    // checked out instead of creating anything.
+    checkout_branch(&dir, "main", Some("origin/main"), true).expect("switch to existing");
+    assert_eq!(head_branch_of(&dir).as_deref(), Some("main"));
 }

@@ -383,6 +383,18 @@ impl OpsEngine {
         Ok(created)
     }
 
+    /// Synchronous empty-file creation with an undo entry.
+    pub fn create_file(&self, parent: &Path, name: &str) -> Result<PathBuf, ItemError> {
+        let created = create_file(parent, name)?;
+        self.push_undo(UndoEntry {
+            description: "New File".to_string(),
+            actions: vec![UndoAction::Trash {
+                path: created.clone(),
+            }],
+        });
+        Ok(created)
+    }
+
     fn push_undo(&self, entry: UndoEntry) {
         let mut journal = self.journal.lock().unwrap();
         journal.undo.push(entry);
@@ -461,6 +473,37 @@ pub fn create_folder(parent: &Path, name: &str) -> Result<PathBuf, ItemError> {
     }
     std::fs::create_dir(&candidate).map_err(|e| item_error(parent, &e.to_string()))?;
     Ok(candidate)
+}
+
+/// Creates an empty file. Appends " 2", " 3", … when the name is taken,
+/// mirroring the folder behavior.
+pub fn create_file(parent: &Path, name: &str) -> Result<PathBuf, ItemError> {
+    if name.is_empty() || name.contains('/') {
+        return Err(item_error(parent, "invalid name"));
+    }
+    let mut candidate = parent.join(name);
+    let stem_ext = split_stem(name);
+    let mut counter = 2;
+    while candidate.symlink_metadata().is_ok() {
+        let unique = match &stem_ext {
+            Some((stem, ext)) => format!("{stem} {counter}.{ext}"),
+            None => format!("{name} {counter}"),
+        };
+        candidate = parent.join(unique);
+        counter += 1;
+    }
+    std::fs::File::create(&candidate).map_err(|e| item_error(parent, &e.to_string()))?;
+    Ok(candidate)
+}
+
+/// Splits "report.txt" into ("report", "txt"). None for names without
+/// a dot in their last component.
+fn split_stem(name: &str) -> Option<(String, String)> {
+    let (stem, ext) = name.rsplit_once('.')?;
+    if stem.is_empty() || ext.is_empty() {
+        return None;
+    }
+    Some((stem.to_string(), ext.to_string()))
 }
 
 // ---------------------------------------------------------------------------

@@ -59,6 +59,10 @@ struct OrkaApp: App {
                     AppModel.shared.newFolder()
                 }
                 .keyboardShortcut("n", modifiers: [.command, .shift])
+                Button("New File") {
+                    AppModel.shared.newFile()
+                }
+                .keyboardShortcut("n", modifiers: [.command, .option])
                 Button("Duplicate") {
                     AppModel.shared.duplicateSelection()
                 }

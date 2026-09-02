@@ -619,6 +619,8 @@ final class FileListCoordinator: NSObject, @preconcurrency NSFilePromiseProvider
 
     @objc private func contextNewFolder() { model.newFolder(in: window) }
 
+    @objc private func contextNewFile() { model.newFile(in: window) }
+
     @objc private func contextCompressZip() { compressSelectionFromMenu(as: .zip) }
     @objc private func contextCompressTar() { compressSelectionFromMenu(as: .tar) }
     @objc private func contextCompressTarGz() { compressSelectionFromMenu(as: .tarGz) }
@@ -1194,6 +1196,8 @@ extension FileListCoordinator: NSMenuDelegate {
         menu.addItem(.separator())
         menu.addItem(makeItem(
             "New Folder", action: #selector(contextNewFolder)))
+        menu.addItem(makeItem(
+            "New File", action: #selector(contextNewFile)))
     }
 
     /// Checkmark list of the toggleable columns, shown on a header
