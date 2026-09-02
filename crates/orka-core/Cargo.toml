@@ -12,16 +12,32 @@ nucleo-matcher = "0.3.1"
 # vendored-libgit2 compiles the C library in; no system dependency.
 git2 = { version = "0.21.0", default-features = false, features = ["vendored-libgit2"] }
 ssh2 = { version = "0.9.6", features = ["vendored-openssl"] }
-# FTP backend.
-suppaftp = { version = "6", default-features = false, features = ["rustls"] }
+# FTP backend. "deprecated" unlocks connect_secure_implicit, needed for
+# implicit-TLS FTPS (port 990); the FTP spec deprecated implicit TLS in
+# favor of explicit AUTH TLS, but many servers still expect it on 990.
+suppaftp = { version = "6", default-features = false, features = ["rustls", "deprecated"] }
+# Trust roots for the FTPS TLS connector.
+webpki-roots = "1"
 # REST file-server backends (Dropbox, Google Drive, ADLS) and their JSON.
 ureq = { version = "2", features = ["json", "tls"] }
+# Only for reading the URL a ureq transport error carries, so the
+# error message can drop its query string (a SAS token can live
+# there) instead of the crate's own URL parsing.
+url = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # ADLS Gen2 shared-key signing.
 hmac = "0.12"
 sha2 = "0.10"
 base64 = "0.22"
+# Cryptographically secure randomness for the OAuth PKCE verifier and
+# the loopback redirect state parameter.
+getrandom = "0.2"
+# RS256 signing for a Google service-account JWT. Pure Rust; no system
+# OpenSSL dependency, so vendored builds keep working. Trimmed to the
+# features this backend actually needs: PEM parsing of the key file
+# and SHA-256 for the RS256 signature.
+rsa = { version = "0.9", default-features = false, features = ["std", "pem", "sha2"] }
 # Archive support: zip, tar, and gzip tarballs.
 zip = { version = "2", default-features = false, features = ["deflate"] }
 tar = "0.4"

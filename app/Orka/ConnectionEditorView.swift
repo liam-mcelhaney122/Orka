@@ -21,11 +21,13 @@ struct ConnectionEditorTarget: Identifiable {
 
 /// Add/edit sheet for one saved connection, opened from the sidebar's
 /// Connections section. Fields adapt to the chosen scheme: SFTP and
-/// RSync offer Password, SSH Key, and SSH Agent; S3 offers Profile and
-/// Access Keys; SMB and FTP offer Password or No Auth (guest/anonymous);
-/// NFS needs no sign-in at all, so it shows no Auth picker; ADLS offers
-/// an account key or an OAuth token; Google Drive and Dropbox use an
-/// OAuth token.
+/// RSync offer Password, SSH Key, and SSH Agent; S3 offers Profile,
+/// Access Keys, and No Auth; FTP and FTPS offer Password or No Auth
+/// (anonymous login); SMB offers Password, Kerberos, or No Auth
+/// (guest); NFS offers No Auth or Kerberos; ADLS offers an account
+/// key, a SAS token, a service principal, an interactive sign-in, or a
+/// pasted token; Google Drive and Dropbox offer an interactive
+/// sign-in, and Google Drive also offers a service-account key file.
 struct ConnectionEditorView: View {
     let target: ConnectionEditorTarget
 
@@ -42,6 +44,24 @@ struct ConnectionEditorView: View {
     @State private var keyPath: String
     @State private var profile: String
     @State private var secret: String
+    /// S3 Access Keys only. Non-empty saves the secret as JSON with the
+    /// secret access key, rather than as the plain key string.
+    @State private var sessionToken: String
+    /// Service Principal and Sign In (OAuth app) auth: the app's
+    /// tenant. Empty except for ADLS.
+    @State private var tenantIdField: String
+    /// Service Principal and Sign In (OAuth app) auth: the app's
+    /// client id.
+    @State private var clientIdField: String
+    /// Google Drive Sign In only. Some OAuth desktop clients (Google's
+    /// among them) need the client secret on a token refresh even
+    /// though the app is a public installed client. Passed to sign-in
+    /// only; never saved on its own.
+    @State private var oauthClientSecret: String
+    /// Caption under the Sign In button: "Signed in" on success, or the
+    /// failure reason. Nil before the first attempt.
+    @State private var signInStatus: String?
+    @State private var isSigningIn: Bool
 
     init(target: ConnectionEditorTarget) {
         self.target = target
@@ -68,6 +88,12 @@ struct ConnectionEditorView: View {
         _keyPath = State(initialValue: existing?.auth.keyPath ?? "")
         _profile = State(initialValue: existing?.auth.profile ?? "")
         _secret = State(initialValue: "")
+        _sessionToken = State(initialValue: "")
+        _tenantIdField = State(initialValue: existing?.auth.tenantId ?? "")
+        _clientIdField = State(initialValue: existing?.auth.clientId ?? "")
+        _oauthClientSecret = State(initialValue: "")
+        _signInStatus = State(initialValue: nil)
+        _isSigningIn = State(initialValue: false)
     }
 
     private var isNew: Bool { target.connection == nil }
@@ -110,6 +136,9 @@ struct ConnectionEditorView: View {
             hostHint
             TextField("Port", text: $port)
             TextField(usernameLabel, text: $username)
+            if scheme == .smb {
+                hintCaption("DOMAIN;user for a domain account")
+            }
             TextField("Initial Path", text: $initialPath)
             if !availableAuthKinds.isEmpty {
                 Picker("Auth", selection: $authKind) {
@@ -117,11 +146,6 @@ struct ConnectionEditorView: View {
                         Text(kind.rawValue).tag(kind)
                     }
                 }
-            }
-            if scheme == .nfs {
-                Text("No sign-in is needed; the mount runs as your user.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
             }
             authFields
         }
@@ -149,7 +173,7 @@ struct ConnectionEditorView: View {
             hintCaption("drive.google.com")
         case .dropbox:
             hintCaption("dropbox.com")
-        case .sftp, .s3, .ftp, .rsync:
+        case .sftp, .s3, .ftp, .ftps, .rsync:
             EmptyView()
         }
     }
@@ -160,6 +184,17 @@ struct ConnectionEditorView: View {
             .foregroundStyle(.secondary)
     }
 
+    /// "Leave blank to keep the saved secret" applies to every
+    /// secret-bearing kind, but only once a saved secret exists.
+    @ViewBuilder
+    private var keepSecretHint: some View {
+        if !isNew {
+            Text("Leave blank to keep the saved secret.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
     @ViewBuilder
     private var authFields: some View {
         switch authKind {
@@ -167,11 +202,10 @@ struct ConnectionEditorView: View {
             SecureField(
                 authKind == .password ? "Password" : "Secret Access Key",
                 text: $secret)
-            if !isNew {
-                Text("Leave blank to keep the saved secret.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+            if authKind == .s3Keys {
+                SecureField("Session Token (optional)", text: $sessionToken)
             }
+            keepSecretHint
         case .sshKey:
             HStack(spacing: 6) {
                 TextField("Key Path", text: $keyPath)
@@ -196,14 +230,75 @@ struct ConnectionEditorView: View {
             Text("Paste an OAuth access token. It is stored in your keychain.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+            keepSecretHint
         case .sharedKey:
             SecureField("Account Key", text: $secret)
             Text("Paste the base64 storage account key. It is stored in your keychain.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+            keepSecretHint
+        case .sasToken:
+            SecureField("SAS Token", text: $secret)
+            Text("Paste the SAS query string. It is stored in your keychain.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            keepSecretHint
+        case .servicePrincipal:
+            TextField("Tenant ID", text: $tenantIdField)
+            TextField("Client ID", text: $clientIdField)
+            SecureField("Client Secret", text: $secret)
+            keepSecretHint
+        case .oauthApp:
+            oauthAppFields
+        case .serviceAccount:
+            serviceAccountFields
+        case .kerberos:
+            Text("Uses your signed-in user's Kerberos ticket. No credentials are stored.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         case .none:
             EmptyView()
         }
+    }
+
+    @ViewBuilder
+    private var oauthAppFields: some View {
+        if scheme == .adls {
+            TextField("Tenant ID", text: $tenantIdField)
+        }
+        TextField("Client ID", text: $clientIdField)
+        if scheme == .gdrive {
+            SecureField("Client Secret (optional)", text: $oauthClientSecret)
+        }
+        HStack(spacing: 6) {
+            Button(isSigningIn ? "Signing In…" : "Sign In…") {
+                Task { await signIn() }
+            }
+            .disabled(
+                isSigningIn
+                    || clientIdField.trimmingCharacters(in: .whitespaces).isEmpty)
+            if isSigningIn {
+                ProgressView().controlSize(.small)
+            }
+        }
+        if let signInStatus {
+            Text(signInStatus)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        keepSecretHint
+    }
+
+    @ViewBuilder
+    private var serviceAccountFields: some View {
+        HStack(spacing: 6) {
+            Text(secret.isEmpty ? "No file chosen" : "JSON key selected")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Spacer()
+            Button("Choose JSON key…") { chooseServiceAccountFile() }
+        }
+        keepSecretHint
     }
 
     private var footer: some View {
@@ -226,15 +321,13 @@ struct ConnectionEditorView: View {
         .padding(.vertical, 12)
     }
 
-    /// Schemes the picker offers. Every scheme has a backend now.
+    /// Schemes the picker offers. Every scheme has a backend now,
+    /// except FTPS, whose backend lands separately.
     private var availableSchemes: [StoredScheme] {
         StoredScheme.allCases
     }
 
-    /// Auth kinds offered for the chosen scheme. NFS needs no sign-in at
-    /// all (the mount runs as the local user), so it offers none and the
-    /// form hides the Auth picker entirely. FTP and SMB add No Auth
-    /// alongside Password for anonymous/guest access.
+    /// Auth kinds offered for the chosen scheme.
     ///
     /// A `static` function (not just this computed property) so `init`
     /// can clamp a saved connection's auth kind against its scheme's
@@ -243,11 +336,13 @@ struct ConnectionEditorView: View {
     private static func authKinds(for scheme: StoredScheme) -> [AuthKind] {
         switch scheme {
         case .sftp, .rsync: return [.password, .sshKey, .sshAgent]
-        case .s3: return [.s3Profile, .s3Keys]
-        case .ftp, .smb: return [.password, .none]
-        case .nfs: return []
-        case .adls: return [.sharedKey, .oauthToken]
-        case .gdrive, .dropbox: return [.oauthToken]
+        case .s3: return [.s3Profile, .s3Keys, .none]
+        case .ftp, .ftps: return [.password, .none]
+        case .smb: return [.password, .kerberos, .none]
+        case .nfs: return [.none, .kerberos]
+        case .adls: return [.sharedKey, .sasToken, .servicePrincipal, .oauthApp, .oauthToken]
+        case .gdrive: return [.oauthApp, .serviceAccount, .oauthToken]
+        case .dropbox: return [.oauthApp, .oauthToken]
         }
     }
 
@@ -284,6 +379,52 @@ struct ConnectionEditorView: View {
         }
     }
 
+    /// File picker for a Google service-account JSON key. The file's
+    /// full content becomes the secret; there is no separate path
+    /// field to keep, since the app never re-reads the file.
+    private func chooseServiceAccountFile() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [.json]
+        if panel.runModal() == .OK, let url = panel.url,
+            let content = try? String(contentsOf: url, encoding: .utf8)
+        {
+            secret = content
+        }
+    }
+
+    /// Runs the interactive OAuth sign-in flow off the main thread and
+    /// keeps the returned token-set JSON in `secret` so `save()` stores
+    /// it. Tenant id is sent only for ADLS; client secret only for
+    /// Google Drive, which some OAuth desktop clients require even for
+    /// a public installed client.
+    private func signIn() async {
+        isSigningIn = true
+        signInStatus = nil
+        let engineScheme = scheme.toEngine()
+        let clientId = clientIdField
+        let tenantId = scheme == .adls ? tenantIdField : ""
+        let clientSecret =
+            (scheme == .gdrive && !oauthClientSecret.isEmpty) ? oauthClientSecret : nil
+        let result = await Task.detached(priority: .userInitiated) {
+            Result {
+                try oauthSignIn(
+                    scheme: engineScheme, clientId: clientId,
+                    clientSecret: clientSecret, tenantId: tenantId)
+            }
+        }.value
+        isSigningIn = false
+        switch result {
+        case .success(let json):
+            secret = json
+            signInStatus = "Signed in"
+        case .failure(let error):
+            signInStatus = DirectoryModel.describe(error)
+        }
+    }
+
     private func save() {
         guard let portNumber else { return }
         let auth: StoredAuthMethod
@@ -295,6 +436,14 @@ struct ConnectionEditorView: View {
         case .s3Keys: auth = .s3Keys
         case .oauthToken: auth = .oauthToken
         case .sharedKey: auth = .sharedKey
+        case .sasToken: auth = .sasToken
+        case .servicePrincipal:
+            auth = .servicePrincipal(tenantId: tenantIdField, clientId: clientIdField)
+        case .oauthApp:
+            auth = .oauthApp(
+                clientId: clientIdField, tenantId: scheme == .adls ? tenantIdField : "")
+        case .serviceAccount: auth = .serviceAccount
+        case .kerberos: auth = .kerberos
         case .none: auth = .none
         }
         let config = StoredConnection(
@@ -303,8 +452,35 @@ struct ConnectionEditorView: View {
             port: portNumber, username: username,
             initialPath: StoredConnection.normalizedInitialPath(initialPath),
             auth: auth)
-        model.saveConnection(
-            config, secret: secret.isEmpty ? nil : secret)
+        model.saveConnection(config, secret: resolvedSecret())
         dismiss()
+    }
+
+    /// The secret to save. S3 Access Keys with a session token save a
+    /// JSON object instead of the plain key, so the backend can tell
+    /// the two forms apart (see `SecretFields` in the core crate).
+    private func resolvedSecret() -> String? {
+        if authKind == .s3Keys, !sessionToken.isEmpty {
+            let payload = S3KeysSecret(secretAccessKey: secret, sessionToken: sessionToken)
+            if let data = try? JSONEncoder().encode(payload),
+                let json = String(data: data, encoding: .utf8)
+            {
+                return json
+            }
+        }
+        return secret.isEmpty ? nil : secret
+    }
+}
+
+/// JSON shape for an S3 Access Keys secret that also carries a session
+/// token. Mirrors the field names `orka_core::vfs::secret::SecretFields`
+/// reads on the backend side.
+private struct S3KeysSecret: Codable {
+    let secretAccessKey: String
+    let sessionToken: String
+
+    enum CodingKeys: String, CodingKey {
+        case secretAccessKey = "secret_access_key"
+        case sessionToken = "session_token"
     }
 }

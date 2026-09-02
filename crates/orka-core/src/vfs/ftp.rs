@@ -10,27 +10,51 @@
 //! `suppaftp` handles, and chunks cross a bounded channel to a plain
 //! `Read`/`Write` side the caller uses.
 //!
-//! This backend speaks plain FTP, not FTPS. Plain FTP sends the
+//! This backend speaks both plain FTP and FTPS. Plain FTP sends the
 //! login and every byte of data in cleartext; prefer `sftp://` when a
-//! server supports it. Error strings must never include secret
-//! material.
+//! server supports it. FTPS wraps the same control and data
+//! connections in TLS: port 990 dials straight into TLS (implicit
+//! mode, deprecated by the FTP spec but still expected by many
+//! servers); any other port connects in cleartext first and then
+//! sends `AUTH TLS` (explicit mode). Both FTPS modes require `PROT P`
+//! so file data, not only the login, travels encrypted. Error strings
+//! must never include secret material.
 //!
 //! FTP has no generic "stat" command with reliable semantics across
 //! servers, so [`FtpBackend::stat`] lists the parent directory and
 //! matches the entry by name. This mirrors how graphical FTP clients
 //! resolve single-path metadata.
+//!
+//! TLS verification trusts only the Mozilla root set baked in by
+//! `webpki-roots`. A private or self-signed certificate authority is
+//! not supported yet.
 
 use super::connections::{AuthMethod, BackendFactory, ConnectionConfig, SecretProvider};
 use super::{Capabilities, FsBackend, WriteFinish};
 use crate::{Entry, ListOptions};
-use suppaftp::list::File as FtpFile;
-use suppaftp::FtpStream;
 use std::io::{self, Read, Write};
-use std::net::ToSocketAddrs;
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, UNIX_EPOCH};
+use suppaftp::list::File as FtpFile;
+use suppaftp::rustls::{ClientConfig, RootCertStore};
+use suppaftp::{RustlsConnector, RustlsFtpStream, Status};
+
+/// The control (and, once secured, data) connection type.
+///
+/// This is the same type whether or not the session ends up secured.
+/// `suppaftp` tells the two apart only at the byte-stream level
+/// (`DataStream`'s `Tcp`/`Ssl` variants), not at the Rust type level.
+/// A plain FTP session and a negotiated FTPS session therefore share
+/// this alias. Every operation below (list, read, write, rename,
+/// delete, mkdir, transfer pumps) works unchanged on both.
+type FtpStream = RustlsFtpStream;
+
+/// The conventional implicit-TLS FTPS port. A connect to any other
+/// port uses explicit `AUTH TLS` instead.
+const IMPLICIT_TLS_PORT: u16 = 990;
 
 /// TCP dial timeout. Covers connect only.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -81,14 +105,24 @@ fn prepare_auth(
         | AuthMethod::S3Profile { .. }
         | AuthMethod::S3Keys
         | AuthMethod::OAuthToken
-        | AuthMethod::SharedKey => Err("wrong auth method for ftp".to_string()),
+        | AuthMethod::SharedKey
+        | AuthMethod::SasToken
+        | AuthMethod::ServicePrincipal { .. }
+        | AuthMethod::OAuthApp { .. }
+        | AuthMethod::ServiceAccount
+        | AuthMethod::Kerberos => Err("wrong auth method for ftp".to_string()),
     }
 }
 
 /// Dials and authenticates one control connection for one config. The
 /// factory uses it for the primary connection; every transfer pump
-/// uses it again for its own connection.
-fn connect_session(config: &ConnectionConfig, secrets: &dyn SecretProvider) -> Result<FtpStream, String> {
+/// uses it again for its own connection. `tls` selects FTPS: implicit
+/// mode on [`IMPLICIT_TLS_PORT`], explicit `AUTH TLS` otherwise.
+fn connect_session(
+    config: &ConnectionConfig,
+    secrets: &dyn SecretProvider,
+    tls: bool,
+) -> Result<FtpStream, String> {
     let auth = prepare_auth(config, secrets)?;
     let port = u16::try_from(config.port).map_err(|_| format!("invalid port {}", config.port))?;
     let addr = (config.host.as_str(), port)
@@ -96,13 +130,16 @@ fn connect_session(config: &ConnectionConfig, secrets: &dyn SecretProvider) -> R
         .map_err(|e| format!("cannot resolve {}: {e}", config.host))?
         .next()
         .ok_or_else(|| format!("cannot resolve {}", config.host))?;
-    let stream = FtpStream::connect_timeout(addr, CONNECT_TIMEOUT)
-        .map_err(|e| format!("cannot connect to {}:{port}: {e}", config.host))?;
+    let mut stream = if tls {
+        connect_tls(&config.host, addr, port)?
+    } else {
+        FtpStream::connect_timeout(addr, CONNECT_TIMEOUT)
+            .map_err(|e| format!("cannot connect to {}:{port}: {e}", config.host))?
+    };
     // Best effort: an unsupported timeout on the underlying socket
     // must not fail the connect.
     let _ = stream.get_ref().set_read_timeout(Some(SESSION_TIMEOUT));
     let _ = stream.get_ref().set_write_timeout(Some(SESSION_TIMEOUT));
-    let mut stream = stream;
     let (user, password) = match &auth {
         PreparedAuth::Password(password) => (config.username.as_str(), password.as_str()),
         PreparedAuth::Anonymous => anonymous_credentials(),
@@ -114,10 +151,127 @@ fn connect_session(config: &ConnectionConfig, secrets: &dyn SecretProvider) -> R
     Ok(stream)
 }
 
-/// Creates FTP backends for [`super::Scheme::Ftp`]. Plain FTP: the
-/// login and all data move in cleartext over the network.
+/// True when `port` is the conventional implicit-TLS FTPS port.
+fn is_implicit_tls_port(port: u16) -> bool {
+    port == IMPLICIT_TLS_PORT
+}
+
+/// A TLS connector trusting the Mozilla root set baked in by
+/// `webpki-roots`. Built fresh per connect: an FTP control connection
+/// is short-lived compared to the cost of building a `ClientConfig`,
+/// and a fresh connector keeps this function free of shared mutable
+/// state.
+fn tls_connector() -> RustlsConnector {
+    let roots = RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.into(),
+    };
+    let config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    RustlsConnector::from(Arc::new(config))
+}
+
+/// Dials `addr` over FTPS. `host` is the TLS server name and must be
+/// the name from the connection config, not a resolved IP: it is used
+/// for both SNI and certificate verification.
+///
+/// Both modes dial (and, for explicit mode, apply the session
+/// timeouts) before any TLS byte crosses the wire, so a stalled dial
+/// or a stalled handshake cannot hang past [`CONNECT_TIMEOUT`].
+fn connect_tls(host: &str, addr: SocketAddr, port: u16) -> Result<FtpStream, String> {
+    let connector = tls_connector();
+    if is_implicit_tls_port(port) {
+        let mut stream = connect_secure_implicit_bounded(addr, connector, host, CONNECT_TIMEOUT)
+            .map_err(|e| format!("cannot connect to {host}:{port}: {e}"))?;
+        // Best effort: an unsupported timeout on the underlying socket
+        // must not fail the connect.
+        let _ = stream.get_ref().set_read_timeout(Some(SESSION_TIMEOUT));
+        let _ = stream.get_ref().set_write_timeout(Some(SESSION_TIMEOUT));
+        // Implicit mode skips the `AUTH TLS` exchange that normally
+        // negotiates PBSZ/PROT, so the data channel is protected by
+        // hand here.
+        secure_data_channel(&mut stream)?;
+        Ok(stream)
+    } else {
+        let socket = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
+            .map_err(|e| format!("cannot connect to {host}:{port}: {e}"))?;
+        // Best effort: an unsupported timeout on the underlying socket
+        // must not fail the connect. Setting it now, before the
+        // control-channel greeting and the TLS handshake, bounds both.
+        let _ = socket.set_read_timeout(Some(SESSION_TIMEOUT));
+        let _ = socket.set_write_timeout(Some(SESSION_TIMEOUT));
+        let plain = FtpStream::connect_with_stream(socket)
+            .map_err(|e| format!("cannot connect to {host}:{port}: {e}"))?;
+        // `into_secure` negotiates PBSZ 0 and PROT P itself.
+        plain
+            .into_secure(connector, host)
+            .map_err(|e| format!("cannot negotiate TLS with {host}:{port}: {e}"))
+    }
+}
+
+/// Dials `addr` and negotiates implicit FTPS, bounded to `timeout`.
+///
+/// `suppaftp` (6.3.0) has no stream-based constructor for implicit
+/// mode: [`FtpStream::connect_secure_implicit`] always dials its own
+/// `TcpStream::connect` internally, with no timeout and no stream
+/// handed in, so this cannot set a timeout on the socket up front the
+/// way [`connect_tls`] does for explicit mode. Instead this runs the
+/// whole dial and handshake on a helper thread and stops waiting for
+/// it once `timeout` elapses. A helper thread that misses the
+/// deadline is abandoned; std has no way to cancel a blocking socket
+/// call from outside it, so the thread finishes (or fails) on its own
+/// once the connect or handshake resolves.
+fn connect_secure_implicit_bounded(
+    addr: SocketAddr,
+    connector: RustlsConnector,
+    host: &str,
+    timeout: Duration,
+) -> Result<FtpStream, String> {
+    let host = host.to_string();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let result =
+            FtpStream::connect_secure_implicit(addr, connector, &host).map_err(|e| e.to_string());
+        let _ = tx.send(result);
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(_) => Err(format!("timed out after {}s", timeout.as_secs())),
+    }
+}
+
+/// Sends `PBSZ 0` then `PROT P` so the data channel (listings,
+/// transfers), not only the login, is encrypted. `into_secure` does
+/// this on its own for explicit TLS; implicit TLS has no equivalent
+/// step in `suppaftp`, so implicit mode calls this directly.
+fn secure_data_channel(stream: &mut FtpStream) -> Result<(), String> {
+    stream
+        .custom_command("PBSZ 0", &[Status::CommandOk])
+        .map_err(|e| format!("cannot set protection buffer size: {e}"))?;
+    stream
+        .custom_command("PROT P", &[Status::CommandOk])
+        .map_err(|e| format!("cannot require an encrypted data channel: {e}"))?;
+    Ok(())
+}
+
+/// Creates FTP backends for [`super::Scheme::Ftp`] and
+/// [`super::Scheme::Ftps`]. Plain FTP (`tls: false`) sends the login
+/// and all data in cleartext. FTPS (`tls: true`) wraps the control
+/// connection, and per [`secure_data_channel`] the data connection
+/// too, in TLS: see [`connect_tls`] for implicit-vs-explicit mode
+/// selection.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct FtpFactory;
+pub struct FtpFactory {
+    tls: bool,
+}
+
+impl FtpFactory {
+    /// An FTPS factory. Port 990 means implicit TLS; any other port
+    /// means explicit `AUTH TLS` on the plain control connection.
+    pub fn tls() -> Self {
+        Self { tls: true }
+    }
+}
 
 impl BackendFactory for FtpFactory {
     fn connect(
@@ -125,11 +279,12 @@ impl BackendFactory for FtpFactory {
         config: &ConnectionConfig,
         secrets: Arc<dyn SecretProvider>,
     ) -> Result<Arc<dyn FsBackend>, String> {
-        let stream = connect_session(config, secrets.as_ref())?;
+        let stream = connect_session(config, secrets.as_ref(), self.tls)?;
         Ok(Arc::new(FtpBackend {
             inner: Mutex::new(stream),
             config: config.clone(),
             secrets,
+            tls: self.tls,
         }))
     }
 }
@@ -274,10 +429,11 @@ impl Read for ChannelReader {
 fn read_pump(
     config: &ConnectionConfig,
     secrets: &dyn SecretProvider,
+    tls: bool,
     path: &str,
     tx: &SyncSender<ChunkResult>,
 ) -> Result<(), String> {
-    let mut stream = connect_session(config, secrets)?;
+    let mut stream = connect_session(config, secrets, tls)?;
     let mut data = stream
         .retr_as_stream(path)
         .map_err(|e| format!("cannot open {path}: {e}"))?;
@@ -407,10 +563,11 @@ impl Drop for ChannelWriter {
 fn write_pump(
     config: &ConnectionConfig,
     secrets: &dyn SecretProvider,
+    tls: bool,
     path: &str,
     rx: &Receiver<Vec<u8>>,
 ) -> Result<(), String> {
-    let mut stream = connect_session(config, secrets)?;
+    let mut stream = connect_session(config, secrets, tls)?;
     let mut data = stream
         .put_with_stream(path)
         .map_err(|e| format!("cannot create {path}: {e}"))?;
@@ -436,6 +593,7 @@ pub struct FtpBackend {
     inner: Mutex<FtpStream>,
     config: ConnectionConfig,
     secrets: Arc<dyn SecretProvider>,
+    tls: bool,
 }
 
 impl FtpBackend {
@@ -538,9 +696,10 @@ impl FsBackend for FtpBackend {
         let (tx, rx) = mpsc::sync_channel::<ChunkResult>(CHANNEL_DEPTH);
         let config = self.config.clone();
         let secrets = self.secrets.clone();
+        let tls = self.tls;
         let path = path.to_string();
         std::thread::spawn(move || {
-            if let Err(message) = read_pump(&config, secrets.as_ref(), &path, &tx) {
+            if let Err(message) = read_pump(&config, secrets.as_ref(), tls, &path, &tx) {
                 // A send failure means the reader is gone; drop the
                 // error with it.
                 let _ = tx.send(Err(message));
@@ -559,9 +718,10 @@ impl FsBackend for FtpBackend {
         let (done_tx, done_rx) = mpsc::sync_channel::<Result<(), String>>(1);
         let config = self.config.clone();
         let secrets = self.secrets.clone();
+        let tls = self.tls;
         let path = path.to_string();
         let handle = std::thread::spawn(move || {
-            let result = write_pump(&config, secrets.as_ref(), &path, &rx);
+            let result = write_pump(&config, secrets.as_ref(), tls, &path, &rx);
             // An error must also drain no further: returning drops rx,
             // so the writer's next send fails and reads this result.
             let _ = done_tx.send(result);
@@ -698,7 +858,7 @@ mod tests {
         let mut cfg = config(AuthMethod::SshAgent);
         cfg.host = "host.invalid".to_string();
         let start = Instant::now();
-        let err = FtpFactory
+        let err = FtpFactory::default()
             .connect(&cfg, Arc::new(NoSecrets))
             .err()
             .expect("must fail");
@@ -711,7 +871,46 @@ mod tests {
         let mut cfg = config(AuthMethod::Password);
         cfg.host = "host.invalid".to_string();
         let start = Instant::now();
-        let err = FtpFactory
+        let err = FtpFactory::default()
+            .connect(&cfg, Arc::new(NoSecrets))
+            .err()
+            .expect("must fail");
+        assert!(err.contains("no password stored"), "got: {err}");
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn is_implicit_tls_port_selects_990_only() {
+        assert!(is_implicit_tls_port(990));
+        assert!(!is_implicit_tls_port(21));
+        assert!(!is_implicit_tls_port(2121));
+        assert!(!is_implicit_tls_port(0));
+    }
+
+    #[test]
+    fn tls_factory_rejects_wrong_auth_method_before_any_dial() {
+        // Same auth kinds as plain FTP; the check runs before TLS mode
+        // selection or any dial, so an unroutable host still proves no
+        // network access happened.
+        let mut cfg = config(AuthMethod::SshAgent);
+        cfg.scheme = Scheme::Ftps;
+        cfg.host = "host.invalid".to_string();
+        let start = Instant::now();
+        let err = FtpFactory::tls()
+            .connect(&cfg, Arc::new(NoSecrets))
+            .err()
+            .expect("must fail");
+        assert!(err.contains("wrong auth method"), "got: {err}");
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn tls_factory_rejects_missing_password_before_any_dial() {
+        let mut cfg = config(AuthMethod::Password);
+        cfg.scheme = Scheme::Ftps;
+        cfg.host = "host.invalid".to_string();
+        let start = Instant::now();
+        let err = FtpFactory::tls()
             .connect(&cfg, Arc::new(NoSecrets))
             .err()
             .expect("must fail");
@@ -729,12 +928,56 @@ mod tests {
         let mut cfg = config(AuthMethod::None);
         cfg.port = port as u32;
         let start = Instant::now();
-        let err = FtpFactory
+        let err = FtpFactory::default()
             .connect(&cfg, Arc::new(NoSecrets))
             .err()
             .expect("must fail");
         assert!(err.contains("cannot connect"), "got: {err}");
         assert!(start.elapsed() < Duration::from_secs(20));
+    }
+
+    #[test]
+    fn tls_closed_port_fails_cleanly_on_the_explicit_path() {
+        // An ephemeral port is never 990, so this exercises
+        // connect_tls's explicit branch (plain connect, then
+        // into_secure) rather than connect_secure_implicit.
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        assert!(!is_implicit_tls_port(port));
+        let mut cfg = config(AuthMethod::None);
+        cfg.scheme = Scheme::Ftps;
+        cfg.port = port as u32;
+        let start = Instant::now();
+        let err = FtpFactory::tls()
+            .connect(&cfg, Arc::new(NoSecrets))
+            .err()
+            .expect("must fail");
+        assert!(err.contains("cannot connect"), "got: {err}");
+        assert!(start.elapsed() < Duration::from_secs(20));
+    }
+
+    #[test]
+    fn implicit_bounded_connect_fails_cleanly_on_a_closed_port() {
+        // Exercises connect_secure_implicit_bounded directly: a closed
+        // port refuses the dial immediately, well inside the timeout,
+        // and the helper thread's error reaches the caller.
+        let addr = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap()
+        };
+        let start = Instant::now();
+        let err = connect_secure_implicit_bounded(
+            addr,
+            tls_connector(),
+            "localhost",
+            Duration::from_secs(5),
+        )
+        .err()
+        .expect("must fail");
+        assert!(!err.is_empty());
+        assert!(start.elapsed() < Duration::from_secs(5));
     }
 
     #[test]

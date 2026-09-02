@@ -1140,4 +1140,10 @@ private final class TrashDelegate: PlatformDelegate {
         }
         return String(data: data, encoding: .utf8)
     }
+
+    /// Stores a refreshed secret for one connection, for example a
+    /// renewed OAuth token set.
+    func setSecret(connectionId: String, value: String) {
+        KeychainHelper.save(account: connectionId, secret: value)
+    }
 }

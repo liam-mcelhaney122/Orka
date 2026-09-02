@@ -24,6 +24,7 @@ enum StoredScheme: String, Codable, CaseIterable {
     case sftp
     case s3
     case ftp
+    case ftps
     case smb
     case nfs
     case adls
@@ -36,6 +37,7 @@ enum StoredScheme: String, Codable, CaseIterable {
         case .sftp: return "SFTP"
         case .s3: return "S3"
         case .ftp: return "FTP"
+        case .ftps: return "FTPS"
         case .smb: return "SMB"
         case .nfs: return "NFS"
         case .adls: return "ADLS Gen2"
@@ -50,6 +52,7 @@ enum StoredScheme: String, Codable, CaseIterable {
         case .sftp: return 22
         case .s3: return 443
         case .ftp: return 21
+        case .ftps: return 21
         case .smb: return 445
         case .nfs: return 2049
         case .adls, .gdrive, .dropbox: return 443
@@ -68,6 +71,21 @@ enum StoredAuthMethod: Codable, Hashable {
     case s3Keys
     case oauthToken
     case sharedKey
+    /// Azure ADLS Gen2 SAS auth. The secret is the SAS query string,
+    /// with or without a leading '?'.
+    case sasToken
+    /// Azure ADLS Gen2 service-principal auth. The secret is the
+    /// client secret.
+    case servicePrincipal(tenantId: String, clientId: String)
+    /// An OAuth app the user signs in to interactively. `tenantId` is
+    /// empty except for ADLS. The secret is a token-set JSON blob.
+    case oauthApp(clientId: String, tenantId: String)
+    /// Google Drive service-account auth. The secret is the full
+    /// service-account JSON key file content.
+    case serviceAccount
+    /// SMB or NFS auth using the signed-in user's existing ticket. No
+    /// secret.
+    case kerberos
     /// No credentials: anonymous FTP, guest SMB, or a mount (NFS) whose
     /// transport has no auth step at all.
     case none
@@ -82,6 +100,11 @@ enum AuthKind: String, CaseIterable {
     case s3Keys = "Access Keys"
     case oauthToken = "Token"
     case sharedKey = "Account Key"
+    case sasToken = "SAS Token"
+    case servicePrincipal = "Service Principal"
+    case oauthApp = "Sign In"
+    case serviceAccount = "Service Account"
+    case kerberos = "Kerberos"
     case none = "No Auth"
 }
 
@@ -95,6 +118,11 @@ extension StoredAuthMethod {
         case .s3Keys: return .s3Keys
         case .oauthToken: return .oauthToken
         case .sharedKey: return .sharedKey
+        case .sasToken: return .sasToken
+        case .servicePrincipal: return .servicePrincipal
+        case .oauthApp: return .oauthApp
+        case .serviceAccount: return .serviceAccount
+        case .kerberos: return .kerberos
         case .none: return .none
         }
     }
@@ -109,13 +137,35 @@ extension StoredAuthMethod {
         return ""
     }
 
+    /// The tenant id for a Service Principal or Sign In (OAuth app)
+    /// auth method. Empty for every other case.
+    var tenantId: String {
+        switch self {
+        case .servicePrincipal(let tenantId, _): return tenantId
+        case .oauthApp(_, let tenantId): return tenantId
+        default: return ""
+        }
+    }
+
+    /// The client id for a Service Principal or Sign In (OAuth app)
+    /// auth method. Empty for every other case.
+    var clientId: String {
+        switch self {
+        case .servicePrincipal(_, let clientId): return clientId
+        case .oauthApp(let clientId, _): return clientId
+        default: return ""
+        }
+    }
+
     /// True for auth methods that can keep a secret in the keychain.
-    /// An SSH key's secret is an optional passphrase.
+    /// An SSH key's secret is an optional passphrase. Kerberos uses the
+    /// signed-in user's ticket, so it keeps no secret.
     var needsSecret: Bool {
         switch self {
-        case .password, .sshKey, .s3Keys, .oauthToken, .sharedKey:
+        case .password, .sshKey, .s3Keys, .oauthToken, .sharedKey,
+            .sasToken, .servicePrincipal, .oauthApp, .serviceAccount:
             return true
-        case .sshAgent, .s3Profile, .none: return false
+        case .sshAgent, .s3Profile, .kerberos, .none: return false
         }
     }
 }
@@ -148,6 +198,7 @@ extension StoredScheme {
         case .sftp: return .sftp
         case .s3: return .s3
         case .ftp: return .ftp
+        case .ftps: return .ftps
         case .smb: return .smb
         case .nfs: return .nfs
         case .adls: return .adls
@@ -168,6 +219,13 @@ extension StoredAuthMethod {
         case .s3Keys: return .s3Keys
         case .oauthToken: return .oAuthToken
         case .sharedKey: return .sharedKey
+        case .sasToken: return .sasToken
+        case .servicePrincipal(let tenantId, let clientId):
+            return .servicePrincipal(tenantId: tenantId, clientId: clientId)
+        case .oauthApp(let clientId, let tenantId):
+            return .oAuthApp(clientId: clientId, tenantId: tenantId)
+        case .serviceAccount: return .serviceAccount
+        case .kerberos: return .kerberos
         case .none: return .none
         }
     }

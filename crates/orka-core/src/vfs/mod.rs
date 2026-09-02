@@ -14,7 +14,9 @@ pub mod gdrive;
 pub mod http;
 pub mod local;
 pub mod mount;
+pub mod oauth;
 pub mod s3;
+pub mod secret;
 pub mod sftp;
 
 pub use local::LocalBackend;
@@ -30,6 +32,7 @@ pub enum Scheme {
     Sftp,
     S3,
     Ftp,
+    Ftps,
     Smb,
     Nfs,
     Adls,
@@ -44,6 +47,7 @@ impl Scheme {
             Scheme::Sftp => "sftp",
             Scheme::S3 => "s3",
             Scheme::Ftp => "ftp",
+            Scheme::Ftps => "ftps",
             Scheme::Smb => "smb",
             Scheme::Nfs => "nfs",
             Scheme::Adls => "adls",
@@ -58,6 +62,7 @@ impl Scheme {
             "sftp" => Some(Scheme::Sftp),
             "s3" => Some(Scheme::S3),
             "ftp" => Some(Scheme::Ftp),
+            "ftps" => Some(Scheme::Ftps),
             "smb" => Some(Scheme::Smb),
             "nfs" => Some(Scheme::Nfs),
             "adls" => Some(Scheme::Adls),
@@ -302,6 +307,7 @@ mod tests {
     #[test]
     fn new_schemes_are_remote() {
         for uri in [
+            "ftps://host/dir",
             "smb://server/share",
             "nfs://host/export",
             "adls://store/fs/dir",

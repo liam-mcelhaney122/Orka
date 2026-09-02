@@ -65,8 +65,11 @@ impl MountFactory {
         let url = build_smb_url(config, secret.as_deref())?;
         let binary = find_binary("mount_smbfs")
             .ok_or_else(|| "mount_smbfs not found on this system".to_string())?;
+        let kerberos = config.auth == AuthMethod::Kerberos;
         let mut command = Command::new(binary);
-        command.arg(&url).arg(&dir);
+        for arg in smb_argv(&url, &dir, kerberos) {
+            command.arg(arg);
+        }
         let outcome = run_with_timeout(command, MOUNT_TIMEOUT)?;
         finish_mount("mount_smbfs", outcome, dir, secret.as_deref(), false)
     }
@@ -76,11 +79,15 @@ impl MountFactory {
         config: &ConnectionConfig,
         dir: PathBuf,
     ) -> Result<Arc<dyn FsBackend>, String> {
+        validate_nfs_auth(&config.auth)?;
         let target = nfs_target(&config.host)?;
         let binary = find_binary("mount_nfs")
             .ok_or_else(|| "mount_nfs not found on this system".to_string())?;
+        let kerberos = config.auth == AuthMethod::Kerberos;
         let mut command = Command::new(binary);
-        command.arg(target).arg(&dir);
+        for arg in nfs_argv(target, &dir, kerberos) {
+            command.arg(arg);
+        }
         let outcome = run_with_timeout(command, MOUNT_TIMEOUT)?;
         finish_mount("mount_nfs", outcome, dir, None, true)
     }
@@ -259,8 +266,16 @@ impl Drop for MountBackend {
 /// `secret`, even if a stale secret is still stored from an earlier
 /// `Password` config: switching a saved connection to No Auth must not
 /// silently keep authenticating with a leftover credential.
+///
+/// `AuthMethod::Kerberos` puts the username in the URL with no
+/// password, so mount_smbfs authenticates with the caller's existing
+/// ticket instead. The username can carry a `DOMAIN;user` form and
+/// passes through unchanged.
 fn build_smb_url(config: &ConnectionConfig, secret: Option<&str>) -> Result<String, String> {
-    if !matches!(config.auth, AuthMethod::Password | AuthMethod::None) {
+    if !matches!(
+        config.auth,
+        AuthMethod::Password | AuthMethod::Kerberos | AuthMethod::None
+    ) {
         return Err("wrong auth method for smb".to_string());
     }
     let (server, share) = config
@@ -273,14 +288,64 @@ fn build_smb_url(config: &ConnectionConfig, secret: Option<&str>) -> Result<Stri
     if config.auth == AuthMethod::None {
         return Ok(format!("//{server}/{share}"));
     }
+    if config.auth == AuthMethod::Kerberos {
+        if config.username.is_empty() {
+            return Err("username required".to_string());
+        }
+        return Ok(format!("//{}@{server}/{share}", config.username));
+    }
     match secret {
-        Some(password) if !password.is_empty() => Ok(format!(
-            "//{}:{}@{server}/{share}",
-            config.username,
-            url_encode(password)
-        )),
+        Some(password) if !password.is_empty() => {
+            if config.username.is_empty() {
+                return Err("username required".to_string());
+            }
+            Ok(format!(
+                "//{}:{}@{server}/{share}",
+                config.username,
+                url_encode(password)
+            ))
+        }
         // No stored secret means guest access.
         _ => Ok(format!("//{server}/{share}")),
+    }
+}
+
+/// Builds the `mount_smbfs` argv (excluding the binary itself). A
+/// Kerberos URL carries no password, so without `-N` mount_smbfs
+/// would block on an interactive prompt; `-N` makes it fail instead,
+/// surfacing a missing ticket as the mount_smbfs error text.
+fn smb_argv(url: &str, dir: &Path, kerberos: bool) -> Vec<std::ffi::OsString> {
+    let mut argv: Vec<std::ffi::OsString> = Vec::new();
+    if kerberos {
+        argv.push("-N".into());
+    }
+    argv.push(url.into());
+    argv.push(dir.as_os_str().to_os_string());
+    argv
+}
+
+/// Builds the `mount_nfs` argv (excluding the binary itself).
+/// `sec=krb5` tells mount_nfs to authenticate the mount with the
+/// caller's Kerberos ticket instead of the default `sys` scheme.
+fn nfs_argv(target: &str, dir: &Path, kerberos: bool) -> Vec<std::ffi::OsString> {
+    let mut argv: Vec<std::ffi::OsString> = Vec::new();
+    if kerberos {
+        argv.push("-o".into());
+        argv.push("sec=krb5".into());
+    }
+    argv.push(target.into());
+    argv.push(dir.as_os_str().to_os_string());
+    argv
+}
+
+/// Validates the auth method for an NFS mount. `None` (the default,
+/// unauthenticated export) and `Kerberos` (ticket-based `sec=krb5`)
+/// are the only kinds mount_nfs supports here.
+fn validate_nfs_auth(auth: &AuthMethod) -> Result<(), String> {
+    if matches!(auth, AuthMethod::None | AuthMethod::Kerberos) {
+        Ok(())
+    } else {
+        Err("wrong auth method for nfs".to_string())
     }
 }
 
@@ -461,6 +526,46 @@ mod tests {
     }
 
     #[test]
+    fn smb_url_for_kerberos_has_no_password() {
+        let config = smb_config("server/share", AuthMethod::Kerberos);
+        // A stale secret from an earlier Password config must never
+        // reach a Kerberos URL either.
+        assert_eq!(
+            build_smb_url(&config, Some("stale-password")).unwrap(),
+            "//liam@server/share"
+        );
+        assert_eq!(build_smb_url(&config, None).unwrap(), "//liam@server/share");
+    }
+
+    #[test]
+    fn smb_url_for_kerberos_keeps_a_domain_username() {
+        let mut config = smb_config("server/share", AuthMethod::Kerberos);
+        config.username = "DOMAIN;user".into();
+        assert_eq!(
+            build_smb_url(&config, None).unwrap(),
+            "//DOMAIN;user@server/share"
+        );
+    }
+
+    #[test]
+    fn smb_rejects_kerberos_with_no_username() {
+        let mut config = smb_config("server/share", AuthMethod::Kerberos);
+        config.username = String::new();
+        let err = build_smb_url(&config, None).unwrap_err();
+        assert_eq!(err, "username required");
+    }
+
+    #[test]
+    fn smb_rejects_password_with_no_username() {
+        let mut config = smb_config("server/share", AuthMethod::Password);
+        config.username = String::new();
+        let err = build_smb_url(&config, Some("pw")).unwrap_err();
+        assert_eq!(err, "username required");
+        // An empty username with no password is still guest access.
+        assert_eq!(build_smb_url(&config, None).unwrap(), "//server/share");
+    }
+
+    #[test]
     fn smb_rejects_missing_share() {
         for host in ["server", "server/"] {
             let config = smb_config(host, AuthMethod::Password);
@@ -484,6 +589,57 @@ mod tests {
             let err = nfs_target(host).unwrap_err();
             assert_eq!(err, "nfs host must be server:/export");
         }
+    }
+
+    #[test]
+    fn smb_argv_adds_no_prompt_flag_only_for_kerberos() {
+        let dir = Path::new("/tmp/mnt");
+        assert_eq!(
+            smb_argv("//server/share", dir, false),
+            vec![
+                std::ffi::OsString::from("//server/share"),
+                std::ffi::OsString::from("/tmp/mnt"),
+            ]
+        );
+        assert_eq!(
+            smb_argv("//liam@server/share", dir, true),
+            vec![
+                std::ffi::OsString::from("-N"),
+                std::ffi::OsString::from("//liam@server/share"),
+                std::ffi::OsString::from("/tmp/mnt"),
+            ]
+        );
+    }
+
+    #[test]
+    fn nfs_argv_adds_sec_krb5_only_for_kerberos() {
+        let dir = Path::new("/tmp/mnt");
+        assert_eq!(
+            nfs_argv("server:/export", dir, false),
+            vec![
+                std::ffi::OsString::from("server:/export"),
+                std::ffi::OsString::from("/tmp/mnt"),
+            ]
+        );
+        assert_eq!(
+            nfs_argv("server:/export", dir, true),
+            vec![
+                std::ffi::OsString::from("-o"),
+                std::ffi::OsString::from("sec=krb5"),
+                std::ffi::OsString::from("server:/export"),
+                std::ffi::OsString::from("/tmp/mnt"),
+            ]
+        );
+    }
+
+    #[test]
+    fn nfs_auth_accepts_none_and_kerberos_only() {
+        assert!(validate_nfs_auth(&AuthMethod::None).is_ok());
+        assert!(validate_nfs_auth(&AuthMethod::Kerberos).is_ok());
+        let err = validate_nfs_auth(&AuthMethod::Password).unwrap_err();
+        assert_eq!(err, "wrong auth method for nfs");
+        let err = validate_nfs_auth(&AuthMethod::SshAgent).unwrap_err();
+        assert_eq!(err, "wrong auth method for nfs");
     }
 
     #[test]

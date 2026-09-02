@@ -1,19 +1,21 @@
 //! Dropbox backend over the Dropbox REST API.
 //!
 //! Every call is one independent authenticated HTTP request, so the
-//! backend holds only the bearer token and a pooled agent; no session
-//! mutex exists. Transfers run on pump threads that own the HTTP
-//! response or the upload session, and chunks cross bounded channels
-//! with the same reader and writer structure the SFTP backend uses.
+//! backend holds only an [`oauth::TokenSource`] and a pooled agent; no
+//! session mutex exists. Transfers run on pump threads that own the
+//! HTTP response or the upload session, and chunks cross bounded
+//! channels with the same reader and writer structure the SFTP
+//! backend uses.
 
 use super::connections::{AuthMethod, BackendFactory, ConnectionConfig, SecretProvider};
 use super::http;
+use super::oauth;
 use super::{Capabilities, FsBackend, WriteFinish};
 use crate::{Entry, ListOptions};
 use serde_json::{json, Value};
 use std::io::{self, Read, Write};
 use std::sync::mpsc::{self, Receiver, SyncSender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 const LIST_URL: &str = "https://api.dropboxapi.com/2/files/list_folder";
@@ -101,6 +103,19 @@ fn request_error(e: ureq::Error) -> String {
         }
         other => http::error_string(other),
     }
+}
+
+/// Runs one Dropbox call against a token source, retrying once with a
+/// forced refresh when the first attempt fails with HTTP 401. Shares
+/// its retry policy with [`oauth::call_with_auth_retry`], with
+/// [`request_error`] as the error hook so a failure that survives the
+/// retry keeps Dropbox's expired-token hint instead of the generic
+/// message the shared helper uses by default.
+fn call_with_auth_retry<T>(
+    tokens: &oauth::TokenSource,
+    call: impl FnMut(&str) -> Result<T, ureq::Error>,
+) -> Result<T, String> {
+    oauth::call_with_auth_retry_and(tokens, request_error, call)
 }
 
 /// A chunk from a read pump. `Err` carries the pump's failure once,
@@ -264,19 +279,20 @@ impl Drop for ChannelWriter {
 /// Downloads `path` and feeds chunks to `tx`. A send failure means the
 /// reader dropped; the pump stops quietly.
 fn read_pump(
-    token: String,
+    tokens: oauth::TokenSource,
     agent: ureq::Agent,
     path: String,
     tx: &SyncSender<ChunkResult>,
 ) -> Result<(), String> {
     let arg = api_arg(&json!({"path": dropbox_path(&path)}));
-    let response = agent
-        .post(DOWNLOAD_URL)
-        .set("Authorization", &auth_header(&token))
-        .set("Dropbox-API-Arg", &arg)
-        .set("Content-Type", "application/octet-stream")
-        .send_bytes(&[])
-        .map_err(request_error)?;
+    let response = call_with_auth_retry(&tokens, |token| {
+        agent
+            .post(DOWNLOAD_URL)
+            .set("Authorization", &auth_header(token))
+            .set("Dropbox-API-Arg", &arg)
+            .set("Content-Type", "application/octet-stream")
+            .send_bytes(&[])
+    })?;
     let mut reader = http::response_reader(response);
     let mut chunk = vec![0u8; READ_CHUNK_SIZE];
     loop {
@@ -292,13 +308,14 @@ fn read_pump(
     }
 }
 
-fn start_upload_session(token: &str, agent: &ureq::Agent) -> Result<String, String> {
-    let response = agent
-        .post(UPLOAD_START_URL)
-        .set("Authorization", &auth_header(token))
-        .set("Content-Type", "application/octet-stream")
-        .send_bytes(&[])
-        .map_err(request_error)?;
+fn start_upload_session(tokens: &oauth::TokenSource, agent: &ureq::Agent) -> Result<String, String> {
+    let response = call_with_auth_retry(tokens, |token| {
+        agent
+            .post(UPLOAD_START_URL)
+            .set("Authorization", &auth_header(token))
+            .set("Content-Type", "application/octet-stream")
+            .send_bytes(&[])
+    })?;
     let value: Value = response
         .into_json()
         .map_err(|e| format!("upload session start returned bad JSON: {e}"))?;
@@ -310,7 +327,7 @@ fn start_upload_session(token: &str, agent: &ureq::Agent) -> Result<String, Stri
 }
 
 fn finish_upload_session(
-    token: &str,
+    tokens: &oauth::TokenSource,
     agent: &ureq::Agent,
     path: &str,
     session_id: &str,
@@ -325,13 +342,14 @@ fn finish_upload_session(
         },
         "cursor": {"session_id": session_id, "offset": offset},
     }));
-    let response = agent
-        .post(UPLOAD_FINISH_URL)
-        .set("Authorization", &auth_header(token))
-        .set("Dropbox-API-Arg", &arg)
-        .set("Content-Type", "application/octet-stream")
-        .send_bytes(&[])
-        .map_err(request_error)?;
+    let response = call_with_auth_retry(tokens, |token| {
+        agent
+            .post(UPLOAD_FINISH_URL)
+            .set("Authorization", &auth_header(token))
+            .set("Dropbox-API-Arg", &arg)
+            .set("Content-Type", "application/octet-stream")
+            .send_bytes(&[])
+    })?;
     // Drain the small ack so the connection returns to the pool.
     drop(http::read_body_string(response));
     Ok(())
@@ -364,31 +382,31 @@ fn pump_uploads(rx: Receiver<Vec<u8>>, append: &mut AppendChunk<'_>) -> Result<u
 /// the file at `path`. Returns after the writer closes the channel
 /// and the session commits.
 fn write_pump(
-    token: String,
+    tokens: oauth::TokenSource,
     agent: ureq::Agent,
     path: String,
     rx: Receiver<Vec<u8>>,
 ) -> Result<(), String> {
-    let session_id = start_upload_session(&token, &agent)?;
-    let auth = auth_header(&token);
+    let session_id = start_upload_session(&tokens, &agent)?;
     let sid = session_id.clone();
     let mut append = |offset: u64, chunk: &[u8], close: bool| -> Result<(), String> {
         let arg = api_arg(&json!({
             "cursor": {"session_id": sid, "offset": offset},
             "close": close,
         }));
-        let response = agent
-            .post(UPLOAD_APPEND_URL)
-            .set("Authorization", &auth)
-            .set("Dropbox-API-Arg", &arg)
-            .set("Content-Type", "application/octet-stream")
-            .send_bytes(chunk)
-            .map_err(request_error)?;
+        let response = call_with_auth_retry(&tokens, |token| {
+            agent
+                .post(UPLOAD_APPEND_URL)
+                .set("Authorization", &auth_header(token))
+                .set("Dropbox-API-Arg", &arg)
+                .set("Content-Type", "application/octet-stream")
+                .send_bytes(chunk)
+        })?;
         drop(http::read_body_string(response));
         Ok(())
     };
     let offset = pump_uploads(rx, &mut append)?;
-    finish_upload_session(&token, &agent, &path, &session_id, offset)?;
+    finish_upload_session(&tokens, &agent, &path, &session_id, offset)?;
     Ok(())
 }
 
@@ -448,10 +466,10 @@ fn root_entry() -> Entry {
     }
 }
 
-/// One live Dropbox connection. Holds the bearer token fetched once at
-/// connect; REST calls share no state, so no lock is needed.
+/// One live Dropbox connection. Holds the token source resolved at
+/// connect; REST calls share no other state, so no lock is needed.
 struct DropboxBackend {
-    token: String,
+    tokens: oauth::TokenSource,
     agent: ureq::Agent,
 }
 
@@ -459,12 +477,12 @@ impl DropboxBackend {
     /// POSTs a JSON body and parses the JSON response. All metadata
     /// and RPC endpoints share this shape.
     fn post_json(&self, url: &str, body: Value) -> Result<Value, String> {
-        let response = self
-            .agent
-            .post(url)
-            .set("Authorization", &auth_header(&self.token))
-            .send_json(body)
-            .map_err(request_error)?;
+        let response = call_with_auth_retry(&self.tokens, |token| {
+            self.agent
+                .post(url)
+                .set("Authorization", &auth_header(token))
+                .send_json(body.clone())
+        })?;
         response
             .into_json()
             .map_err(|e| format!("response was not valid JSON: {e}"))
@@ -480,16 +498,34 @@ impl BackendFactory for DropboxFactory {
         config: &ConnectionConfig,
         secrets: Arc<dyn SecretProvider>,
     ) -> Result<Arc<dyn FsBackend>, String> {
-        // Auth is checked before any network work so a bad config fails
-        // immediately.
-        if config.auth != AuthMethod::OAuthToken {
-            return Err("wrong auth method for dropbox".to_string());
-        }
-        let token = secrets
-            .get_secret(&config.id)
-            .ok_or_else(|| "no access token stored for this connection".to_string())?;
+        // Auth is resolved and validated before any network work so a
+        // bad config or a missing secret fails immediately.
+        let tokens = match &config.auth {
+            AuthMethod::OAuthToken => {
+                let token = secrets
+                    .get_secret(&config.id)
+                    .ok_or_else(|| "no access token stored for this connection".to_string())?;
+                oauth::TokenSource::Fixed(token)
+            }
+            AuthMethod::OAuthApp { client_id, .. } => {
+                let raw = secrets
+                    .get_secret(&config.id)
+                    .ok_or_else(|| "no token stored for this connection".to_string())?;
+                // Fail on a malformed secret now rather than on the
+                // first request.
+                oauth::TokenSet::from_json(&raw)?;
+                oauth::TokenSource::OAuthApp {
+                    provider: oauth::Provider::Dropbox,
+                    client_id: client_id.clone(),
+                    connection_id: config.id.clone(),
+                    secrets,
+                    cache: Arc::new(Mutex::new(None)),
+                }
+            }
+            _ => return Err("wrong auth method for dropbox".to_string()),
+        };
         Ok(Arc::new(DropboxBackend {
-            token,
+            tokens,
             agent: http::agent(),
         }))
     }
@@ -563,10 +599,10 @@ impl FsBackend for DropboxBackend {
     fn open_read(&self, path: &str) -> Result<Box<dyn Read + Send>, String> {
         let path = normalize_path(path)?;
         let (tx, rx) = mpsc::sync_channel::<ChunkResult>(CHANNEL_DEPTH);
-        let token = self.token.clone();
+        let tokens = self.tokens.clone();
         let agent = self.agent.clone();
         std::thread::spawn(move || {
-            if let Err(message) = read_pump(token, agent, path, &tx) {
+            if let Err(message) = read_pump(tokens, agent, path, &tx) {
                 // A send failure means the reader is gone; drop the
                 // error with it.
                 let _ = tx.send(Err(message));
@@ -587,10 +623,10 @@ impl FsBackend for DropboxBackend {
         }
         let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(CHANNEL_DEPTH);
         let (done_tx, done_rx) = mpsc::sync_channel::<Result<(), String>>(1);
-        let token = self.token.clone();
+        let tokens = self.tokens.clone();
         let agent = self.agent.clone();
         let handle = std::thread::spawn(move || {
-            let result = write_pump(token, agent, path, rx);
+            let result = write_pump(tokens, agent, path, rx);
             // Returning drops rx, so a failed pump rejects later sends.
             let _ = done_tx.send(result);
         });
@@ -840,6 +876,60 @@ mod tests {
         assert!(capabilities.can_rename);
         assert!(!capabilities.server_side_copy);
         assert!(!capabilities.preserves_permissions);
+    }
+
+    fn oauth_app_auth() -> AuthMethod {
+        AuthMethod::OAuthApp {
+            client_id: "client".to_string(),
+            tenant_id: String::new(),
+        }
+    }
+
+    #[test]
+    fn oauth_app_without_a_stored_secret_fails_before_any_network_call() {
+        let err = DropboxFactory
+            .connect(&config(oauth_app_auth()), Arc::new(NoSecrets))
+            .err()
+            .expect("must fail");
+        assert!(err.contains("no token stored"), "got: {err}");
+    }
+
+    #[test]
+    fn oauth_app_with_a_malformed_secret_fails_before_any_network_call() {
+        struct BadSecret;
+        impl SecretProvider for BadSecret {
+            fn get_secret(&self, _connection_id: &str) -> Option<String> {
+                Some("not a token set".to_string())
+            }
+        }
+        let err = DropboxFactory
+            .connect(&config(oauth_app_auth()), Arc::new(BadSecret))
+            .err()
+            .expect("must fail");
+        assert!(err.contains("cannot decode token set"), "got: {err}");
+    }
+
+    #[test]
+    fn oauth_app_with_a_valid_secret_connects() {
+        let set = oauth::TokenSet {
+            access_token: "a".to_string(),
+            refresh_token: Some("r".to_string()),
+            expires_at_ms: u64::MAX,
+            client_secret: None,
+        };
+        struct GoodSecret(String);
+        impl SecretProvider for GoodSecret {
+            fn get_secret(&self, _connection_id: &str) -> Option<String> {
+                Some(self.0.clone())
+            }
+        }
+        let backend = DropboxFactory
+            .connect(
+                &config(oauth_app_auth()),
+                Arc::new(GoodSecret(set.to_json().unwrap())),
+            )
+            .expect("must connect");
+        assert!(!backend.capabilities().is_local);
     }
 
     #[test]

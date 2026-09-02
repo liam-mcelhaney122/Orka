@@ -34,10 +34,14 @@ Drag files onto a tab to switch to it and send the files to that folder. You can
 
 Browse local files and remote storage through the same navigation model. Orka connects to:
 
-- SFTP servers
-- Dropbox
-- Google Drive
-- Azure Data Lake
+- SFTP and RSync over SSH (password, SSH key with optional certificate, or SSH agent)
+- S3 and S3-compatible storage (AWS profile with SSO, assumed role, or credential process; access keys with optional session token; anonymous)
+- FTP and FTPS (password or anonymous)
+- SMB (password, Kerberos, or guest)
+- NFS (no sign-in or Kerberos)
+- Azure Data Lake Storage Gen2 (account key, SAS token, service principal, or in-app sign-in)
+- Google Drive (in-app sign-in or service account)
+- Dropbox (in-app sign-in)
 
 Save connections beside your favorite folders and mounted volumes. Press Space to use Quick Look with local or remote files.
 
@@ -66,7 +70,7 @@ Finder remains the standard macOS file browser. Orka is for workflows that need 
 | --- | --- |
 | Work across many folders | Colored tabs, session restore, tab-to-window movement, and multiple independent windows |
 | Move files between open locations | Drop files onto tabs or sidebar folders |
-| Browse remote storage | SFTP, Dropbox, Google Drive, and Azure Data Lake beside local files |
+| Browse remote storage | SFTP, S3, FTP, FTPS, SMB, NFS, Azure Data Lake, Google Drive, and Dropbox beside local files |
 | Work in repositories | File-level Git status and a built-in commit graph |
 | Inspect large folder trees | Recursive search, extension filters, and calculated folder sizes |
 | Manage long file operations | Background progress, cancellation, archive tools, and undo or redo |
