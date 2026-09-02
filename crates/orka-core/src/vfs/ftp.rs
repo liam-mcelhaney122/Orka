@@ -24,27 +24,32 @@
 //! servers, so [`FtpBackend::stat`] lists the parent directory and
 //! matches the entry by name. This mirrors how graphical FTP clients
 //! resolve single-path metadata.
+//!
+//! TLS verification trusts only the Mozilla root set baked in by
+//! `webpki-roots`. A private or self-signed certificate authority is
+//! not supported yet.
 
 use super::connections::{AuthMethod, BackendFactory, ConnectionConfig, SecretProvider};
 use super::{Capabilities, FsBackend, WriteFinish};
 use crate::{Entry, ListOptions};
 use std::io::{self, Read, Write};
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, UNIX_EPOCH};
 use suppaftp::list::File as FtpFile;
 use suppaftp::rustls::{ClientConfig, RootCertStore};
 use suppaftp::{RustlsConnector, RustlsFtpStream, Status};
 
-/// The control (and, once secured, data) connection type. It is the
-/// same type whether or not the session ends up secured: `suppaftp`
-/// only tells the two apart at the byte-stream level (`DataStream`'s
-/// `Tcp`/`Ssl` variants), not at the Rust type level, so a plain FTP
-/// session and a negotiated FTPS session share this alias and every
-/// operation below (list, read, write, rename, delete, mkdir,
-/// transfer pumps) works unchanged on both.
+/// The control (and, once secured, data) connection type.
+///
+/// This is the same type whether or not the session ends up secured.
+/// `suppaftp` tells the two apart only at the byte-stream level
+/// (`DataStream`'s `Tcp`/`Ssl` variants), not at the Rust type level.
+/// A plain FTP session and a negotiated FTPS session therefore share
+/// this alias. Every operation below (list, read, write, rename,
+/// delete, mkdir, transfer pumps) works unchanged on both.
 type FtpStream = RustlsFtpStream;
 
 /// The conventional implicit-TLS FTPS port. A connect to any other
@@ -169,23 +174,69 @@ fn tls_connector() -> RustlsConnector {
 /// Dials `addr` over FTPS. `host` is the TLS server name and must be
 /// the name from the connection config, not a resolved IP: it is used
 /// for both SNI and certificate verification.
+///
+/// Both modes dial (and, for explicit mode, apply the session
+/// timeouts) before any TLS byte crosses the wire, so a stalled dial
+/// or a stalled handshake cannot hang past [`CONNECT_TIMEOUT`].
 fn connect_tls(host: &str, addr: SocketAddr, port: u16) -> Result<FtpStream, String> {
     let connector = tls_connector();
     if is_implicit_tls_port(port) {
-        let mut stream = FtpStream::connect_secure_implicit(addr, connector, host)
+        let mut stream = connect_secure_implicit_bounded(addr, connector, host, CONNECT_TIMEOUT)
             .map_err(|e| format!("cannot connect to {host}:{port}: {e}"))?;
+        // Best effort: an unsupported timeout on the underlying socket
+        // must not fail the connect.
+        let _ = stream.get_ref().set_read_timeout(Some(SESSION_TIMEOUT));
+        let _ = stream.get_ref().set_write_timeout(Some(SESSION_TIMEOUT));
         // Implicit mode skips the `AUTH TLS` exchange that normally
         // negotiates PBSZ/PROT, so the data channel is protected by
         // hand here.
         secure_data_channel(&mut stream)?;
         Ok(stream)
     } else {
-        let plain = FtpStream::connect_timeout(addr, CONNECT_TIMEOUT)
+        let socket = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
+            .map_err(|e| format!("cannot connect to {host}:{port}: {e}"))?;
+        // Best effort: an unsupported timeout on the underlying socket
+        // must not fail the connect. Setting it now, before the
+        // control-channel greeting and the TLS handshake, bounds both.
+        let _ = socket.set_read_timeout(Some(SESSION_TIMEOUT));
+        let _ = socket.set_write_timeout(Some(SESSION_TIMEOUT));
+        let plain = FtpStream::connect_with_stream(socket)
             .map_err(|e| format!("cannot connect to {host}:{port}: {e}"))?;
         // `into_secure` negotiates PBSZ 0 and PROT P itself.
         plain
             .into_secure(connector, host)
             .map_err(|e| format!("cannot negotiate TLS with {host}:{port}: {e}"))
+    }
+}
+
+/// Dials `addr` and negotiates implicit FTPS, bounded to `timeout`.
+///
+/// `suppaftp` (6.3.0) has no stream-based constructor for implicit
+/// mode: [`FtpStream::connect_secure_implicit`] always dials its own
+/// `TcpStream::connect` internally, with no timeout and no stream
+/// handed in, so this cannot set a timeout on the socket up front the
+/// way [`connect_tls`] does for explicit mode. Instead this runs the
+/// whole dial and handshake on a helper thread and stops waiting for
+/// it once `timeout` elapses. A helper thread that misses the
+/// deadline is abandoned; std has no way to cancel a blocking socket
+/// call from outside it, so the thread finishes (or fails) on its own
+/// once the connect or handshake resolves.
+fn connect_secure_implicit_bounded(
+    addr: SocketAddr,
+    connector: RustlsConnector,
+    host: &str,
+    timeout: Duration,
+) -> Result<FtpStream, String> {
+    let host = host.to_string();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let result =
+            FtpStream::connect_secure_implicit(addr, connector, &host).map_err(|e| e.to_string());
+        let _ = tx.send(result);
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(_) => Err(format!("timed out after {}s", timeout.as_secs())),
     }
 }
 
@@ -905,6 +956,28 @@ mod tests {
             .expect("must fail");
         assert!(err.contains("cannot connect"), "got: {err}");
         assert!(start.elapsed() < Duration::from_secs(20));
+    }
+
+    #[test]
+    fn implicit_bounded_connect_fails_cleanly_on_a_closed_port() {
+        // Exercises connect_secure_implicit_bounded directly: a closed
+        // port refuses the dial immediately, well inside the timeout,
+        // and the helper thread's error reaches the caller.
+        let addr = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap()
+        };
+        let start = Instant::now();
+        let err = connect_secure_implicit_bounded(
+            addr,
+            tls_connector(),
+            "localhost",
+            Duration::from_secs(5),
+        )
+        .err()
+        .expect("must fail");
+        assert!(!err.is_empty());
+        assert!(start.elapsed() < Duration::from_secs(5));
     }
 
     #[test]
