@@ -88,11 +88,13 @@ bench-up:
         mkdir -p "$RUN/shares/secure" "$RUN/shares/guest" "$RUN/private" "$RUN/pid"
         # Samba maps every login to a Unix account, so the bench user
         # is the current account. bench_mounts.rs reads the same name.
+        # `-L` must come first: without it a non-root smbpasswd talks
+        # to a server instead of editing the local password database.
         BENCH_USER="${ORKA_BENCH_SMB_USER:-$(id -un)}"
         sed -e "s#@BENCH_RUN@#$RUN#g" -e "s#@BENCH_USER@#$BENCH_USER#g" bench/smb.conf > "$RUN/smb.conf"
         if [ ! -f "$RUN/passdb.tdb" ]; then
             printf 'orka-bench\norka-bench\n' \
-                | "$SMBPASSWD" -c "$RUN/smb.conf" -s -a "$BENCH_USER" \
+                | "$SMBPASSWD" -L -c "$RUN/smb.conf" -s -a "$BENCH_USER" \
                 || echo "smbpasswd: failed (see output above); the SMB bench will skip"
         fi
         if [ ! -f bench/run/smbd.pid ] || ! kill -0 "$(cat bench/run/smbd.pid)" 2>/dev/null; then
