@@ -73,22 +73,39 @@ bench-up:
 
     # smbd (Homebrew samba; Apple's own /usr/sbin/smbd cannot read
     # this config and is not usable here).
-    SMBD="/opt/homebrew/sbin/smbd"
-    if [ ! -x "$SMBD" ]; then SMBD="/usr/local/sbin/smbd"; fi
-    if [ -x "$SMBD" ]; then
+    # Homebrew renames the daemon to samba-dot-org-smbd so it does not
+    # shadow Apple's /usr/sbin/smbd.
+    SMBD=""
+    for candidate in /opt/homebrew/sbin/samba-dot-org-smbd /usr/local/sbin/samba-dot-org-smbd \
+            /opt/homebrew/sbin/smbd /usr/local/sbin/smbd; do
+        if [ -x "$candidate" ]; then SMBD="$candidate"; break; fi
+    done
+    if [ -n "$SMBD" ]; then
+        SMBPASSWD="$(dirname "$SMBD")/samba-dot-org-smbpasswd"
+        if [ ! -x "$SMBPASSWD" ]; then SMBPASSWD="$(dirname "$SMBD")/smbpasswd"; fi
+        if [ ! -x "$SMBPASSWD" ]; then SMBPASSWD="$(dirname "$(dirname "$SMBD")")/bin/smbpasswd"; fi
         RUN="$(pwd)/bench/run/samba"
         mkdir -p "$RUN/shares/secure" "$RUN/shares/guest" "$RUN/private" "$RUN/pid"
         sed "s#@BENCH_RUN@#$RUN#g" bench/smb.conf > "$RUN/smb.conf"
         if [ ! -f "$RUN/passdb.tdb" ]; then
             printf 'orka-bench\norka-bench\n' \
-                | "$(dirname "$SMBD")/smbpasswd" -c "$RUN/smb.conf" -s -a orka
+                | "$SMBPASSWD" -c "$RUN/smb.conf" -s -a orka \
+                || echo "smbpasswd: failed (see output above); the SMB bench will skip"
         fi
         if [ ! -f bench/run/smbd.pid ] || ! kill -0 "$(cat bench/run/smbd.pid)" 2>/dev/null; then
-            "$SMBD" -s "$RUN/smb.conf" -D
-            sleep 1
-            cp "$RUN/pid/smbd.pid" bench/run/smbd.pid
+            # An optional daemon that fails to start must not stop the
+            # recipe; the SMB tests skip when the port is closed.
+            if "$SMBD" -s "$RUN/smb.conf" -D > "$RUN/smbd.out" 2>&1; then
+                sleep 1
+                cp "$RUN/pid/smbd.pid" bench/run/smbd.pid 2>/dev/null || true
+                echo "smbd: listening on 127.0.0.1:4450 (config $RUN/smb.conf)"
+            else
+                echo "smbd: failed to start; the SMB bench will skip"
+                cat "$RUN/smbd.out"
+            fi
+        else
+            echo "smbd: already running on 127.0.0.1:4450"
         fi
-        echo "smbd: listening on 127.0.0.1:4450 (config $RUN/smb.conf)"
     else
         echo "smbd: skipped, Homebrew samba is not installed (brew install samba)"
     fi
@@ -113,13 +130,21 @@ bench-up:
         mkdir -p "$RUN/anon"
         sed -e "s#@BENCH_RUN@#$RUN#g" -e "s#@BENCH_TLS@#$(pwd)/bench/tls#g" \
             bench/vsftpd.conf > "$RUN/vsftpd.conf"
+        # vsftpd refuses a config file that is not owned by root.
+        sudo chown root "$RUN/vsftpd.conf"
         if [ ! -f bench/run/vsftpd.pid ] || ! sudo kill -0 "$(cat bench/run/vsftpd.pid)" 2>/dev/null; then
-            sudo "$VSFTPD" "$RUN/vsftpd.conf"
-            sleep 1
-            sudo cp "$RUN/vsftpd.pid" bench/run/vsftpd.pid
-            sudo chmod 644 bench/run/vsftpd.pid
+            if sudo "$VSFTPD" "$RUN/vsftpd.conf" > "$RUN/vsftpd.out" 2>&1; then
+                sleep 1
+                sudo cp "$RUN/vsftpd.pid" bench/run/vsftpd.pid 2>/dev/null || true
+                sudo chmod 644 bench/run/vsftpd.pid 2>/dev/null || true
+                echo "vsftpd: listening on 127.0.0.1:990 (implicit TLS, started with sudo)"
+            else
+                echo "vsftpd: failed to start; the FTPS bench will skip"
+                cat "$RUN/vsftpd.out"
+            fi
+        else
+            echo "vsftpd: already running on 127.0.0.1:990"
         fi
-        echo "vsftpd: listening on 127.0.0.1:990 (implicit TLS, started with sudo)"
     elif [ -x "$VSFTPD" ]; then
         echo "vsftpd: skipped, passwordless sudo is not available in this shell"
     else
