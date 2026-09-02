@@ -1084,6 +1084,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "ureq",
+ "url",
  "webpki-roots 1.0.9",
  "zip",
 ]

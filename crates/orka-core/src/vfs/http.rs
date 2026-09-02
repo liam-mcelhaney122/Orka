@@ -32,15 +32,53 @@ pub fn is_ok(status: u16) -> bool {
 /// Flattens a ureq error into one message. A status error keeps the
 /// server's body, which REST APIs use for their failure reason. The
 /// response body is dropped here; backends read it themselves when
-/// they need it.
+/// they need it. A transport error (DNS, connect, timeout) keeps
+/// ureq's own message, minus its URL's query string.
 pub fn error_string(e: ureq::Error) -> String {
     match e {
         ureq::Error::Status(code, response) => {
             let body = read_body_string(response);
             format!("HTTP {code}: {body}")
         }
-        other => other.to_string(),
+        ureq::Error::Transport(transport) => transport_error_string(&transport),
     }
+}
+
+/// Formats a transport error the same way ureq's own `Display` does,
+/// except with the URL's query string dropped. ureq attaches the full
+/// request URL, query string included, to a transport error; a SAS
+/// signature or another secret carried in the query string must never
+/// reach an error message. Scheme, host, and path stay, so the
+/// message is still useful for diagnosing which request failed.
+fn transport_error_string(transport: &ureq::Transport) -> String {
+    let mut out = String::new();
+    if let Some(url) = transport.url() {
+        out.push_str(&scrub_url_query(url));
+        out.push_str(": ");
+    }
+    out.push_str(&transport.kind().to_string());
+    if let Some(message) = transport.message() {
+        out.push_str(": ");
+        out.push_str(message);
+    }
+    if let Some(source) = std::error::Error::source(transport) {
+        out.push_str(": ");
+        out.push_str(&source.to_string());
+    }
+    out
+}
+
+/// Renders a URL without its query string or fragment: scheme, host,
+/// port (when not the scheme's default), and path only.
+fn scrub_url_query(url: &url::Url) -> String {
+    let mut out = format!("{}://", url.scheme());
+    out.push_str(url.host_str().unwrap_or(""));
+    if let Some(port) = url.port() {
+        out.push(':');
+        out.push_str(&port.to_string());
+    }
+    out.push_str(url.path());
+    out
 }
 
 /// Reads a whole body into a string, bounded so an error report can
@@ -178,6 +216,31 @@ mod tests {
             Err(e) => error_string(e),
         };
         assert!(message.contains("Connection refused"), "got: {message}");
+    }
+
+    #[test]
+    fn error_string_strips_the_query_string_from_a_transport_error_url() {
+        // A closed local port gives a transport error whose URL still
+        // carries the query string ureq attached before dialing. A SAS
+        // signature there must never reach the returned message.
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let url = format!("http://127.0.0.1:{port}/fs/file?sv=2023-11-03&sig=super-secret-value");
+        let result = agent().get(&url).call();
+        let message = match result {
+            Ok(_) => panic!("must fail"),
+            Err(e) => error_string(e),
+        };
+        assert!(!message.contains("sig="), "got: {message}");
+        assert!(!message.contains("super-secret-value"), "got: {message}");
+        assert!(!message.contains("sv="), "got: {message}");
+        // Scheme, host, and path stay, so the message is still useful.
+        assert!(
+            message.contains(&format!("http://127.0.0.1:{port}/fs/file")),
+            "got: {message}"
+        );
     }
 
     #[test]

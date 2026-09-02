@@ -20,6 +20,10 @@ suppaftp = { version = "6", default-features = false, features = ["rustls", "dep
 webpki-roots = "1"
 # REST file-server backends (Dropbox, Google Drive, ADLS) and their JSON.
 ureq = { version = "2", features = ["json", "tls"] }
+# Only for reading the URL a ureq transport error carries, so the
+# error message can drop its query string (a SAS token can live
+# there) instead of the crate's own URL parsing.
+url = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # ADLS Gen2 shared-key signing.
