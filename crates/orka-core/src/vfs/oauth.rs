@@ -4,7 +4,9 @@
 //! resulting [`TokenSet`]. The caller stores its JSON as the
 //! connection's keychain secret. [`ensure_fresh_token`] loads that
 //! secret, refreshes it when it is close to expiry, and returns a
-//! valid access token; a refresh writes the updated [`TokenSet`] back
+//! valid access token; [`refresh_stored_token`] forces that renewal
+//! even when the token does not look close to expiry, for a retry
+//! after an HTTP 401. A refresh writes the updated [`TokenSet`] back
 //! through [`SecretProvider::set_secret`].
 //!
 //! [`TokenSource`] and [`call_with_auth_retry`] give the REST backends
@@ -170,9 +172,20 @@ impl TokenSource {
 
     /// A token for a retry after an HTTP 401. A fixed token has
     /// nothing to refresh and is returned unchanged, so the retry
-    /// reproduces the same failure instead of looping.
+    /// reproduces the same failure instead of looping. An OAuth app
+    /// forces a fresh token even when the stored one does not look
+    /// close to expiry: the server just rejected it, so the client's
+    /// own expiry guess is not trustworthy anymore.
     pub fn refresh(&self) -> Result<String, String> {
-        self.token()
+        match self {
+            TokenSource::Fixed(token) => Ok(token.clone()),
+            TokenSource::OAuthApp {
+                provider,
+                client_id,
+                connection_id,
+                secrets,
+            } => refresh_stored_token(provider.clone(), client_id, connection_id, secrets.as_ref()),
+        }
     }
 }
 
@@ -494,27 +507,40 @@ pub fn sign_in(
     )
 }
 
-/// Returns a valid access token for `connection_id`, refreshing it
-/// first when it is within 60 seconds of `expires_at_ms`. A refresh
-/// stores the new [`TokenSet`] back through
+/// True when a stored token must be refreshed before use. `force`
+/// always requires a refresh, regardless of `expires_at_ms`: the
+/// caller just saw an HTTP 401 for this exact token, so the client's
+/// own expiry guess is not trustworthy anymore and must not gate the
+/// refresh. Otherwise the normal expiry skew applies. Pure so the
+/// decision is testable without a network call.
+fn should_refresh(force: bool, expires_at_ms: u64, now_ms: u64) -> bool {
+    force || needs_refresh(expires_at_ms, now_ms)
+}
+
+/// Returns a valid access token for `connection_id`. `force` skips
+/// the expiry check and always renews the token when a refresh token
+/// is on file, so a caller retrying after an HTTP 401 does not resend
+/// the same rejected token unchanged. [`ensure_fresh_token`] calls
+/// this with `force: false`; [`refresh_stored_token`] calls this with
+/// `force: true`. A refresh stores the new [`TokenSet`] back through
 /// [`SecretProvider::set_secret`] before returning.
-pub fn ensure_fresh_token(
+fn ensure_fresh_token_with(
     provider: Provider,
     client_id: &str,
     connection_id: &str,
     secrets: &dyn SecretProvider,
+    force: bool,
 ) -> Result<String, String> {
     let raw = secrets
         .get_secret(connection_id)
         .ok_or_else(|| "no token stored for this connection".to_string())?;
     let token_set = TokenSet::from_json(&raw)?;
-    if !token_set.needs_refresh(now_ms()) {
+    if !should_refresh(force, token_set.expires_at_ms, now_ms()) {
         return Ok(token_set.access_token);
     }
-    let refresh_token = token_set
-        .refresh_token
-        .as_deref()
-        .ok_or_else(|| "stored token has no refresh token to renew it with".to_string())?;
+    let refresh_token = token_set.refresh_token.as_deref().ok_or_else(|| {
+        "stored token has no refresh token; sign in again to renew this connection".to_string()
+    })?;
 
     let mut form: Vec<(&str, &str)> = vec![
         ("grant_type", "refresh_token"),
@@ -539,6 +565,30 @@ pub fn ensure_fresh_token(
 
     secrets.set_secret(connection_id, &refreshed.to_json()?);
     Ok(refreshed.access_token)
+}
+
+/// Returns a valid access token for `connection_id`, refreshing it
+/// first when it is within 60 seconds of `expires_at_ms`.
+pub fn ensure_fresh_token(
+    provider: Provider,
+    client_id: &str,
+    connection_id: &str,
+    secrets: &dyn SecretProvider,
+) -> Result<String, String> {
+    ensure_fresh_token_with(provider, client_id, connection_id, secrets, false)
+}
+
+/// Forces a refresh of the stored token for `connection_id`, even when
+/// it does not look close to expiry. Use this after an HTTP 401: the
+/// server just rejected the current access token, so it must be
+/// replaced rather than resent on a retry.
+pub fn refresh_stored_token(
+    provider: Provider,
+    client_id: &str,
+    connection_id: &str,
+    secrets: &dyn SecretProvider,
+) -> Result<String, String> {
+    ensure_fresh_token_with(provider, client_id, connection_id, secrets, true)
 }
 
 #[cfg(test)]
@@ -590,6 +640,20 @@ mod tests {
     #[test]
     fn expiry_flags_an_already_expired_token() {
         assert!(needs_refresh(500, 1_000));
+    }
+
+    #[test]
+    fn should_refresh_forces_regardless_of_expiry() {
+        assert!(should_refresh(true, u64::MAX, 0));
+        assert!(should_refresh(true, 0, 0));
+    }
+
+    #[test]
+    fn should_refresh_defers_to_expiry_when_not_forced() {
+        let now = 1_000_000_u64;
+        assert!(!should_refresh(false, now + REFRESH_SKEW_MS + 1, now));
+        assert!(should_refresh(false, now + REFRESH_SKEW_MS, now));
+        assert!(should_refresh(false, now - 1, now));
     }
 
     #[test]
@@ -844,6 +908,24 @@ mod tests {
     }
 
     #[test]
+    fn refresh_stored_token_fails_without_a_refresh_token_even_when_not_expired() {
+        // A token that looks fresh must still be rejected under a
+        // forced refresh: force exists precisely so a token the
+        // server just rejected with a 401 is never resent unchanged.
+        let far_future = now_ms() + 3_600_000;
+        let set = TokenSet {
+            access_token: "still-good".to_string(),
+            refresh_token: None,
+            expires_at_ms: far_future,
+            client_secret: None,
+        };
+        let secrets = RecordingSecrets::seeded("conn", &set.to_json().unwrap());
+        let err = refresh_stored_token(Provider::Google, "client", "conn", &secrets).unwrap_err();
+        assert!(err.contains("no refresh token"), "got: {err}");
+        assert!(err.contains("sign in again"), "got: {err}");
+    }
+
+    #[test]
     fn token_source_fixed_returns_the_pasted_token_unchanged() {
         let source = TokenSource::Fixed("pasted-token".to_string());
         assert_eq!(source.token().unwrap(), "pasted-token");
@@ -868,6 +950,34 @@ mod tests {
             secrets,
         };
         assert_eq!(source.token().unwrap(), "app-token");
+    }
+
+    #[test]
+    fn token_source_oauth_app_refresh_forces_even_when_not_expired() {
+        let far_future = now_ms() + 3_600_000;
+        let set = TokenSet {
+            access_token: "app-token".to_string(),
+            refresh_token: None,
+            expires_at_ms: far_future,
+            client_secret: None,
+        };
+        let secrets: Arc<dyn SecretProvider> =
+            Arc::new(RecordingSecrets::seeded("conn", &set.to_json().unwrap()));
+        let source = TokenSource::OAuthApp {
+            provider: Provider::Dropbox,
+            client_id: "client".to_string(),
+            connection_id: "conn".to_string(),
+            secrets,
+        };
+        // token() returns the cached value; it looks fresh and needs
+        // no refresh token to do so.
+        assert_eq!(source.token().unwrap(), "app-token");
+        // refresh() forces a renewal even though the token looks
+        // fresh, and fails clearly because there is no refresh token
+        // to renew it with. Before this fix, refresh() just called
+        // token() and would have returned "app-token" unchanged.
+        let err = source.refresh().unwrap_err();
+        assert!(err.contains("no refresh token"), "got: {err}");
     }
 
     #[test]

@@ -381,8 +381,9 @@ impl AdlsCore {
     }
 
     /// Resolves the bearer token for a signed-in OAuth-app credential.
-    /// `force` bypasses the cache and re-resolves through
-    /// [`oauth::ensure_fresh_token`]; a normal request only does that
+    /// `force` bypasses the cache and forces a renewal through
+    /// [`oauth::refresh_stored_token`], for a retry after an HTTP 401;
+    /// a normal request only reaches [`oauth::ensure_fresh_token`]
     /// when nothing is cached yet or the cache has aged out.
     ///
     /// [`oauth::ensure_fresh_token`] does its own expiry tracking
@@ -414,8 +415,15 @@ impl AdlsCore {
         let provider = Provider::Azure {
             tenant_id: tenant_id.clone(),
         };
-        let token =
-            oauth::ensure_fresh_token(provider, client_id, connection_id, secrets.as_ref())?;
+        // A forced refresh must not just re-check the stored token's
+        // expiry: the server already rejected it, so the client's own
+        // expiry guess cannot be trusted, and the renewal must always
+        // go through even when the token still looks fresh.
+        let token = if force {
+            oauth::refresh_stored_token(provider, client_id, connection_id, secrets.as_ref())?
+        } else {
+            oauth::ensure_fresh_token(provider, client_id, connection_id, secrets.as_ref())?
+        };
         *cache.lock().unwrap() = Some(CachedToken {
             access_token: token.clone(),
             expires_at_ms: now_ms() + 60_000,
