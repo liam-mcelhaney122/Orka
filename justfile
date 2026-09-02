@@ -105,13 +105,20 @@ bench-up:
                 echo "smbpasswd: skipped, passwordless sudo is not available; the SMB password tests will fail"
             fi
         fi
+        # smbd must run as root. Its atomic directory create makes a
+        # temporary directory, then renames it as the file owner, and
+        # that seteuid step fails on an unprivileged daemon, so every
+        # mkdir over SMB is denied. A real SMB server runs as root too.
+        SMBD_SUDO=""
+        if sudo -n true 2>/dev/null; then SMBD_SUDO="sudo"; fi
         if [ ! -f bench/run/smbd.pid ] || ! kill -0 "$(cat bench/run/smbd.pid)" 2>/dev/null; then
             # An optional daemon that fails to start must not stop the
             # recipe; the SMB tests skip when the port is closed.
-            if "$SMBD" -s "$RUN/smb.conf" -D > "$RUN/smbd.out" 2>&1; then
+            if $SMBD_SUDO "$SMBD" -s "$RUN/smb.conf" -D > "$RUN/smbd.out" 2>&1; then
                 sleep 1
-                cp "$RUN/pid/smbd.pid" bench/run/smbd.pid 2>/dev/null || true
-                echo "smbd: listening on 127.0.0.1:4450 (config $RUN/smb.conf)"
+                $SMBD_SUDO cp "$RUN/pid/smbd.pid" bench/run/smbd.pid 2>/dev/null || true
+                $SMBD_SUDO chmod 644 bench/run/smbd.pid 2>/dev/null || true
+                echo "smbd: listening on 127.0.0.1:4450 as ${SMBD_SUDO:-$(id -un)} (config $RUN/smb.conf)"
             else
                 echo "smbd: failed to start; the SMB bench will skip"
                 cat "$RUN/smbd.out"
@@ -172,11 +179,18 @@ bench-down:
     #!/usr/bin/env bash
     set -uo pipefail
     cd "{{justfile_directory()}}"
+    SMBD_SUDO=""
+    if sudo -n true 2>/dev/null; then SMBD_SUDO="sudo"; fi
     for name in smbd nfs sshd; do
         pid_file="bench/run/$name.pid"
         if [ -f "$pid_file" ]; then
-            kill "$(cat "$pid_file")" 2>/dev/null || true
-            rm -f "$pid_file"
+            if [ "$name" = smbd ]; then
+                $SMBD_SUDO kill "$(cat "$pid_file")" 2>/dev/null || true
+                $SMBD_SUDO rm -f "$pid_file"
+            else
+                kill "$(cat "$pid_file")" 2>/dev/null || true
+                rm -f "$pid_file"
+            fi
         fi
     done
     # Daemon output helps diagnose a refused mount or a failed start
@@ -186,9 +200,7 @@ bench-down:
     done
     if [ -s bench/run/samba/log.smbd ]; then
         echo "== bench/run/samba/log.smbd (denials and errors)"
-        grep -n -m1 -B60 'NT_STATUS_ACCESS_DENIED' bench/run/samba/log.smbd | grep -v '^[0-9]*-\[20' | head -n 120
-        echo "== bench/run/samba/log.smbd (token and access checks)"
-        grep -n -i 'se_access_check\|se_file_access_check\|check_parent_access\|smbd_check_access_rights\|access_mask\|S-1-5-21\|S-1-22\|token' bench/run/samba/log.smbd | grep -v 'class=acls' | tail -n 80
+        grep -i 'NT_STATUS_ACCESS_DENIED\|failed\|denied' bench/run/samba/log.smbd | tail -n 20
     fi
     # A bench test that panicked mid-mount can leave a share mounted;
     # sweep anything still mounted under Orka's mount directory.
