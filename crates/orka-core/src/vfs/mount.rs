@@ -289,14 +289,22 @@ fn build_smb_url(config: &ConnectionConfig, secret: Option<&str>) -> Result<Stri
         return Ok(format!("//{server}/{share}"));
     }
     if config.auth == AuthMethod::Kerberos {
+        if config.username.is_empty() {
+            return Err("username required".to_string());
+        }
         return Ok(format!("//{}@{server}/{share}", config.username));
     }
     match secret {
-        Some(password) if !password.is_empty() => Ok(format!(
-            "//{}:{}@{server}/{share}",
-            config.username,
-            url_encode(password)
-        )),
+        Some(password) if !password.is_empty() => {
+            if config.username.is_empty() {
+                return Err("username required".to_string());
+            }
+            Ok(format!(
+                "//{}:{}@{server}/{share}",
+                config.username,
+                url_encode(password)
+            ))
+        }
         // No stored secret means guest access.
         _ => Ok(format!("//{server}/{share}")),
     }
@@ -537,6 +545,24 @@ mod tests {
             build_smb_url(&config, None).unwrap(),
             "//DOMAIN;user@server/share"
         );
+    }
+
+    #[test]
+    fn smb_rejects_kerberos_with_no_username() {
+        let mut config = smb_config("server/share", AuthMethod::Kerberos);
+        config.username = String::new();
+        let err = build_smb_url(&config, None).unwrap_err();
+        assert_eq!(err, "username required");
+    }
+
+    #[test]
+    fn smb_rejects_password_with_no_username() {
+        let mut config = smb_config("server/share", AuthMethod::Password);
+        config.username = String::new();
+        let err = build_smb_url(&config, Some("pw")).unwrap_err();
+        assert_eq!(err, "username required");
+        // An empty username with no password is still guest access.
+        assert_eq!(build_smb_url(&config, None).unwrap(), "//server/share");
     }
 
     #[test]
