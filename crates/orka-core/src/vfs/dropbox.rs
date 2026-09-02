@@ -8,6 +8,7 @@
 //! backend uses.
 
 use super::connections::{AuthMethod, BackendFactory, ConnectionConfig, SecretProvider};
+use super::endpoints;
 use super::http;
 use super::oauth;
 use super::{Capabilities, FsBackend, WriteFinish};
@@ -18,16 +19,20 @@ use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-const LIST_URL: &str = "https://api.dropboxapi.com/2/files/list_folder";
-const LIST_CONTINUE_URL: &str = "https://api.dropboxapi.com/2/files/list_folder/continue";
-const METADATA_URL: &str = "https://api.dropboxapi.com/2/files/get_metadata";
-const DELETE_URL: &str = "https://api.dropboxapi.com/2/files/delete_v2";
-const MOVE_URL: &str = "https://api.dropboxapi.com/2/files/move_v2";
-const CREATE_FOLDER_URL: &str = "https://api.dropboxapi.com/2/files/create_folder_v2";
-const DOWNLOAD_URL: &str = "https://content.dropboxapi.com/2/files/download";
-const UPLOAD_START_URL: &str = "https://content.dropboxapi.com/2/files/upload_session/start";
-const UPLOAD_APPEND_URL: &str = "https://content.dropboxapi.com/2/files/upload_session/append_v2";
-const UPLOAD_FINISH_URL: &str = "https://content.dropboxapi.com/2/files/upload_session/finish";
+// Paths appended to `api_base` (the RPC endpoints, JSON in and out)
+// or `content_base` (raw bytes in or out). Both bases are resolved
+// once when the backend is built, from `ORKA_ENDPOINT_DROPBOX_API`
+// and `ORKA_ENDPOINT_DROPBOX_CONTENT`; see [`DropboxFactory::connect`].
+const LIST_PATH: &str = "/2/files/list_folder";
+const LIST_CONTINUE_PATH: &str = "/2/files/list_folder/continue";
+const METADATA_PATH: &str = "/2/files/get_metadata";
+const DELETE_PATH: &str = "/2/files/delete_v2";
+const MOVE_PATH: &str = "/2/files/move_v2";
+const CREATE_FOLDER_PATH: &str = "/2/files/create_folder_v2";
+const DOWNLOAD_PATH: &str = "/2/files/download";
+const UPLOAD_START_PATH: &str = "/2/files/upload_session/start";
+const UPLOAD_APPEND_PATH: &str = "/2/files/upload_session/append_v2";
+const UPLOAD_FINISH_PATH: &str = "/2/files/upload_session/finish";
 
 /// Bytes read from a download response before one channel send. Small
 /// chunks keep the reader responsive and bound in-flight memory.
@@ -277,17 +282,20 @@ impl Drop for ChannelWriter {
 }
 
 /// Downloads `path` and feeds chunks to `tx`. A send failure means the
-/// reader dropped; the pump stops quietly.
+/// reader dropped; the pump stops quietly. `content_base` is the
+/// content-API origin resolved once when the backend was built.
 fn read_pump(
     tokens: oauth::TokenSource,
     agent: ureq::Agent,
+    content_base: String,
     path: String,
     tx: &SyncSender<ChunkResult>,
 ) -> Result<(), String> {
     let arg = api_arg(&json!({"path": dropbox_path(&path)}));
+    let url = format!("{content_base}{DOWNLOAD_PATH}");
     let response = call_with_auth_retry(&tokens, |token| {
         agent
-            .post(DOWNLOAD_URL)
+            .post(&url)
             .set("Authorization", &auth_header(token))
             .set("Dropbox-API-Arg", &arg)
             .set("Content-Type", "application/octet-stream")
@@ -308,10 +316,15 @@ fn read_pump(
     }
 }
 
-fn start_upload_session(tokens: &oauth::TokenSource, agent: &ureq::Agent) -> Result<String, String> {
+fn start_upload_session(
+    tokens: &oauth::TokenSource,
+    agent: &ureq::Agent,
+    content_base: &str,
+) -> Result<String, String> {
+    let url = format!("{content_base}{UPLOAD_START_PATH}");
     let response = call_with_auth_retry(tokens, |token| {
         agent
-            .post(UPLOAD_START_URL)
+            .post(&url)
             .set("Authorization", &auth_header(token))
             .set("Content-Type", "application/octet-stream")
             .send_bytes(&[])
@@ -329,6 +342,7 @@ fn start_upload_session(tokens: &oauth::TokenSource, agent: &ureq::Agent) -> Res
 fn finish_upload_session(
     tokens: &oauth::TokenSource,
     agent: &ureq::Agent,
+    content_base: &str,
     path: &str,
     session_id: &str,
     offset: u64,
@@ -342,9 +356,10 @@ fn finish_upload_session(
         },
         "cursor": {"session_id": session_id, "offset": offset},
     }));
+    let url = format!("{content_base}{UPLOAD_FINISH_PATH}");
     let response = call_with_auth_retry(tokens, |token| {
         agent
-            .post(UPLOAD_FINISH_URL)
+            .post(&url)
             .set("Authorization", &auth_header(token))
             .set("Dropbox-API-Arg", &arg)
             .set("Content-Type", "application/octet-stream")
@@ -384,11 +399,13 @@ fn pump_uploads(rx: Receiver<Vec<u8>>, append: &mut AppendChunk<'_>) -> Result<u
 fn write_pump(
     tokens: oauth::TokenSource,
     agent: ureq::Agent,
+    content_base: String,
     path: String,
     rx: Receiver<Vec<u8>>,
 ) -> Result<(), String> {
-    let session_id = start_upload_session(&tokens, &agent)?;
+    let session_id = start_upload_session(&tokens, &agent, &content_base)?;
     let sid = session_id.clone();
+    let append_url = format!("{content_base}{UPLOAD_APPEND_PATH}");
     let mut append = |offset: u64, chunk: &[u8], close: bool| -> Result<(), String> {
         let arg = api_arg(&json!({
             "cursor": {"session_id": sid, "offset": offset},
@@ -396,7 +413,7 @@ fn write_pump(
         }));
         let response = call_with_auth_retry(&tokens, |token| {
             agent
-                .post(UPLOAD_APPEND_URL)
+                .post(&append_url)
                 .set("Authorization", &auth_header(token))
                 .set("Dropbox-API-Arg", &arg)
                 .set("Content-Type", "application/octet-stream")
@@ -406,7 +423,7 @@ fn write_pump(
         Ok(())
     };
     let offset = pump_uploads(rx, &mut append)?;
-    finish_upload_session(&tokens, &agent, &path, &session_id, offset)?;
+    finish_upload_session(&tokens, &agent, &content_base, &path, &session_id, offset)?;
     Ok(())
 }
 
@@ -471,15 +488,22 @@ fn root_entry() -> Entry {
 struct DropboxBackend {
     tokens: oauth::TokenSource,
     agent: ureq::Agent,
+    /// `ORKA_ENDPOINT_DROPBOX_API` or its production default, resolved
+    /// once when this backend was built.
+    api_base: String,
+    /// `ORKA_ENDPOINT_DROPBOX_CONTENT` or its production default,
+    /// resolved the same way as `api_base`.
+    content_base: String,
 }
 
 impl DropboxBackend {
-    /// POSTs a JSON body and parses the JSON response. All metadata
-    /// and RPC endpoints share this shape.
-    fn post_json(&self, url: &str, body: Value) -> Result<Value, String> {
+    /// POSTs a JSON body to `{api_base}{path}` and parses the JSON
+    /// response. All metadata and RPC endpoints share this shape.
+    fn post_json(&self, path: &str, body: Value) -> Result<Value, String> {
+        let url = format!("{}{path}", self.api_base);
         let response = call_with_auth_retry(&self.tokens, |token| {
             self.agent
-                .post(url)
+                .post(&url)
                 .set("Authorization", &auth_header(token))
                 .send_json(body.clone())
         })?;
@@ -526,7 +550,9 @@ impl BackendFactory for DropboxFactory {
         };
         Ok(Arc::new(DropboxBackend {
             tokens,
-            agent: http::agent(),
+            agent: http::agent()?,
+            api_base: endpoints::dropbox_api_base(),
+            content_base: endpoints::dropbox_content_base(),
         }))
     }
 }
@@ -546,10 +572,10 @@ impl FsBackend for DropboxBackend {
     fn list_dir(&self, path: &str, opts: &ListOptions) -> Result<Vec<Entry>, String> {
         let dir = normalize_path(path)?;
         let mut body = json!({"path": dropbox_path(&dir), "recursive": false});
-        let mut url = LIST_URL;
+        let mut list_path = LIST_PATH;
         let mut entries = Vec::new();
         loop {
-            let response = self.post_json(url, body)?;
+            let response = self.post_json(list_path, body)?;
             entries.extend(parse_entries(&response, &dir));
             if !response
                 .get("has_more")
@@ -563,7 +589,7 @@ impl FsBackend for DropboxBackend {
                 .and_then(Value::as_str)
                 .ok_or_else(|| "list response has more entries but no cursor".to_string())?;
             body = json!({"cursor": cursor});
-            url = LIST_CONTINUE_URL;
+            list_path = LIST_CONTINUE_PATH;
         }
         entries.retain(|entry| {
             (opts.include_hidden || !entry.is_hidden) && (!opts.dirs_only || entry.is_dir)
@@ -577,7 +603,7 @@ impl FsBackend for DropboxBackend {
         if p == "/" {
             return Ok(root_entry());
         }
-        let value = match self.post_json(METADATA_URL, json!({"path": dropbox_path(&p)})) {
+        let value = match self.post_json(METADATA_PATH, json!({"path": dropbox_path(&p)})) {
             Ok(value) => value,
             Err(message) => {
                 // The API reports a missing item as path/not_found in
@@ -601,8 +627,9 @@ impl FsBackend for DropboxBackend {
         let (tx, rx) = mpsc::sync_channel::<ChunkResult>(CHANNEL_DEPTH);
         let tokens = self.tokens.clone();
         let agent = self.agent.clone();
+        let content_base = self.content_base.clone();
         std::thread::spawn(move || {
-            if let Err(message) = read_pump(tokens, agent, path, &tx) {
+            if let Err(message) = read_pump(tokens, agent, content_base, path, &tx) {
                 // A send failure means the reader is gone; drop the
                 // error with it.
                 let _ = tx.send(Err(message));
@@ -625,8 +652,9 @@ impl FsBackend for DropboxBackend {
         let (done_tx, done_rx) = mpsc::sync_channel::<Result<(), String>>(1);
         let tokens = self.tokens.clone();
         let agent = self.agent.clone();
+        let content_base = self.content_base.clone();
         let handle = std::thread::spawn(move || {
-            let result = write_pump(tokens, agent, path, rx);
+            let result = write_pump(tokens, agent, content_base, path, rx);
             // Returning drops rx, so a failed pump rejects later sends.
             let _ = done_tx.send(result);
         });
@@ -640,7 +668,7 @@ impl FsBackend for DropboxBackend {
         }
         // delete_v2 removes files and non-empty folders alike, so the
         // recursive flag needs no server-side handling.
-        self.post_json(DELETE_URL, json!({"path": dropbox_path(&p)}))
+        self.post_json(DELETE_PATH, json!({"path": dropbox_path(&p)}))
             .map(|_| ())
     }
 
@@ -651,7 +679,7 @@ impl FsBackend for DropboxBackend {
             return Err("cannot rename the root".to_string());
         }
         self.post_json(
-            MOVE_URL,
+            MOVE_PATH,
             json!({"from_path": dropbox_path(&from), "to_path": dropbox_path(&to), "autorename": false}),
         )
         .map(|_| ())
@@ -662,7 +690,7 @@ impl FsBackend for DropboxBackend {
         if p == "/" {
             return Ok(());
         }
-        match self.post_json(CREATE_FOLDER_URL, json!({"path": dropbox_path(&p)})) {
+        match self.post_json(CREATE_FOLDER_PATH, json!({"path": dropbox_path(&p)})) {
             Ok(_) => Ok(()),
             Err(message) => {
                 // The API reports an existing folder as path/conflict;
@@ -744,6 +772,7 @@ mod tests {
 
     fn post_error(port: u16) -> ureq::Error {
         http::agent()
+            .unwrap()
             .post(&format!("http://127.0.0.1:{port}/x"))
             .send_string("{}")
             .err()
@@ -876,6 +905,27 @@ mod tests {
         assert!(capabilities.can_rename);
         assert!(!capabilities.server_side_copy);
         assert!(!capabilities.preserves_permissions);
+    }
+
+    #[test]
+    fn api_base_override_is_used_for_metadata_requests() {
+        use crate::vfs::endpoints::test_support::with_var;
+        let body = r#"{".tag":"file","name":"a.txt","size":3,"server_modified":"2023-05-31T15:14:23Z"}"#;
+        let port = serve_once("HTTP/1.1 200 OK", body);
+        with_var(
+            "ORKA_ENDPOINT_DROPBOX_API",
+            &format!("http://127.0.0.1:{port}"),
+            || {
+                let backend = DropboxFactory
+                    .connect(&config(AuthMethod::OAuthToken), Arc::new(FixedSecrets))
+                    .expect("must connect");
+                let entry = backend
+                    .stat("/a.txt")
+                    .expect("must reach the overridden API base");
+                assert_eq!(entry.name, "a.txt");
+                assert_eq!(entry.size, 3);
+            },
+        );
     }
 
     fn oauth_app_auth() -> AuthMethod {

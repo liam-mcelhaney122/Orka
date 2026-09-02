@@ -25,13 +25,16 @@
 //! matches the entry by name. This mirrors how graphical FTP clients
 //! resolve single-path metadata.
 //!
-//! TLS verification trusts only the Mozilla root set baked in by
-//! `webpki-roots`. A private or self-signed certificate authority is
-//! not supported yet.
+//! TLS verification trusts the Mozilla root set baked in by
+//! `webpki-roots`. Setting `ORKA_EXTRA_CA_FILE` to a PEM file adds a
+//! private or self-signed certificate authority to that trust store
+//! as well; see [`super::http::build_root_store`], which this backend
+//! shares with the REST backends' TLS client.
 
 use super::connections::{AuthMethod, BackendFactory, ConnectionConfig, SecretProvider};
 use super::{Capabilities, FsBackend, WriteFinish};
 use crate::{Entry, ListOptions};
+use rustls::ClientConfig;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::mpsc::{self, Receiver, SyncSender};
@@ -39,7 +42,6 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, UNIX_EPOCH};
 use suppaftp::list::File as FtpFile;
-use suppaftp::rustls::{ClientConfig, RootCertStore};
 use suppaftp::{RustlsConnector, RustlsFtpStream, Status};
 
 /// The control (and, once secured, data) connection type.
@@ -157,18 +159,21 @@ fn is_implicit_tls_port(port: u16) -> bool {
 }
 
 /// A TLS connector trusting the Mozilla root set baked in by
-/// `webpki-roots`. Built fresh per connect: an FTP control connection
-/// is short-lived compared to the cost of building a `ClientConfig`,
-/// and a fresh connector keeps this function free of shared mutable
-/// state.
-fn tls_connector() -> RustlsConnector {
-    let roots = RootCertStore {
-        roots: webpki_roots::TLS_SERVER_ROOTS.into(),
-    };
+/// `webpki-roots`, plus `ORKA_EXTRA_CA_FILE` when that variable names
+/// a readable PEM file. Built fresh per connect: an FTP control
+/// connection is short-lived compared to the cost of building a
+/// `ClientConfig`, and a fresh connector keeps this function free of
+/// shared mutable state.
+///
+/// Fails when `ORKA_EXTRA_CA_FILE` is set but the file cannot be read
+/// or holds no valid certificate, rather than connecting with the
+/// default roots silently.
+fn tls_connector() -> Result<RustlsConnector, String> {
+    let roots = super::http::build_root_store()?;
     let config = ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
-    RustlsConnector::from(Arc::new(config))
+    Ok(RustlsConnector::from(Arc::new(config)))
 }
 
 /// Dials `addr` over FTPS. `host` is the TLS server name and must be
@@ -179,7 +184,7 @@ fn tls_connector() -> RustlsConnector {
 /// timeouts) before any TLS byte crosses the wire, so a stalled dial
 /// or a stalled handshake cannot hang past [`CONNECT_TIMEOUT`].
 fn connect_tls(host: &str, addr: SocketAddr, port: u16) -> Result<FtpStream, String> {
-    let connector = tls_connector();
+    let connector = tls_connector()?;
     if is_implicit_tls_port(port) {
         let mut stream = connect_secure_implicit_bounded(addr, connector, host, CONNECT_TIMEOUT)
             .map_err(|e| format!("cannot connect to {host}:{port}: {e}"))?;
@@ -793,6 +798,24 @@ mod tests {
         assert_eq!(anonymous_credentials(), ("anonymous", "anonymous@"));
     }
 
+    // tls_connector's only added logic over ureq's default TLS setup
+    // is building the shared root store from `ORKA_EXTRA_CA_FILE`;
+    // that parsing and error handling is unit-tested directly, with
+    // no environment variable involved, in `http::tests`
+    // (`build_root_store_with`). Testing it again here through the
+    // real environment would risk colliding with any other test in
+    // this crate that calls `agent()` or `tls_connector()` while this
+    // one holds a broken path in the same process-global variable.
+    #[test]
+    fn tls_connector_succeeds_with_no_extra_ca_file() {
+        // Assumes ORKA_EXTRA_CA_FILE is unset, so this holds the
+        // environment lock: a concurrent test that points it at a
+        // broken file must not run at the same time.
+        crate::vfs::endpoints::test_support::with_no_overrides(|| {
+            tls_connector().expect("must succeed with only the default roots");
+        });
+    }
+
     #[test]
     fn is_safe_child_name_rejects_traversal_and_slashes() {
         assert!(is_safe_child_name("file.txt"));
@@ -970,7 +993,7 @@ mod tests {
         let start = Instant::now();
         let err = connect_secure_implicit_bounded(
             addr,
-            tls_connector(),
+            tls_connector().unwrap(),
             "localhost",
             Duration::from_secs(5),
         )

@@ -19,6 +19,7 @@ use std::thread::JoinHandle;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::connections::{AuthMethod, BackendFactory, ConnectionConfig, SecretProvider};
+use super::endpoints::{self, scheme_for_host};
 use super::http::{
     agent, error_string, is_ok, parse_rfc1123_to_ms, read_body_string, response_reader, url_encode,
 };
@@ -168,10 +169,11 @@ fn build_core(
         .filter(|name| !name.is_empty())
         .ok_or_else(|| "adls host must start with the account name".to_string())?;
     Ok(AdlsCore {
-        agent: agent(),
+        agent: agent()?,
         host: config.host.clone(),
         account: account.to_string(),
         filesystem: config.username.clone(),
+        azure_login_base: endpoints::azure_login_base(),
         credential,
     })
 }
@@ -231,13 +233,17 @@ fn append_sas_query(url: &str, sas: &str) -> String {
 
 /// Exchanges a service-principal client secret for a bearer token via
 /// the OAuth2 client-credentials grant, scoped to Azure Storage.
+/// `azure_login_base` is the login origin resolved once when the
+/// connection was built, so an `ORKA_ENDPOINT_AZURE_LOGIN` override
+/// stays stable across every refresh.
 fn fetch_service_principal_token(
     agent: &ureq::Agent,
+    azure_login_base: &str,
     tenant_id: &str,
     client_id: &str,
     client_secret: &str,
 ) -> Result<CachedToken, String> {
-    let url = format!("https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token");
+    let url = format!("{azure_login_base}/{tenant_id}/oauth2/v2.0/token");
     let response = agent
         .post(&url)
         .send_form(&[
@@ -312,12 +318,22 @@ struct AdlsCore {
     host: String,
     account: String,
     filesystem: String,
+    /// The Azure AD login origin, resolved once when this core was
+    /// built. A service-principal token fetch appends the tenant path
+    /// to it, so an `ORKA_ENDPOINT_AZURE_LOGIN` override set before
+    /// the connection was built stays stable for its whole life.
+    azure_login_base: String,
     credential: AdlsCredential,
 }
 
 impl AdlsCore {
     fn base_url(&self) -> String {
-        format!("https://{}/{}/", self.host, url_encode(&self.filesystem))
+        format!(
+            "{}://{}/{}/",
+            scheme_for_host(&self.host),
+            self.host,
+            url_encode(&self.filesystem)
+        )
     }
 
     /// Percent-encodes a backend-local path for the URL, keeping the
@@ -373,8 +389,13 @@ impl AdlsCore {
                 }
             }
         }
-        let fetched =
-            fetch_service_principal_token(&self.agent, tenant_id, client_id, client_secret)?;
+        let fetched = fetch_service_principal_token(
+            &self.agent,
+            &self.azure_login_base,
+            tenant_id,
+            client_id,
+            client_secret,
+        )?;
         let token = fetched.access_token.clone();
         *cache.lock().unwrap() = Some(fetched);
         Ok(token)
@@ -1332,10 +1353,11 @@ mod tests {
     #[test]
     fn request_url_encodes_path_and_sorts_query() {
         let core = AdlsCore {
-            agent: agent(),
+            agent: agent().unwrap(),
             host: "myaccount.dfs.core.windows.net".to_string(),
             account: "myaccount".to_string(),
             filesystem: "fs".to_string(),
+            azure_login_base: endpoints::azure_login_base(),
             credential: AdlsCredential::SharedKey(vec![1]),
         };
         let (url, sorted) = core.request_url(
@@ -1776,10 +1798,11 @@ mod tests {
 
     fn oauth_app_core(secrets: Arc<dyn SecretProvider>) -> AdlsCore {
         AdlsCore {
-            agent: agent(),
+            agent: agent().unwrap(),
             host: "myaccount.dfs.core.windows.net".to_string(),
             account: "myaccount".to_string(),
             filesystem: "fs".to_string(),
+            azure_login_base: endpoints::azure_login_base(),
             credential: AdlsCredential::OAuthApp {
                 tenant_id: "tenant".to_string(),
                 client_id: "client".to_string(),
@@ -1870,6 +1893,52 @@ mod tests {
             .err()
             .expect("must fail");
         assert!(err.contains("cannot parse"), "got: {err}");
+    }
+
+    #[test]
+    fn fetch_service_principal_token_uses_the_azure_login_base_it_was_given() {
+        // Passing a base with no listener behind it proves the
+        // request went to that origin: it fails immediately with a
+        // connection error rather than resolving the real Azure host.
+        let err = fetch_service_principal_token(
+            &agent().unwrap(),
+            "http://127.0.0.1:1",
+            "tenant",
+            "client",
+            "secret",
+        )
+        .err()
+        .expect("must fail: nothing listens on port 1");
+        assert!(err.contains("127.0.0.1:1"), "got: {err}");
+    }
+
+    #[test]
+    fn base_url_uses_https_for_a_real_account_host() {
+        let core = AdlsCore {
+            agent: agent().unwrap(),
+            host: "myaccount.dfs.core.windows.net".to_string(),
+            account: "myaccount".to_string(),
+            filesystem: "fs".to_string(),
+            azure_login_base: endpoints::azure_login_base(),
+            credential: AdlsCredential::SharedKey(vec![1]),
+        };
+        assert_eq!(
+            core.base_url(),
+            "https://myaccount.dfs.core.windows.net/fs/"
+        );
+    }
+
+    #[test]
+    fn base_url_uses_plain_http_for_a_loopback_host() {
+        let core = AdlsCore {
+            agent: agent().unwrap(),
+            host: "127.0.0.1".to_string(),
+            account: "myaccount".to_string(),
+            filesystem: "fs".to_string(),
+            azure_login_base: endpoints::azure_login_base(),
+            credential: AdlsCredential::SharedKey(vec![1]),
+        };
+        assert_eq!(core.base_url(), "http://127.0.0.1/fs/");
     }
 
     // --- Auth-method validation ---

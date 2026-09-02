@@ -9,6 +9,7 @@
 pub mod adls;
 pub mod connections;
 pub mod dropbox;
+pub mod endpoints;
 pub mod ftp;
 pub mod gdrive;
 pub mod http;

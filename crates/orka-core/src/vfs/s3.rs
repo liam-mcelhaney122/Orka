@@ -73,6 +73,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::connections::{AuthMethod, BackendFactory, ConnectionConfig, SecretProvider};
+use super::endpoints::{self, scheme_for_host};
 use super::http::{
     agent, error_string, parse_rfc1123_to_ms, parse_rfc3339_to_ms, response_reader, url_encode,
 };
@@ -137,7 +138,7 @@ fn build_core(config: &ConnectionConfig, secrets: &dyn SecretProvider) -> Result
         u16::try_from(config.port).map_err(|_| format!("invalid port {}", config.port))?
     };
     Ok(S3Core {
-        agent: agent(),
+        agent: agent()?,
         host: config.host.clone(),
         port,
         region: region_from_host(&config.host),
@@ -452,7 +453,7 @@ fn assume_role(
     role_arn: &str,
     region: &str,
 ) -> Result<Credentials, String> {
-    let host = sts_host(region);
+    let origin = endpoints::sts_endpoint(&sts_host(region));
     let query = vec![
         ("Action".to_string(), "AssumeRole".to_string()),
         ("Version".to_string(), "2011-06-15".to_string()),
@@ -462,7 +463,7 @@ fn assume_role(
             format!("orka-{}", std::process::id()),
         ),
     ];
-    let body = sigv4_get(&agent(), &host, region, "sts", source_creds, &query)?;
+    let body = sigv4_get(&agent()?, &origin, region, "sts", source_creds, &query)?;
     parse_assume_role_credentials(&body)
 }
 
@@ -478,14 +479,22 @@ fn sts_host(region: &str) -> String {
 /// response body. Shared by [`assume_role`]; the object-storage path
 /// through [`S3Core::request`] stays separate because it also handles
 /// PUT/DELETE bodies and the object-key URI shape.
+///
+/// `origin` is the full `scheme://host[:port]` to call, so an
+/// `ORKA_ENDPOINT_STS` override can point this at a plain-HTTP test
+/// server. The signed `host` header comes from `origin` with its
+/// scheme stripped, matching whatever is actually on the wire.
 fn sigv4_get(
     agent: &ureq::Agent,
-    host: &str,
+    origin: &str,
     region: &str,
     service: &str,
     creds: &Credentials,
     query: &[(String, String)],
 ) -> Result<String, String> {
+    let host = origin
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -522,7 +531,7 @@ fn sigv4_get(
         &signed_headers,
         &signature,
     );
-    let url = format!("https://{host}/?{query_string}");
+    let url = format!("{origin}/?{query_string}");
     let mut req = agent.get(&url);
     for (name, value) in &headers {
         if name == "host" {
@@ -606,7 +615,7 @@ fn load_sso_credentials(
         })?;
 
     let body =
-        fetch_sso_role_credentials(&agent(), &sso_region, account_id, role_name, &access_token)?;
+        fetch_sso_role_credentials(&agent()?, &sso_region, account_id, role_name, &access_token)?;
     parse_sso_role_credentials(&body)
 }
 
@@ -669,7 +678,8 @@ fn fetch_sso_role_credentials(
     access_token: &str,
 ) -> Result<String, String> {
     let url = format!(
-        "https://portal.sso.{sso_region}.amazonaws.com/federation/credentials?account_id={}&role_name={}",
+        "{}/federation/credentials?account_id={}&role_name={}",
+        endpoints::sso_portal_endpoint(sso_region),
         url_encode(account_id),
         url_encode(role_name)
     );
@@ -744,8 +754,18 @@ struct S3Core {
 }
 
 impl S3Core {
+    /// The scheme's default port: 443 for https, 80 for the plain
+    /// HTTP that [`scheme_for_host`] picks for a loopback host.
+    fn default_port(&self) -> u16 {
+        if scheme_for_host(&self.host) == "https" {
+            443
+        } else {
+            80
+        }
+    }
+
     fn host_header(&self) -> String {
-        if self.port == 443 {
+        if self.port == self.default_port() {
             self.host.clone()
         } else {
             format!("{}:{}", self.host, self.port)
@@ -753,10 +773,11 @@ impl S3Core {
     }
 
     fn base_url(&self) -> String {
-        if self.port == 443 {
-            format!("https://{}", self.host)
+        let scheme = scheme_for_host(&self.host);
+        if self.port == self.default_port() {
+            format!("{scheme}://{}", self.host)
         } else {
-            format!("https://{}:{}", self.host, self.port)
+            format!("{scheme}://{}:{}", self.host, self.port)
         }
     }
 
@@ -2269,6 +2290,58 @@ mod tests {
         assert_eq!(sts_host("eu-west-1"), "sts.eu-west-1.amazonaws.com");
     }
 
+    #[test]
+    fn sigv4_get_uses_the_sts_override_origin_and_host_header() {
+        use crate::vfs::endpoints::test_support::with_var;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0u8; 1];
+            let mut seen = String::new();
+            while !seen.contains("\r\n\r\n") {
+                match std::io::Read::read(&mut stream, &mut buf) {
+                    Ok(0) => break,
+                    Ok(_) => seen.push(buf[0] as char),
+                    Err(_) => break,
+                }
+            }
+            let body = "ok";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            use std::io::Write;
+            let _ = stream.write_all(response.as_bytes());
+        });
+        with_var(
+            "ORKA_ENDPOINT_STS",
+            &format!("http://127.0.0.1:{port}"),
+            || {
+                let origin = endpoints::sts_endpoint(&sts_host("us-east-1"));
+                assert_eq!(origin, format!("http://127.0.0.1:{port}"));
+                let creds = Credentials {
+                    access_key: "AKID".to_string(),
+                    secret_key: "secret".to_string(),
+                    session_token: None,
+                };
+                let body = sigv4_get(
+                    &agent().unwrap(),
+                    &origin,
+                    "us-east-1",
+                    "sts",
+                    &creds,
+                    &[],
+                )
+                .expect("must reach the overridden STS origin");
+                assert_eq!(body, "ok");
+            },
+        );
+    }
+
     // --- SSO cache lookup and federation response ------------------------
 
     #[test]
@@ -2506,6 +2579,33 @@ mod tests {
             .head_bucket("some-bucket")
             .expect_err("an unresolvable host must fail");
         assert!(!err.contains(secret), "got: {err}");
+    }
+
+    #[test]
+    fn base_url_uses_https_for_a_real_host_and_omits_the_default_port() {
+        let core = build_core(&config(AuthMethod::None), &NoSecrets).expect("must succeed offline");
+        assert_eq!(core.base_url(), "https://s3.amazonaws.com");
+        assert_eq!(core.host_header(), "s3.amazonaws.com");
+    }
+
+    #[test]
+    fn base_url_uses_plain_http_for_a_loopback_host() {
+        let mut cfg = config(AuthMethod::None);
+        cfg.host = "127.0.0.1".to_string();
+        cfg.port = 9123;
+        let core = build_core(&cfg, &NoSecrets).expect("must succeed offline");
+        assert_eq!(core.base_url(), "http://127.0.0.1:9123");
+        assert_eq!(core.host_header(), "127.0.0.1:9123");
+    }
+
+    #[test]
+    fn base_url_omits_the_default_http_port_for_a_loopback_host() {
+        let mut cfg = config(AuthMethod::None);
+        cfg.host = "127.0.0.1".to_string();
+        cfg.port = 80;
+        let core = build_core(&cfg, &NoSecrets).expect("must succeed offline");
+        assert_eq!(core.base_url(), "http://127.0.0.1");
+        assert_eq!(core.host_header(), "127.0.0.1");
     }
 
     #[test]

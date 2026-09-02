@@ -12,6 +12,7 @@
 //! overwrite PATCH or one multipart create lands.
 
 use super::connections::{AuthMethod, BackendFactory, ConnectionConfig, SecretProvider};
+use super::endpoints;
 use super::http;
 use super::oauth;
 use super::{Capabilities, FsBackend, WriteFinish};
@@ -27,8 +28,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const API_BASE: &str = "https://www.googleapis.com/drive/v3";
-const UPLOAD_BASE: &str = "https://www.googleapis.com/upload/drive/v3";
 const FOLDER_MIME: &str = "application/vnd.google-apps.folder";
 /// Google Docs/Sheets/Slides types start with this prefix. They have
 /// no downloadable bytes; only an export conversion can produce a file.
@@ -46,6 +45,8 @@ const BOUNDARY: &str = "orka_drive_boundary_7ad9c1";
 const DRIVE_SCOPE: &str = "https://www.googleapis.com/auth/drive";
 /// Token endpoint a service-account key uses when its own JSON omits
 /// `token_uri`, which every key Google issues today includes anyway.
+/// `ORKA_ENDPOINT_GOOGLE_TOKEN` overrides this and the key's own
+/// `token_uri` alike, so a test fake token server is always reachable.
 const DEFAULT_TOKEN_URI: &str = "https://oauth2.googleapis.com/token";
 /// Lifetime Google grants a service-account JWT-bearer token.
 const SERVICE_ACCOUNT_TOKEN_LIFETIME_SECS: u64 = 3600;
@@ -200,9 +201,15 @@ fn find_query(parent_id: &str, name: &str) -> String {
 
 /// Builds the `files.list` URL. The query goes through percent
 /// encoding because it contains spaces, quotes, and equals signs.
-fn files_list_url(q: &str, fields: &str, page_size: u32, page_token: Option<&str>) -> String {
+fn files_list_url(
+    api_base: &str,
+    q: &str,
+    fields: &str,
+    page_size: u32,
+    page_token: Option<&str>,
+) -> String {
     let mut url = format!(
-        "{API_BASE}/files?fields={fields}&pageSize={page_size}&q={}",
+        "{api_base}/files?fields={fields}&pageSize={page_size}&q={}",
         http::url_encode(q)
     );
     if let Some(token) = page_token {
@@ -283,11 +290,13 @@ fn parse_service_account_key(raw: &str) -> Result<ServiceAccountKey, String> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| "service-account key is missing private_key".to_string())?
         .to_string();
-    let token_uri = value
-        .get("token_uri")
-        .and_then(|v| v.as_str())
-        .unwrap_or(DEFAULT_TOKEN_URI)
-        .to_string();
+    let token_uri = endpoints::env_override("ORKA_ENDPOINT_GOOGLE_TOKEN").unwrap_or_else(|| {
+        value
+            .get("token_uri")
+            .and_then(|v| v.as_str())
+            .unwrap_or(DEFAULT_TOKEN_URI)
+            .to_string()
+    });
     Ok(ServiceAccountKey {
         client_email,
         private_key_pem,
@@ -451,6 +460,13 @@ fn mint_service_account_token(
 struct Transport {
     agent: ureq::Agent,
     tokens: Arc<GdriveTokenSource>,
+    /// `{ORKA_ENDPOINT_GOOGLE_API}/drive/v3`, resolved once when the
+    /// backend was built, so a value an integration test set before
+    /// then stays stable for the connection's whole life.
+    api_base: String,
+    /// `{ORKA_ENDPOINT_GOOGLE_API}/upload/drive/v3`, resolved the
+    /// same way as `api_base`.
+    upload_base: String,
 }
 
 impl Transport {
@@ -487,7 +503,7 @@ impl Transport {
         let mut items = Vec::new();
         let mut token: Option<String> = None;
         loop {
-            let url = files_list_url(q, fields, page_size, token.as_deref());
+            let url = files_list_url(&self.api_base, q, fields, page_size, token.as_deref());
             let (page, next) = parse_file_list(&self.get_json(&url)?)?;
             items.extend(page);
             match next {
@@ -509,7 +525,7 @@ impl Transport {
 
     /// Full metadata for one id.
     fn get_file(&self, id: &str) -> Result<DriveItem, String> {
-        let url = format!("{API_BASE}/files/{id}?fields=id,name,mimeType,size,modifiedTime");
+        let url = format!("{}/files/{id}?fields=id,name,mimeType,size,modifiedTime", self.api_base);
         parse_file_resource(&self.get_json(&url)?)
     }
 
@@ -517,7 +533,7 @@ impl Transport {
     /// the connection until the reader drains or drops. The 401 retry
     /// covers only opening the stream, not bytes already in flight.
     fn download(&self, id: &str) -> Result<Box<dyn Read + Send>, String> {
-        let url = format!("{API_BASE}/files/{id}?alt=media");
+        let url = format!("{}/files/{id}?alt=media", self.api_base);
         let response = self.with_auth_retry(|header| {
             self.agent.get(&url).set("Authorization", header).call()
         })?;
@@ -526,7 +542,7 @@ impl Transport {
 
     /// Overwrites an existing file's content in place.
     fn patch_media(&self, id: &str, bytes: &[u8]) -> Result<(), String> {
-        let url = format!("{UPLOAD_BASE}/files/{id}?uploadType=media");
+        let url = format!("{}/files/{id}?uploadType=media", self.upload_base);
         self.with_auth_retry(|header| {
             self.agent
                 .patch(&url)
@@ -539,7 +555,7 @@ impl Transport {
 
     /// Creates a new file with its content in one multipart request.
     fn post_multipart(&self, metadata_json: &str, bytes: &[u8]) -> Result<(), String> {
-        let url = format!("{UPLOAD_BASE}/files?uploadType=multipart");
+        let url = format!("{}/files?uploadType=multipart", self.upload_base);
         let body = multipart_body(metadata_json, bytes);
         self.with_auth_retry(|header| {
             self.agent
@@ -556,7 +572,7 @@ impl Transport {
 
     /// Creates one folder and returns its new id.
     fn create_folder(&self, name: &str, parent_id: &str) -> Result<String, String> {
-        let url = format!("{API_BASE}/files");
+        let url = format!("{}/files", self.api_base);
         let body = serde_json::json!({
             "name": name,
             "mimeType": FOLDER_MIME,
@@ -581,7 +597,7 @@ impl Transport {
     /// Trashes one file or folder. Drive deletes a folder's children
     /// server-side, so no client-side recursion is needed.
     fn delete_file(&self, id: &str) -> Result<(), String> {
-        let url = format!("{API_BASE}/files/{id}");
+        let url = format!("{}/files/{id}", self.api_base);
         self.with_auth_retry(|header| {
             self.agent.delete(&url).set("Authorization", header).call()
         })?;
@@ -590,7 +606,7 @@ impl Transport {
 
     /// Renames one item in place.
     fn rename_file(&self, id: &str, name: &str) -> Result<(), String> {
-        let url = format!("{API_BASE}/files/{id}");
+        let url = format!("{}/files/{id}", self.api_base);
         let body = serde_json::json!({ "name": name });
         self.with_auth_retry(|header| {
             self.agent
@@ -1032,10 +1048,13 @@ impl BackendFactory for GdriveFactory {
             }
             _ => return Err("wrong auth method for gdrive".to_string()),
         };
+        let api_root = endpoints::google_api_base();
         Ok(Arc::new(GdriveBackend {
             transport: Transport {
-                agent: http::agent(),
+                agent: http::agent()?,
                 tokens: Arc::new(tokens),
+                api_base: format!("{api_root}/drive/v3"),
+                upload_base: format!("{api_root}/upload/drive/v3"),
             },
             cache: Arc::new(Mutex::new(HashMap::new())),
         }))
@@ -1200,13 +1219,30 @@ mod tests {
 
     #[test]
     fn service_account_key_parses_required_and_default_fields() {
-        let key = parse_service_account_key(
-            r#"{"client_email":"svc@proj.iam.gserviceaccount.com","private_key":"PEM"}"#,
-        )
-        .unwrap();
-        assert_eq!(key.client_email, "svc@proj.iam.gserviceaccount.com");
-        assert_eq!(key.private_key_pem, "PEM");
-        assert_eq!(key.token_uri, DEFAULT_TOKEN_URI);
+        // Asserts the default token_uri, so this holds the
+        // environment lock: a concurrent test that overrides
+        // ORKA_ENDPOINT_GOOGLE_TOKEN must not run at the same time.
+        crate::vfs::endpoints::test_support::with_no_overrides(|| {
+            let key = parse_service_account_key(
+                r#"{"client_email":"svc@proj.iam.gserviceaccount.com","private_key":"PEM"}"#,
+            )
+            .unwrap();
+            assert_eq!(key.client_email, "svc@proj.iam.gserviceaccount.com");
+            assert_eq!(key.private_key_pem, "PEM");
+            assert_eq!(key.token_uri, DEFAULT_TOKEN_URI);
+        });
+    }
+
+    #[test]
+    fn google_token_override_wins_over_the_keys_own_token_uri() {
+        use crate::vfs::endpoints::test_support::with_var;
+        with_var("ORKA_ENDPOINT_GOOGLE_TOKEN", "http://127.0.0.1:9011/token", || {
+            let key = parse_service_account_key(
+                r#"{"client_email":"a@b.com","private_key":"PEM","token_uri":"https://token.example.com"}"#,
+            )
+            .unwrap();
+            assert_eq!(key.token_uri, "http://127.0.0.1:9011/token");
+        });
     }
 
     #[test]
@@ -1260,22 +1296,42 @@ mod tests {
 
     #[test]
     fn list_url_encodes_the_query() {
-        let q = folder_query("FOLDERID", "My Docs");
-        let url = files_list_url(&q, RESOLVE_FIELDS, RESOLVE_PAGE_SIZE, None);
-        assert!(
-            url.starts_with("https://www.googleapis.com/drive/v3/files?"),
-            "url: {url}"
-        );
-        assert!(url.contains(&http::url_encode(&q)), "url: {url}");
-        assert!(url.contains("pageSize=100"), "url: {url}");
-        assert!(!url.contains("pageToken"), "url: {url}");
-        // Quotes and spaces must be percent-encoded, never raw.
-        assert!(!url.contains("My Docs"), "url: {url}");
-        let paged = files_list_url(&q, RESOLVE_FIELDS, RESOLVE_PAGE_SIZE, Some("tok/en"));
-        assert!(
-            paged.contains(&format!("pageToken={}", http::url_encode("tok/en"))),
-            "url: {paged}"
-        );
+        // Asserts the default googleapis.com host, so this holds the
+        // environment lock: a concurrent test that overrides
+        // ORKA_ENDPOINT_GOOGLE_API must not run at the same time.
+        crate::vfs::endpoints::test_support::with_no_overrides(|| {
+            let api_base = format!("{}/drive/v3", endpoints::google_api_base());
+            let q = folder_query("FOLDERID", "My Docs");
+            let url = files_list_url(&api_base, &q, RESOLVE_FIELDS, RESOLVE_PAGE_SIZE, None);
+            assert!(
+                url.starts_with("https://www.googleapis.com/drive/v3/files?"),
+                "url: {url}"
+            );
+            assert!(url.contains(&http::url_encode(&q)), "url: {url}");
+            assert!(url.contains("pageSize=100"), "url: {url}");
+            assert!(!url.contains("pageToken"), "url: {url}");
+            // Quotes and spaces must be percent-encoded, never raw.
+            assert!(!url.contains("My Docs"), "url: {url}");
+            let paged =
+                files_list_url(&api_base, &q, RESOLVE_FIELDS, RESOLVE_PAGE_SIZE, Some("tok/en"));
+            assert!(
+                paged.contains(&format!("pageToken={}", http::url_encode("tok/en"))),
+                "url: {paged}"
+            );
+        });
+    }
+
+    #[test]
+    fn google_api_base_can_be_overridden_for_files_list() {
+        use crate::vfs::endpoints::test_support::with_var;
+        with_var("ORKA_ENDPOINT_GOOGLE_API", "http://127.0.0.1:9010", || {
+            let api_base = format!("{}/drive/v3", endpoints::google_api_base());
+            let url = files_list_url(&api_base, "q", RESOLVE_FIELDS, RESOLVE_PAGE_SIZE, None);
+            assert!(
+                url.starts_with("http://127.0.0.1:9010/drive/v3/files?"),
+                "url: {url}"
+            );
+        });
     }
 
     fn sample_list_json() -> &'static str {

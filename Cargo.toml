@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/orka-core", "crates/orka-ffi"]
+members = ["crates/orka-core", "crates/orka-ffi", "crates/orka-bench"]
 
 [workspace.package]
 version = "0.1.0"
