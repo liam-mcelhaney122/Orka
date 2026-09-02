@@ -164,7 +164,7 @@ bench-up:
 # bench-up` first for the SMB and FTPS cases; the NFS tests start
 # their own server and do not need `bench-up` at all.
 bench:
-    ORKA_BENCH=1 {{cargo}} test --workspace -- --include-ignored
+    ORKA_BENCH=1 {{cargo}} test --workspace --no-fail-fast -- --include-ignored
 
 # Stop every daemon `bench-up` started and unmount any share a bench
 # test left mounted. Safe to run even when `bench-up` was never run.
