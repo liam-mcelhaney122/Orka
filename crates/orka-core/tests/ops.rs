@@ -1,5 +1,6 @@
 use orka_core::ops::{
-    create_folder, rename_item, EventSink, ItemError, JobState, OpsEngine, PlatformDelegate,
+    create_file, create_folder, rename_item, EventSink, ItemError, JobState, OpsEngine,
+    PlatformDelegate,
     Progress,
 };
 use std::fs;
@@ -223,6 +224,22 @@ fn create_folder_numbers_duplicates() {
     let second = create_folder(tmp.path(), "untitled folder").unwrap();
     assert_eq!(first, tmp.path().join("untitled folder"));
     assert_eq!(second, tmp.path().join("untitled folder 2"));
+}
+
+#[test]
+fn create_file_numbers_duplicates_into_the_stem() {
+    let tmp = tempfile::tempdir().unwrap();
+    let first = create_file(tmp.path(), "untitled.txt").unwrap();
+    let second = create_file(tmp.path(), "untitled.txt").unwrap();
+    assert_eq!(first, tmp.path().join("untitled.txt"));
+    assert_eq!(second, tmp.path().join("untitled 2.txt"));
+}
+
+#[test]
+fn create_file_rejects_invalid_names() {
+    let tmp = tempfile::tempdir().unwrap();
+    assert!(create_file(tmp.path(), "").is_err());
+    assert!(create_file(tmp.path(), "bad/name").is_err());
 }
 
 #[test]

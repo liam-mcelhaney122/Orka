@@ -923,6 +923,26 @@ final class AppModel {
         }
     }
 
+    func newFile(in window: WindowState? = nil) {
+        guard let pane = pane(in: window),
+            OrkaPath.isLocal(pane.directory.path)
+        else {
+            NSSound.beep()
+            return
+        }
+        do {
+            let created = try engine.createFile(
+                parent: pane.directory.path, name: "untitled.txt")
+            refreshJournal()
+            pane.directory.reload(showHidden: showHidden)
+            pane.directory.selection = [created]
+        } catch {
+            lastJobErrors = [JobItemError(
+                path: pane.directory.path,
+                message: String(describing: error))]
+        }
+    }
+
     /// Returns the new path, or nil after showing the error in the status bar.
     func rename(
         path: String, to newName: String, in window: WindowState? = nil

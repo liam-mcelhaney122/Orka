@@ -4,6 +4,7 @@ struct StatusBarView: View {
     @Bindable var model: AppModel
     var window: WindowState
     @State private var freeSpace: String = ""
+    @State private var showBranchPicker = false
     @Environment(\.openWindow) private var openWindow
 
     private var directory: DirectoryModel { window.activePane.directory }
@@ -67,12 +68,24 @@ struct StatusBarView: View {
     }
 
     /// Branch name, or the short commit hash on a detached HEAD.
+    /// Clicking opens the branch picker.
     private var branchSegment: some View {
-        HStack(spacing: 4) {
-            Image(systemName: "arrow.triangle.branch")
-            Text(branchLabel)
+        Button {
+            showBranchPicker = true
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "arrow.triangle.branch")
+                Text(branchLabel)
+            }
+            .foregroundStyle(.secondary)
         }
-        .foregroundStyle(.secondary)
+        .buttonStyle(.borderless)
+        .help("Switch or create a git branch")
+        .popover(isPresented: $showBranchPicker, arrowEdge: .bottom) {
+            BranchPickerView(directory: directory) {
+                directory.reload(showHidden: window.app.showHidden)
+            }
+        }
     }
 
     private var branchLabel: String {

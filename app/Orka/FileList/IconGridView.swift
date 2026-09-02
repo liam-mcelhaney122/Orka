@@ -258,6 +258,7 @@ struct IconGridView: View {
     private var backgroundMenu: some View {
         if OrkaPath.isLocal(directory.path) {
             Button("New Folder") { model.newFolder(in: window) }
+            Button("New File") { model.newFile(in: window) }
         }
         if model.canPaste {
             Button("Paste") { model.paste(in: window) }

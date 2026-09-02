@@ -386,6 +386,10 @@ struct MainWindowView: View {
                 disabled: !OrkaPath.isLocal(pane.directory.path)
             ) { model.newFolder(in: window) }
             toolbarIconButton(
+                "doc.badge.plus", help: "New File",
+                disabled: !OrkaPath.isLocal(pane.directory.path)
+            ) { model.newFile(in: window) }
+            toolbarIconButton(
                 "arrow.clockwise", help: "Refresh", disabled: false
             ) { pane.directory.reload(showHidden: model.showHidden) }
             toolbarIconButton(

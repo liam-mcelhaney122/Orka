@@ -523,6 +523,15 @@ impl OrkaEngine {
             .map_err(item_error_to_orka)
     }
 
+    /// Creates an empty file. Appends " 2", " 3", … when the name is
+    /// taken. Local paths only.
+    pub fn create_file(&self, parent: String, name: String) -> Result<String, OrkaError> {
+        self.inner
+            .create_file(std::path::Path::new(&parent), &name)
+            .map(|p| p.display().to_string())
+            .map_err(item_error_to_orka)
+    }
+
     /// Starts a recursive name search under `root`. Cancels any earlier
     /// query. Results arrive as `SearchResults` events for the returned
     /// query id.
@@ -960,5 +969,43 @@ impl OrkaEngine {
                 })
                 .collect(),
         })
+    }
+
+    /// Lists local and remote-tracking branches of the repo around
+    /// `dir`. Empty when `dir` is not inside a work tree. Synchronous
+    /// and can block on repo IO; Swift calls it off the main actor.
+    pub fn git_branches(&self, dir: String) -> Vec<GitBranchInfo> {
+        orka_core::git::list_branches(&dir)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|b| GitBranchInfo {
+                name: b.name,
+                is_head: b.is_head,
+                is_local: b.is_local,
+                head_commit: None,
+            })
+            .collect()
+    }
+
+    /// Checks out the local branch `name` in the repo around `dir`.
+    /// When `create` is set and the branch does not exist, it is
+    /// created from `base` (a branch shorthand such as "main" or
+    /// "origin/main"), or from HEAD when `base` is None. A remote
+    /// base makes the new branch track it. An existing branch is
+    /// checked out either way. Refuses to overwrite uncommitted
+    /// changes. Callers must reload the pane afterwards; this drops
+    /// the cached status and graph so the reload sees the new branch.
+    pub fn git_checkout_branch(
+        &self,
+        dir: String,
+        name: String,
+        base: Option<String>,
+        create: bool,
+    ) -> Result<(), OrkaError> {
+        orka_core::git::checkout_branch(&dir, &name, base.as_deref(), create)
+            .map_err(|e| OrkaError::Io { message: e.to_string() })?;
+        self.git.invalidate_under(&dir);
+        self.gitlog.invalidate_under(&dir);
+        Ok(())
     }
 }
