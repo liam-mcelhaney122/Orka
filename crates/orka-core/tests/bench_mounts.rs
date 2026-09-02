@@ -4,13 +4,14 @@
 //! Every test in this file is `#[ignore]` and returns immediately
 //! unless `ORKA_BENCH=1` is set, because each one drives a real
 //! system mount helper (`mount_nfs`, `mount_smbfs`) or a real daemon
-//! (`smbd`, `vsftpd`), not a fake in-process server:
+//! (`smbd`, an implicit-TLS FTP server), not a fake in-process server:
 //!
 //!   cargo test -p orka-core --test bench_mounts               # compiles; lists as ignored
 //!   ORKA_BENCH=1 cargo test -p orka-core --test bench_mounts -- --include-ignored
 //!
 //! `just bench-up` starts the daemons this file assumes are already
-//! running (`smbd` on port 4450, `vsftpd` on port 990); the NFS
+//! running (`smbd` on port 4450; an implicit-TLS FTP server on port
+//! 990 is a manual setup, see docs/TESTING.md); the NFS
 //! tests start their own throw-away server instead, since
 //! [`nfsserve`] is cheap to run in-process. See `docs/TESTING.md` for
 //! the full picture.
@@ -457,8 +458,9 @@ fn smb_unmount_on_drop_removes_the_mount_point() {
 /// port 990, and `ConnectionConfig::port` also drives the real TCP
 /// dial for FTP/FTPS (see `connect_session`), so there is no way to
 /// point Orka's implicit-TLS path at a remapped port: the daemon
-/// itself must listen on 990, which needs root. `just bench-up`
-/// starts vsftpd with `sudo` for this reason; see docs/TESTING.md.
+/// itself must listen on 990, which needs root. Homebrew's vsftpd is
+/// built without SSL, so no recipe starts one; docs/TESTING.md
+/// describes the manual setup and `ORKA_BENCH_FTPS_CA` names its CA.
 const FTPS_IMPLICIT_PORT: u16 = 990;
 
 fn ftps_daemon_reachable() -> bool {
@@ -470,7 +472,7 @@ fn ftps_daemon_reachable() -> bool {
 }
 
 #[test]
-#[ignore = "needs `just bench-up`'s vsftpd on port 990 (started with sudo); run with ORKA_BENCH=1"]
+#[ignore = "needs an implicit-TLS FTP server on port 990 and ORKA_BENCH_FTPS_CA; run with ORKA_BENCH=1"]
 fn ftps_implicit_bench_connects_and_meets_conformance() {
     if !bench_enabled() {
         eprintln!("skipping: set ORKA_BENCH=1 to run the mount bench tier");
@@ -478,14 +480,17 @@ fn ftps_implicit_bench_connects_and_meets_conformance() {
     }
     skip_unless!(
         ftps_daemon_reachable(),
-        "skipping: nothing is listening on 127.0.0.1:{FTPS_IMPLICIT_PORT}; run `just bench-up` \
-         first (vsftpd on 990 needs sudo, so bench-up may have skipped it; see docs/TESTING.md)"
+        "skipping: nothing is listening on 127.0.0.1:{FTPS_IMPLICIT_PORT}; start an implicit-TLS \
+         FTP server by hand first (see docs/TESTING.md)"
     );
-
-    let ca_file = repo_root().join("bench/tls/ca.pem");
+    let Ok(ca_file) = std::env::var("ORKA_BENCH_FTPS_CA") else {
+        eprintln!("skipping: ORKA_BENCH_FTPS_CA is not set to the server's CA PEM file");
+        return;
+    };
+    let ca_file = PathBuf::from(ca_file);
     assert!(
         ca_file.exists(),
-        "bench/tls/ca.pem is missing; `just bench-up` generates it before starting vsftpd"
+        "ORKA_BENCH_FTPS_CA points at a missing file: {ca_file:?}"
     );
     // SAFETY: this test does not run concurrently with anything else
     // in this process that reads `ORKA_EXTRA_CA_FILE` through a live
@@ -506,7 +511,7 @@ fn ftps_implicit_bench_connects_and_meets_conformance() {
     };
     let backend = FtpFactory::tls()
         .connect(&config, no_secret())
-        .expect("implicit-TLS FTPS to vsftpd's anonymous share must connect");
+        .expect("implicit-TLS FTPS anonymous login must connect");
     support::conformance::exercise_backend(&*backend, "/");
 }
 

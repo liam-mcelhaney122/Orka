@@ -6,7 +6,7 @@ for realism. Run the cheapest tier that answers your question.
 | Tier | Command | Needs | Runs in CI |
 | --- | --- | --- | --- |
 | 1. Unit and offline connector tests | `cargo test --workspace` | Nothing | Every push and pull request (`rust` job) |
-| 2. Opt-in daemon bench | `just bench` (after `just bench-up`) | Homebrew `samba`, `vsftpd`, `sudo` for one daemon | Every push and pull request (`bench` job), `continue-on-error: true` |
+| 2. Opt-in daemon bench | `just bench` (after `just bench-up`) | Homebrew `samba`, passwordless `sudo` for `smbpasswd` | Every push and pull request (`bench` job), `continue-on-error: true` |
 | 3. Manual live smoke | `just smoke-live` | Real cloud accounts, a Kerberos ticket | Never; run by hand before a release that touches auth |
 
 ## Tier 1: unit and offline connector tests
@@ -64,13 +64,13 @@ needs one sets it itself.
 ## Tier 2: the opt-in daemon bench
 
 ```
-just bench-up      # start smbd, vsftpd (if possible), the NFS bench server, and sshd
+just bench-up      # start smbd, the NFS bench server, and sshd
 just bench          # ORKA_BENCH=1 cargo test --workspace -- --include-ignored
 just bench-down    # stop every daemon and sweep leftover mounts
 ```
 
-This tier drives the mounted connectors (SMB, NFS) and implicit-TLS
-FTPS against real system mount helpers and real daemons, in
+This tier drives the mounted connectors (SMB, NFS) against real
+system mount helpers and real daemons, in
 `crates/orka-core/tests/bench_mounts.rs`. Every test in that file is
 `#[ignore]` and returns immediately unless `ORKA_BENCH=1` is set, so
 `cargo test --workspace` (tier 1) never touches this tier by accident,
@@ -82,40 +82,41 @@ lists every test, just as ignored, with nothing installed.
 | Daemon | Port | Package | Config | Optional? |
 | --- | --- | --- | --- | --- |
 | `smbd` | 4450 | Homebrew `samba` (`brew install samba`) | `bench/smb.conf` | Skipped if not installed |
-| `vsftpd` | 990 (implicit TLS) | Homebrew `vsftpd` (`brew install vsftpd`) | `bench/vsftpd.conf` | Skipped if not installed, or if `sudo -n true` needs a password |
 | `nfs_bench_server` (`crates/orka-core/examples/nfs_bench_server.rs`) | 23890 | None (built from this repo) | none | Always starts |
 | `sshd` | 2222 | Apple's `/usr/sbin/sshd` | `bench/sshd_config` | Skipped if `sshd` is missing; nothing in this repo tests against it yet |
 
-`bench-up` writes one PID file per daemon under `bench/run/`, and one
-throwaway certificate authority and server certificate under
-`bench/tls/` (generated with `openssl` the first time it runs). Both
-directories are gitignored (`bench/.gitignore`) and safe to delete.
+`bench-up` writes one PID file per daemon under `bench/run/`. The
+directory is gitignored (`bench/.gitignore`) and safe to delete.
 `bench-down` reads those PID files to stop exactly what `bench-up`
 started, then sweeps anything still mounted under `~/Library/Application
 Support/Orka/mounts` in case a bench test panicked mid-mount.
 
 Homebrew's `smbd` is required, not the Apple-supplied `/usr/sbin/smbd`:
 Apple's implementation is a different, closed daemon that cannot read
-`bench/smb.conf`.
+`bench/smb.conf`. Homebrew installs it as `samba-dot-org-smbd`.
+`smbpasswd -L` needs root, so `bench-up` runs that one step with
+`sudo -n` and hands the files back to the bench user.
 
-### Why vsftpd needs `sudo`, and NFS cannot use a custom port
+### Implicit FTPS is a manual check
 
-Two bench daemons hit the same wall: **Orka's connection config has no
-way to carry a non-standard port to certain schemes**, so the bench
-server has to run on the standard port instead, which needs root.
+`orka_core::vfs::ftp::is_implicit_tls_port` decides implicit-vs-explicit
+TLS by checking `ConnectionConfig::port == 990` exactly, and that same
+`port` field drives the real TCP dial. So an implicit-TLS bench server
+must listen on the real port 990, which needs root. Homebrew's `vsftpd`
+is built without SSL, so no recipe starts one. To run the check by
+hand:
 
-- **Implicit-TLS FTPS.** `orka_core::vfs::ftp::is_implicit_tls_port`
-  decides implicit-vs-explicit TLS by checking `ConnectionConfig::port
-  == 990` exactly, and that same `port` field drives the real TCP dial
-  (`connect_session` in that module). There is no way to dial a
-  different port while still triggering implicit mode. `bench/vsftpd.conf`
-  therefore listens on the real port 990, which needs root to bind, so
-  `bench-up` starts it with `sudo` — and only if `sudo -n true` can run
-  without a password prompt in the shell `bench-up` runs in.
-  Otherwise it prints a skip message and leaves the FTPS bench
-  unverified; `ftps_implicit_bench_connects_and_meets_conformance` in
-  `bench_mounts.rs` checks the port is reachable and skips itself with
-  the same message when it is not.
+1. Start an FTP server with implicit TLS on port 990 and anonymous
+   write access to an empty directory. ProFTPD with `TLSEngine on`
+   and `TLSOptions UseImplicitSSL` works.
+2. Set `ORKA_BENCH_FTPS_CA` to the PEM file of the CA that signed the
+   server certificate.
+3. Run `ORKA_BENCH=1 cargo test -p orka-core --test bench_mounts --
+   --include-ignored ftps_implicit`.
+
+The test skips itself with a message when port 990 is closed or the
+variable is unset.
+
 - **NFS.** A `nfsserve`-based bench server binds one arbitrary high
   port and never registers with a portmapper. `mount_nfs` reaches it
   only when both `port=` and `mountport=` name that port.

@@ -55,13 +55,13 @@ clean:
 # --- Opt-in daemon bench tier ------------------------------------
 #
 # `bench-up` starts every real daemon `cargo test --test bench_mounts`
-# and friends can use under ORKA_BENCH=1: Homebrew's smbd, vsftpd
-# (implicit FTPS, needs sudo), the NFS bench server, and sshd. Each
-# daemon is optional except the NFS server: a missing Homebrew package
-# is reported and skipped, not a hard failure, since a workstation
-# without `samba`/`vsftpd` installed should still be able to build and
-# run the rest of the suite. See docs/TESTING.md for the full picture
-# and the ports every daemon uses.
+# and friends can use under ORKA_BENCH=1: Homebrew's smbd, the NFS
+# bench server, and sshd. Each daemon is optional except the NFS
+# server: a missing Homebrew package is reported and skipped, not a
+# hard failure, since a workstation without `samba` installed should
+# still be able to build and run the rest of the suite. Implicit FTPS
+# has no daemon here; docs/TESTING.md describes the manual check and
+# the ports every daemon uses.
 
 # Start every opt-in bench daemon. Safe to run again: each daemon is
 # skipped if its own PID file already names a live process.
@@ -92,10 +92,18 @@ bench-up:
         # to a server instead of editing the local password database.
         BENCH_USER="${ORKA_BENCH_SMB_USER:-$(id -un)}"
         sed -e "s#@BENCH_RUN@#$RUN#g" -e "s#@BENCH_USER@#$BENCH_USER#g" bench/smb.conf > "$RUN/smb.conf"
+        # smbpasswd -L edits the local database and needs root; the
+        # files it creates go back to the bench user so smbd can read
+        # them without root.
         if [ ! -f "$RUN/passdb.tdb" ]; then
-            printf 'orka-bench\norka-bench\n' \
-                | "$SMBPASSWD" -L -c "$RUN/smb.conf" -s -a "$BENCH_USER" \
-                || echo "smbpasswd: failed (see output above); the SMB bench will skip"
+            if sudo -n true 2>/dev/null; then
+                printf 'orka-bench\norka-bench\n' \
+                    | sudo "$SMBPASSWD" -L -c "$RUN/smb.conf" -s -a "$BENCH_USER" \
+                    || echo "smbpasswd: failed (see output above); the SMB bench will skip"
+                sudo chown -R "$BENCH_USER" "$RUN"
+            else
+                echo "smbpasswd: skipped, passwordless sudo is not available; the SMB password tests will fail"
+            fi
         fi
         if [ ! -f bench/run/smbd.pid ] || ! kill -0 "$(cat bench/run/smbd.pid)" 2>/dev/null; then
             # An optional daemon that fails to start must not stop the
@@ -115,46 +123,8 @@ bench-up:
         echo "smbd: skipped, Homebrew samba is not installed (brew install samba)"
     fi
 
-    # vsftpd (implicit FTPS is fixed at port 990, which needs root).
-    VSFTPD="/opt/homebrew/sbin/vsftpd"
-    if [ ! -x "$VSFTPD" ]; then VSFTPD="/usr/local/sbin/vsftpd"; fi
-    if [ -x "$VSFTPD" ] && sudo -n true 2>/dev/null; then
-        mkdir -p bench/tls
-        if [ ! -f bench/tls/cert.pem ]; then
-            openssl req -x509 -newkey rsa:2048 -sha256 -days 3650 -nodes \
-                -subj "/CN=Orka bench CA" \
-                -keyout bench/tls/ca-key.pem -out bench/tls/ca.pem
-            openssl req -newkey rsa:2048 -nodes -subj "/CN=localhost" \
-                -keyout bench/tls/key.pem -out bench/tls/csr.pem
-            openssl x509 -req -in bench/tls/csr.pem -CA bench/tls/ca.pem \
-                -CAkey bench/tls/ca-key.pem -CAcreateserial \
-                -out bench/tls/cert.pem -days 3650 -sha256 \
-                -extfile <(printf 'subjectAltName=DNS:localhost,IP:127.0.0.1')
-        fi
-        RUN="$(pwd)/bench/run/vsftpd"
-        mkdir -p "$RUN/anon"
-        sed -e "s#@BENCH_RUN@#$RUN#g" -e "s#@BENCH_TLS@#$(pwd)/bench/tls#g" \
-            bench/vsftpd.conf > "$RUN/vsftpd.conf"
-        # vsftpd refuses a config file that is not owned by root.
-        sudo chown root "$RUN/vsftpd.conf"
-        if ! pgrep -f "$RUN/vsftpd.conf" > /dev/null 2>&1; then
-            # vsftpd writes a startup failure to file descriptor 0, so
-            # that descriptor is opened on the output file as well.
-            if sudo "$VSFTPD" "$RUN/vsftpd.conf" 0<> "$RUN/vsftpd.out" 1>&0 2>&0; then
-                sleep 1
-                echo "vsftpd: listening on 127.0.0.1:990 (implicit TLS, started with sudo)"
-            else
-                echo "vsftpd: failed to start; the FTPS bench will skip"
-                cat "$RUN/vsftpd.out"
-            fi
-        else
-            echo "vsftpd: already running on 127.0.0.1:990"
-        fi
-    elif [ -x "$VSFTPD" ]; then
-        echo "vsftpd: skipped, passwordless sudo is not available in this shell"
-    else
-        echo "vsftpd: skipped, Homebrew vsftpd is not installed (brew install vsftpd)"
-    fi
+    # Implicit FTPS (port 990) has no bench daemon: Homebrew's vsftpd
+    # is built without SSL. See docs/TESTING.md for the manual check.
 
     # NFS bench server: an in-process daemon, no system package needed.
     mkdir -p bench/run/nfs/export
@@ -211,12 +181,9 @@ bench-down:
     done
     # Daemon output helps diagnose a refused mount or a failed start
     # on a CI runner, where nobody can read the files afterwards.
-    for log in bench/run/samba/log.smbd bench/run/samba/smbd.out bench/run/vsftpd/vsftpd.out bench/run/nfs.log; do
+    for log in bench/run/samba/log.smbd bench/run/samba/smbd.out bench/run/nfs.log; do
         if [ -s "$log" ]; then echo "== $log (last 40 lines)"; tail -n 40 "$log"; fi
     done
-    if pgrep -f "bench/run/vsftpd/vsftpd.conf" > /dev/null 2>&1; then
-        sudo pkill -f "bench/run/vsftpd/vsftpd.conf" 2>/dev/null || true
-    fi
     # A bench test that panicked mid-mount can leave a share mounted;
     # sweep anything still mounted under Orka's mount directory.
     mounts_dir="$HOME/Library/Application Support/Orka/mounts"

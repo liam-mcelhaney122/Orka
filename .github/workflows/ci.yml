@@ -28,9 +28,8 @@ jobs:
       - name: Test workspace
         run: cargo test --workspace
 
-  # Opt-in daemon bench tier: SMB (Homebrew samba), implicit-TLS
-  # FTPS (Homebrew vsftpd, needs sudo for port 990), and the NFS bench
-  # server, all driven through `cargo test --test bench_mounts` under
+  # Opt-in daemon bench tier: SMB (Homebrew samba) and the NFS bench
+  # server, driven through `cargo test --test bench_mounts` under
   # ORKA_BENCH=1. This tier is allowed to be slower than the main
   # `rust` job (it starts and stops real daemons) and is not a merge
   # gate yet: `continue-on-error: true` means a failure here shows up
@@ -49,8 +48,8 @@ jobs:
       - name: Cache Cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Install just, samba, and vsftpd
-        run: brew install just samba vsftpd
+      - name: Install just and samba
+        run: brew install just samba
 
       - name: Start the bench daemons
         run: just bench-up
