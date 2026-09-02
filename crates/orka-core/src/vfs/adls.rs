@@ -384,15 +384,10 @@ impl AdlsCore {
     /// `force` bypasses the cache and forces a renewal through
     /// [`oauth::refresh_stored_token`], for a retry after an HTTP 401;
     /// a normal request only reaches [`oauth::ensure_fresh_token`]
-    /// when nothing is cached yet or the cache has aged out.
-    ///
-    /// [`oauth::ensure_fresh_token`] does its own expiry tracking
-    /// against the stored token set and does not report the real
-    /// expiry back here, so the cache below trusts its answer for a
-    /// fixed, short window rather than the token's true lifetime.
-    /// That can call it more often than the token strictly needs, but
-    /// never sends a request with a token the module itself would
-    /// already have refreshed.
+    /// when nothing is cached yet or the cache has aged out. Both
+    /// report the token's real expiry, which this cache stores as-is,
+    /// so a request only re-reads the keychain once that real expiry
+    /// draws close, instead of on every request.
     fn oauth_app_token(&self, force: bool) -> Result<String, String> {
         let AdlsCredential::OAuthApp {
             tenant_id,
@@ -419,14 +414,15 @@ impl AdlsCore {
         // expiry: the server already rejected it, so the client's own
         // expiry guess cannot be trusted, and the renewal must always
         // go through even when the token still looks fresh.
-        let token = if force {
+        let fresh = if force {
             oauth::refresh_stored_token(provider, client_id, connection_id, secrets.as_ref())?
         } else {
             oauth::ensure_fresh_token(provider, client_id, connection_id, secrets.as_ref())?
         };
+        let token = fresh.access_token.clone();
         *cache.lock().unwrap() = Some(CachedToken {
-            access_token: token.clone(),
-            expires_at_ms: now_ms() + 60_000,
+            access_token: fresh.access_token,
+            expires_at_ms: fresh.expires_at_ms as i64,
         });
         Ok(token)
     }
@@ -1746,6 +1742,101 @@ mod tests {
         assert!(!token_is_fresh(now + 1_000, now));
         assert!(!token_is_fresh(now - 1, now));
         assert!(!token_is_fresh(now, now));
+    }
+
+    // --- OAuth-app token cache: real expiry, not a fixed short window ---
+
+    /// Counts every call to `get_secret`, so a test can prove a fresh
+    /// cache skips the keychain instead of reading it on every
+    /// request.
+    struct CountingSecrets {
+        raw: String,
+        calls: Mutex<u32>,
+    }
+
+    impl CountingSecrets {
+        fn seeded(token_set: &oauth::TokenSet) -> Self {
+            Self {
+                raw: token_set.to_json().unwrap(),
+                calls: Mutex::new(0),
+            }
+        }
+
+        fn call_count(&self) -> u32 {
+            *self.calls.lock().unwrap()
+        }
+    }
+
+    impl SecretProvider for CountingSecrets {
+        fn get_secret(&self, _connection_id: &str) -> Option<String> {
+            *self.calls.lock().unwrap() += 1;
+            Some(self.raw.clone())
+        }
+    }
+
+    fn oauth_app_core(secrets: Arc<dyn SecretProvider>) -> AdlsCore {
+        AdlsCore {
+            agent: agent(),
+            host: "myaccount.dfs.core.windows.net".to_string(),
+            account: "myaccount".to_string(),
+            filesystem: "fs".to_string(),
+            credential: AdlsCredential::OAuthApp {
+                tenant_id: "tenant".to_string(),
+                client_id: "client".to_string(),
+                connection_id: "conn".to_string(),
+                secrets,
+                cache: Mutex::new(None),
+            },
+        }
+    }
+
+    #[test]
+    fn oauth_app_token_cache_survives_across_calls_while_fresh() {
+        // Before this fix the cache stored `now + 60_000` regardless
+        // of the token's real lifetime, which `token_is_fresh` always
+        // read as stale, so every call re-read the keychain. Caching
+        // the real expiry must let a second call skip it.
+        let far_future = oauth::TokenSet {
+            access_token: "app-token".to_string(),
+            refresh_token: Some("r".to_string()),
+            expires_at_ms: now_ms() as u64 + 3_600_000,
+            client_secret: None,
+        };
+        let secrets = Arc::new(CountingSecrets::seeded(&far_future));
+        let core = oauth_app_core(secrets.clone());
+        assert_eq!(core.oauth_app_token(false).unwrap(), "app-token");
+        assert_eq!(core.oauth_app_token(false).unwrap(), "app-token");
+        assert_eq!(core.oauth_app_token(false).unwrap(), "app-token");
+        assert_eq!(
+            secrets.call_count(),
+            1,
+            "the real expiry must let the cache skip later keychain reads"
+        );
+    }
+
+    #[test]
+    fn oauth_app_token_401_path_forces_exactly_one_refresh_attempt() {
+        // `oauth_app_token(true)` is exactly the call the 401 handler
+        // in `request` makes. With no refresh token on file the forced
+        // refresh must fail cleanly after reading the keychain exactly
+        // once more, never looping or resending the rejected token.
+        let no_refresh_token = oauth::TokenSet {
+            access_token: "app-token".to_string(),
+            refresh_token: None,
+            expires_at_ms: now_ms() as u64 + 3_600_000,
+            client_secret: None,
+        };
+        let secrets = Arc::new(CountingSecrets::seeded(&no_refresh_token));
+        let core = oauth_app_core(secrets.clone());
+        assert_eq!(core.oauth_app_token(false).unwrap(), "app-token");
+        assert_eq!(secrets.call_count(), 1);
+        let err = core.oauth_app_token(true).unwrap_err();
+        assert!(err.contains("no refresh token"), "got: {err}");
+        assert_eq!(
+            secrets.call_count(),
+            2,
+            "the forced refresh must read the keychain exactly once"
+        );
     }
 
     #[test]

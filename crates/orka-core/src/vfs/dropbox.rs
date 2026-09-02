@@ -15,7 +15,7 @@ use crate::{Entry, ListOptions};
 use serde_json::{json, Value};
 use std::io::{self, Read, Write};
 use std::sync::mpsc::{self, Receiver, SyncSender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 const LIST_URL: &str = "https://api.dropboxapi.com/2/files/list_folder";
@@ -531,6 +531,7 @@ impl BackendFactory for DropboxFactory {
                     client_id: client_id.clone(),
                     connection_id: config.id.clone(),
                     secrets,
+                    cache: Arc::new(Mutex::new(None)),
                 }
             }
             _ => return Err("wrong auth method for dropbox".to_string()),

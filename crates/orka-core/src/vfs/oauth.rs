@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// How long [`sign_in`] waits for the browser redirect before giving up.
@@ -115,11 +115,6 @@ impl TokenSet {
     pub fn from_json(raw: &str) -> Result<Self, String> {
         serde_json::from_str(raw).map_err(|e| format!("cannot decode token set: {e}"))
     }
-
-    /// True once `expires_at_ms` is within [`REFRESH_SKEW_MS`] of now.
-    fn needs_refresh(&self, now_ms: u64) -> bool {
-        needs_refresh(self.expires_at_ms, now_ms)
-    }
 }
 
 /// True once `expires_at_ms` is within [`REFRESH_SKEW_MS`] of `now_ms`.
@@ -142,7 +137,7 @@ fn now_ms() -> u64 {
 /// bearer token pasted once (the legacy `OAuthToken` auth method) or
 /// an OAuth app that refreshes lazily through [`ensure_fresh_token`].
 /// Cloning is cheap: a fixed token clones a `String`, an OAuth app
-/// clones an `Arc` and two small strings.
+/// clones an `Arc`, two small strings, and a shared token cache.
 #[derive(Clone)]
 pub enum TokenSource {
     Fixed(String),
@@ -151,13 +146,18 @@ pub enum TokenSource {
         client_id: String,
         connection_id: String,
         secrets: Arc<dyn SecretProvider>,
+        /// The most recently resolved token and its real expiry.
+        /// [`TokenSource::token`] only reads the keychain when this is
+        /// empty or has gone stale, instead of on every request.
+        cache: Arc<Mutex<Option<FreshToken>>>,
     },
 }
 
 impl TokenSource {
     /// A token for the next request. Cheap when no refresh is due: a
     /// fixed token is returned as-is, and an OAuth app only reaches
-    /// the network when its stored token is close to expiry.
+    /// the keychain when its in-memory cache is empty or close to
+    /// expiry.
     pub fn token(&self) -> Result<String, String> {
         match self {
             TokenSource::Fixed(token) => Ok(token.clone()),
@@ -166,7 +166,24 @@ impl TokenSource {
                 client_id,
                 connection_id,
                 secrets,
-            } => ensure_fresh_token(provider.clone(), client_id, connection_id, secrets.as_ref()),
+                cache,
+            } => {
+                if let Some(cached) = cache.lock().unwrap().as_ref() {
+                    if !needs_refresh(cached.expires_at_ms, now_ms()) {
+                        return Ok(cached.access_token.clone());
+                    }
+                }
+                let fresh = ensure_fresh_token_with(
+                    provider.clone(),
+                    client_id,
+                    connection_id,
+                    secrets.as_ref(),
+                    false,
+                )?;
+                let token = fresh.access_token.clone();
+                *cache.lock().unwrap() = Some(fresh);
+                Ok(token)
+            }
         }
     }
 
@@ -184,7 +201,19 @@ impl TokenSource {
                 client_id,
                 connection_id,
                 secrets,
-            } => refresh_stored_token(provider.clone(), client_id, connection_id, secrets.as_ref()),
+                cache,
+            } => {
+                let fresh = ensure_fresh_token_with(
+                    provider.clone(),
+                    client_id,
+                    connection_id,
+                    secrets.as_ref(),
+                    true,
+                )?;
+                let token = fresh.access_token.clone();
+                *cache.lock().unwrap() = Some(fresh);
+                Ok(token)
+            }
         }
     }
 }
@@ -507,6 +536,27 @@ pub fn sign_in(
     )
 }
 
+/// A resolved access token together with the real expiry the token
+/// endpoint reported. Lets a caller cache the token itself, keyed on
+/// its true lifetime, instead of re-reading the keychain (and the
+/// stored token's own expiry) on every request.
+#[derive(Clone)]
+pub struct FreshToken {
+    pub access_token: String,
+    pub expires_at_ms: u64,
+}
+
+impl std::fmt::Debug for FreshToken {
+    /// Redacts the access token; only the expiry is useful in a log or
+    /// a failed test assertion.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FreshToken")
+            .field("access_token", &"<redacted>")
+            .field("expires_at_ms", &self.expires_at_ms)
+            .finish()
+    }
+}
+
 /// True when a stored token must be refreshed before use. `force`
 /// always requires a refresh, regardless of `expires_at_ms`: the
 /// caller just saw an HTTP 401 for this exact token, so the client's
@@ -517,12 +567,13 @@ fn should_refresh(force: bool, expires_at_ms: u64, now_ms: u64) -> bool {
     force || needs_refresh(expires_at_ms, now_ms)
 }
 
-/// Returns a valid access token for `connection_id`. `force` skips
-/// the expiry check and always renews the token when a refresh token
-/// is on file, so a caller retrying after an HTTP 401 does not resend
-/// the same rejected token unchanged. [`ensure_fresh_token`] calls
-/// this with `force: false`; [`refresh_stored_token`] calls this with
-/// `force: true`. A refresh stores the new [`TokenSet`] back through
+/// Resolves a valid access token for `connection_id`, together with
+/// its real expiry. `force` skips the expiry check and always renews
+/// the token when a refresh token is on file, so a caller retrying
+/// after an HTTP 401 does not resend the same rejected token
+/// unchanged. [`ensure_fresh_token`] calls this with `force: false`;
+/// [`refresh_stored_token`] calls this with `force: true`. A refresh
+/// stores the new [`TokenSet`] back through
 /// [`SecretProvider::set_secret`] before returning.
 fn ensure_fresh_token_with(
     provider: Provider,
@@ -530,13 +581,16 @@ fn ensure_fresh_token_with(
     connection_id: &str,
     secrets: &dyn SecretProvider,
     force: bool,
-) -> Result<String, String> {
+) -> Result<FreshToken, String> {
     let raw = secrets
         .get_secret(connection_id)
         .ok_or_else(|| "no token stored for this connection".to_string())?;
     let token_set = TokenSet::from_json(&raw)?;
     if !should_refresh(force, token_set.expires_at_ms, now_ms()) {
-        return Ok(token_set.access_token);
+        return Ok(FreshToken {
+            access_token: token_set.access_token,
+            expires_at_ms: token_set.expires_at_ms,
+        });
     }
     let refresh_token = token_set.refresh_token.as_deref().ok_or_else(|| {
         "stored token has no refresh token; sign in again to renew this connection".to_string()
@@ -564,17 +618,21 @@ fn ensure_fresh_token_with(
     )?;
 
     secrets.set_secret(connection_id, &refreshed.to_json()?);
-    Ok(refreshed.access_token)
+    Ok(FreshToken {
+        access_token: refreshed.access_token,
+        expires_at_ms: refreshed.expires_at_ms,
+    })
 }
 
-/// Returns a valid access token for `connection_id`, refreshing it
-/// first when it is within 60 seconds of `expires_at_ms`.
+/// Resolves a valid access token for `connection_id`, refreshing it
+/// first when it is within 60 seconds of `expires_at_ms`. The result
+/// carries the token's real expiry so a caller can cache it directly.
 pub fn ensure_fresh_token(
     provider: Provider,
     client_id: &str,
     connection_id: &str,
     secrets: &dyn SecretProvider,
-) -> Result<String, String> {
+) -> Result<FreshToken, String> {
     ensure_fresh_token_with(provider, client_id, connection_id, secrets, false)
 }
 
@@ -587,7 +645,7 @@ pub fn refresh_stored_token(
     client_id: &str,
     connection_id: &str,
     secrets: &dyn SecretProvider,
-) -> Result<String, String> {
+) -> Result<FreshToken, String> {
     ensure_fresh_token_with(provider, client_id, connection_id, secrets, true)
 }
 
@@ -843,6 +901,7 @@ mod tests {
 
     struct RecordingSecrets {
         stored: Mutex<HashMap<String, String>>,
+        get_calls: Mutex<u32>,
     }
 
     impl RecordingSecrets {
@@ -851,12 +910,21 @@ mod tests {
             map.insert(connection_id.to_string(), value.to_string());
             Self {
                 stored: Mutex::new(map),
+                get_calls: Mutex::new(0),
             }
+        }
+
+        /// How many times [`SecretProvider::get_secret`] has run. Lets
+        /// a test prove an in-memory cache skips the keychain instead
+        /// of reading it on every request.
+        fn get_call_count(&self) -> u32 {
+            *self.get_calls.lock().unwrap()
         }
     }
 
     impl SecretProvider for RecordingSecrets {
         fn get_secret(&self, connection_id: &str) -> Option<String> {
+            *self.get_calls.lock().unwrap() += 1;
             self.stored.lock().unwrap().get(connection_id).cloned()
         }
 
@@ -878,8 +946,9 @@ mod tests {
             client_secret: None,
         };
         let secrets = RecordingSecrets::seeded("conn", &set.to_json().unwrap());
-        let token = ensure_fresh_token(Provider::Google, "client", "conn", &secrets).unwrap();
-        assert_eq!(token, "still-good");
+        let fresh = ensure_fresh_token(Provider::Google, "client", "conn", &secrets).unwrap();
+        assert_eq!(fresh.access_token, "still-good");
+        assert_eq!(fresh.expires_at_ms, far_future);
     }
 
     #[test]
@@ -948,8 +1017,36 @@ mod tests {
             client_id: "client".to_string(),
             connection_id: "conn".to_string(),
             secrets,
+            cache: Arc::new(Mutex::new(None)),
         };
         assert_eq!(source.token().unwrap(), "app-token");
+    }
+
+    #[test]
+    fn token_source_oauth_app_caches_in_memory_between_requests() {
+        let far_future = now_ms() + 3_600_000;
+        let set = TokenSet {
+            access_token: "app-token".to_string(),
+            refresh_token: Some("r".to_string()),
+            expires_at_ms: far_future,
+            client_secret: None,
+        };
+        let secrets = Arc::new(RecordingSecrets::seeded("conn", &set.to_json().unwrap()));
+        let source = TokenSource::OAuthApp {
+            provider: Provider::Dropbox,
+            client_id: "client".to_string(),
+            connection_id: "conn".to_string(),
+            secrets: secrets.clone(),
+            cache: Arc::new(Mutex::new(None)),
+        };
+        assert_eq!(source.token().unwrap(), "app-token");
+        assert_eq!(source.token().unwrap(), "app-token");
+        assert_eq!(source.token().unwrap(), "app-token");
+        assert_eq!(
+            secrets.get_call_count(),
+            1,
+            "a fresh in-memory cache must skip the keychain on later requests"
+        );
     }
 
     #[test]
@@ -968,6 +1065,7 @@ mod tests {
             client_id: "client".to_string(),
             connection_id: "conn".to_string(),
             secrets,
+            cache: Arc::new(Mutex::new(None)),
         };
         // token() returns the cached value; it looks fresh and needs
         // no refresh token to do so.

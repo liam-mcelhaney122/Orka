@@ -1016,6 +1016,7 @@ impl BackendFactory for GdriveFactory {
                     client_id: client_id.clone(),
                     connection_id: config.id.clone(),
                     secrets,
+                    cache: Arc::new(Mutex::new(None)),
                 })
             }
             AuthMethod::ServiceAccount => {
