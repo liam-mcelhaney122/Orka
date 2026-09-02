@@ -40,6 +40,7 @@ const CHANNEL_DEPTH: usize = 4;
 #[derive(Clone, Copy)]
 enum Method {
     Get,
+    Head,
     Put,
     Patch,
     Delete,
@@ -50,6 +51,7 @@ impl Method {
     fn as_str(&self) -> &'static str {
         match self {
             Method::Get => "GET",
+            Method::Head => "HEAD",
             Method::Put => "PUT",
             Method::Patch => "PATCH",
             Method::Delete => "DELETE",
@@ -370,8 +372,14 @@ impl AdlsCore {
     }
 
     /// Resolves the bearer token for a service-principal credential,
-    /// reusing the cached one while it stays fresh.
-    fn service_principal_token(&self) -> Result<String, String> {
+    /// reusing the cached one while it stays fresh. `force` skips the
+    /// cache and runs the client-credentials grant again, for a retry
+    /// after an HTTP 401: the server already rejected the cached
+    /// token, so its client-side expiry cannot be trusted. The cache
+    /// lock is held across the grant so concurrent transfers on one
+    /// connection share a single token fetch instead of each running
+    /// its own.
+    fn service_principal_token(&self, force: bool) -> Result<String, String> {
         let AdlsCredential::ServicePrincipal {
             tenant_id,
             client_id,
@@ -381,8 +389,10 @@ impl AdlsCore {
         else {
             return Err("not a service-principal credential".to_string());
         };
-        {
-            let guard = cache.lock().unwrap();
+        let mut guard = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !force {
             if let Some(cached) = guard.as_ref() {
                 if token_is_fresh(cached.expires_at_ms, now_ms()) {
                     return Ok(cached.access_token.clone());
@@ -397,7 +407,7 @@ impl AdlsCore {
             client_secret,
         )?;
         let token = fetched.access_token.clone();
-        *cache.lock().unwrap() = Some(fetched);
+        *guard = Some(fetched);
         Ok(token)
     }
 
@@ -449,10 +459,12 @@ impl AdlsCore {
     }
 
     /// Sends one signed request, retrying once with a forced token
-    /// refresh when an OAuth-app request comes back `401`: the cached
-    /// token could have been revoked or the client clock could be
-    /// behind, and [`oauth::ensure_fresh_token`] may know better than
-    /// the local cache does.
+    /// refresh when a fetched-token request comes back `401`: the
+    /// cached token could have been revoked or the client clock could
+    /// be behind, and a fresh grant may know better than the local
+    /// cache does. Only the two credentials that fetch their own token
+    /// can refresh; a pasted token, a SAS string, or a shared key has
+    /// nothing to renew, so a 401 on those fails outright.
     fn request(
         &self,
         method: Method,
@@ -463,11 +475,16 @@ impl AdlsCore {
     ) -> Result<ureq::Response, ReqError> {
         let result = self.request_once(method, path, params, ms_headers, body);
         match result {
-            Err(ReqError::Http(boxed))
-                if matches!(*boxed, ureq::Error::Status(401, _))
-                    && matches!(self.credential, AdlsCredential::OAuthApp { .. }) =>
-            {
-                self.oauth_app_token(true).map_err(ReqError::Auth)?;
+            Err(ReqError::Http(boxed)) if matches!(*boxed, ureq::Error::Status(401, _)) => {
+                match &self.credential {
+                    AdlsCredential::OAuthApp { .. } => {
+                        self.oauth_app_token(true).map_err(ReqError::Auth)?;
+                    }
+                    AdlsCredential::ServicePrincipal { .. } => {
+                        self.service_principal_token(true).map_err(ReqError::Auth)?;
+                    }
+                    _ => return Err(ReqError::Http(boxed)),
+                }
                 self.request_once(method, path, params, ms_headers, body)
             }
             other => other,
@@ -527,7 +544,8 @@ impl AdlsCore {
             AdlsCredential::Sas(_) => None,
             AdlsCredential::ServicePrincipal { .. } => Some(format!(
                 "Bearer {}",
-                self.service_principal_token().map_err(ReqError::Auth)?
+                self.service_principal_token(false)
+                    .map_err(ReqError::Auth)?
             )),
             AdlsCredential::OAuthApp { .. } => Some(format!(
                 "Bearer {}",
@@ -536,6 +554,7 @@ impl AdlsCore {
         };
         let mut req = match method {
             Method::Get => self.agent.get(&url),
+            Method::Head => self.agent.head(&url),
             Method::Put => self.agent.put(&url),
             Method::Patch => self.agent.patch(&url),
             Method::Delete => self.agent.delete(&url),
@@ -592,13 +611,38 @@ impl AdlsCore {
         Ok((body, token))
     }
 
-    /// PATCH append of one chunk. The server tracks the position;
-    /// the caller only counts bytes for the final flush.
-    fn append(&self, path: &str, chunk: &[u8]) -> Result<(), String> {
-        let params = vec![("action".to_string(), "append".to_string())];
+    /// PUT `resource=file` (Path - Create). Creates the file, or
+    /// truncates an existing one to zero bytes, which is the
+    /// overwrite semantics a write expects. Azure requires this call
+    /// before the first append: an append to a path that does not
+    /// exist fails with 404. The empty body makes ureq send the
+    /// `Content-Length: 0` that Path - Create requires.
+    fn create_file(&self, path: &str) -> Result<(), String> {
+        let params = vec![("resource".to_string(), "file".to_string())];
+        self.request(Method::Put, path, &params, &[], Some(&[]))
+            .map_err(|e| request_error("cannot create", path, e))
+            .map(|_| ())
+    }
+
+    /// PATCH append of one chunk at `position`, the byte offset where
+    /// the chunk starts. Azure rejects an append whose position does
+    /// not equal the file's current uncommitted length, so the caller
+    /// must count bytes and pass the running total.
+    fn append(&self, path: &str, position: u64, chunk: &[u8]) -> Result<(), String> {
+        let params = vec![
+            ("action".to_string(), "append".to_string()),
+            ("position".to_string(), position.to_string()),
+        ];
         self.request(Method::Patch, path, &params, &[], Some(chunk))
             .map_err(|e| request_error("cannot append to", path, e))
             .map(|_| ())
+    }
+
+    /// HEAD with `action=getStatus` (Path - Get Properties). The
+    /// answer carries the path's properties in headers and no body.
+    fn path_properties(&self, path: &str) -> Result<ureq::Response, ReqError> {
+        let params = vec![("action".to_string(), "getStatus".to_string())];
+        self.request(Method::Head, path, &params, &[], None)
     }
 
     /// PATCH flush that closes the file at `position`. This is the
@@ -646,7 +690,58 @@ fn mkdir_result(status: u16, body: &str) -> Result<(), String> {
     Err(format!("cannot create directory: HTTP {status}: {body}"))
 }
 
-/// Decides the rename pre-check from the destination getStatus call.
+/// The properties a Path - Get Properties answer carries in headers.
+/// Pure over header values so the mapping is testable without a
+/// server.
+struct PathProperties {
+    is_dir: bool,
+    size: u64,
+    modified_ms: i64,
+}
+
+/// Reads a Path - Get Properties answer. Azure reports the kind in
+/// `x-ms-resource-type` (`file` or `directory`), the size in
+/// `Content-Length`, and the time in `Last-Modified` (RFC 1123). A
+/// missing or unreadable header falls back to a file of zero bytes
+/// with no time, so a partial answer still produces an entry.
+fn path_properties_from_headers(
+    resource_type: Option<&str>,
+    content_length: Option<&str>,
+    last_modified: Option<&str>,
+) -> PathProperties {
+    let is_dir = resource_type
+        .map(|kind| kind.trim().eq_ignore_ascii_case("directory"))
+        .unwrap_or(false);
+    let size = content_length
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    PathProperties {
+        is_dir,
+        size: if is_dir { 0 } else { size },
+        modified_ms: last_modified.and_then(parse_rfc1123_to_ms).unwrap_or(0),
+    }
+}
+
+/// Reads a listing field that Azure sends as a string (`"true"`,
+/// `"123"`) but that a lenient server may send as a JSON boolean or
+/// number. Both forms parse, so a listing from either source works.
+fn json_bool_field(value: Option<&serde_json::Value>) -> bool {
+    match value {
+        Some(serde_json::Value::Bool(flag)) => *flag,
+        Some(serde_json::Value::String(text)) => text.trim().eq_ignore_ascii_case("true"),
+        _ => false,
+    }
+}
+
+fn json_u64_field(value: Option<&serde_json::Value>) -> u64 {
+    match value {
+        Some(serde_json::Value::Number(number)) => number.as_u64().unwrap_or(0),
+        Some(serde_json::Value::String(text)) => text.trim().parse().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// Decides the rename pre-check from the destination properties call.
 /// `Ok(true)` means the destination exists and the rename must fail;
 /// `Ok(false)` means proceed.
 fn rename_dest_exists(status: u16) -> Result<bool, String> {
@@ -762,14 +857,17 @@ impl Drop for ChannelWriter {
 
 /// Consumes chunks and appends each one at the running position. The
 /// flush request runs after the writer closes the channel, so the
-/// file reads as complete only when the write finishes.
+/// file reads as complete only when the write finishes. The file
+/// itself already exists: `create_write` creates it before this pump
+/// starts, so a zero-byte write ends in a flush at position 0 on an
+/// empty file.
 fn write_pump(core: &AdlsCore, path: &str, rx: &Receiver<Vec<u8>>) -> Result<(), String> {
     let mut position: u64 = 0;
     while let Ok(chunk) = rx.recv() {
         if chunk.is_empty() {
             continue;
         }
-        core.append(path, &chunk)?;
+        core.append(path, position, &chunk)?;
         position += chunk.len() as u64;
     }
     core.flush(path, position)
@@ -825,7 +923,10 @@ impl AdlsBackend {
         }
     }
 
-    /// Parses one listing page against the list options.
+    /// Parses one listing page against the list options. Azure sends
+    /// every listing field as a string: `isDirectory` is `"true"` and
+    /// is absent for a file, and `contentLength` is `"123"`. The field
+    /// readers also accept a JSON boolean or number.
     fn parse_list_page(json: &str, opts: &ListOptions) -> Result<Vec<Entry>, String> {
         let value: serde_json::Value =
             serde_json::from_str(json).map_err(|e| format!("cannot parse listing: {e}"))?;
@@ -838,14 +939,8 @@ impl AdlsBackend {
             let Some(name) = item.get("name").and_then(|n| n.as_str()) else {
                 continue;
             };
-            let is_dir = item
-                .get("isDirectory")
-                .and_then(|d| d.as_bool())
-                .unwrap_or(false);
-            let size = item
-                .get("contentLength")
-                .and_then(|s| s.as_u64())
-                .unwrap_or(0);
+            let is_dir = json_bool_field(item.get("isDirectory"));
+            let size = json_u64_field(item.get("contentLength"));
             let modified = item.get("lastModified").and_then(|m| m.as_str());
             let entry = Self::entry_from_listed(name, is_dir, size, modified);
             if entry.name.starts_with('.') && !opts.include_hidden {
@@ -908,27 +1003,15 @@ impl FsBackend for AdlsBackend {
         if normalized.is_empty() {
             return Err("cannot stat the filesystem root".to_string());
         }
-        let params = vec![("action".to_string(), "getStatus".to_string())];
         let response = self
             .core
-            .request(Method::Get, &normalized, &params, &[], None)
+            .path_properties(&normalized)
             .map_err(|e| request_error("cannot stat", &normalized, e))?;
-        let mut body = String::new();
-        response
-            .into_reader()
-            .read_to_string(&mut body)
-            .map_err(|e| format!("cannot read stat for {normalized}: {e}"))?;
-        let value: serde_json::Value = serde_json::from_str(&body)
-            .map_err(|e| format!("cannot parse stat for {normalized}: {e}"))?;
-        let is_dir = value
-            .get("isDirectory")
-            .and_then(|d| d.as_bool())
-            .unwrap_or(false);
-        let size = value
-            .get("contentLength")
-            .and_then(|s| s.as_u64())
-            .unwrap_or(0);
-        let modified = value.get("lastModified").and_then(|m| m.as_str());
+        let properties = path_properties_from_headers(
+            response.header("x-ms-resource-type"),
+            response.header("Content-Length"),
+            response.header("Last-Modified"),
+        );
         let name = normalized
             .rsplit('/')
             .next()
@@ -938,9 +1021,9 @@ impl FsBackend for AdlsBackend {
             is_hidden: name.starts_with('.'),
             name,
             path: normalized,
-            is_dir,
-            size: if is_dir { 0 } else { size },
-            modified_ms: modified.and_then(parse_rfc1123_to_ms).unwrap_or(0),
+            is_dir: properties.is_dir,
+            size: properties.size,
+            modified_ms: properties.modified_ms,
             is_symlink: false,
         })
     }
@@ -963,6 +1046,10 @@ impl FsBackend for AdlsBackend {
         if normalized.is_empty() {
             return Err("cannot write the filesystem root".to_string());
         }
+        // Create (or truncate) the file before the pump starts, so a
+        // failure here surfaces from this call instead of from the
+        // first chunk, and every append lands on a zero-length file.
+        self.core.create_file(&normalized)?;
         let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(CHANNEL_DEPTH);
         let (done_tx, done_rx) = mpsc::sync_channel::<Result<(), String>>(1);
         let core = self.core.clone();
@@ -995,8 +1082,7 @@ impl FsBackend for AdlsBackend {
         }
         // Azure renames over an existing destination; Orka renames
         // never overwrite, so the pre-check keeps local semantics.
-        let params = vec![("action".to_string(), "getStatus".to_string())];
-        let status = match self.core.request(Method::Get, &dest, &params, &[], None) {
+        let status = match self.core.path_properties(&dest) {
             Ok(response) => response.status(),
             Err(ReqError::Http(boxed)) => match *boxed {
                 ureq::Error::Status(status, _) => status,
@@ -1009,9 +1095,12 @@ impl FsBackend for AdlsBackend {
         }
         let source = format!("/{}/{}", self.core.filesystem, src.trim_start_matches('/'));
         let ms_headers = vec![("x-ms-rename-source", url_encode(&source))];
+        // Rename is a Path - Create with a source header. The empty
+        // body makes ureq send the `Content-Length: 0` that a
+        // body-less PUT to Azure Storage needs.
         let params = vec![("action".to_string(), "rename".to_string())];
         self.core
-            .request(Method::Put, &dest, &params, &ms_headers, None)
+            .request(Method::Put, &dest, &params, &ms_headers, Some(&[]))
             .map_err(|e| request_error("cannot rename", &dest, e))
             .map(|_| ())
     }
@@ -1021,10 +1110,12 @@ impl FsBackend for AdlsBackend {
         if normalized.is_empty() {
             return Err("cannot create the filesystem root".to_string());
         }
+        // Path - Create requires `Content-Length: 0`; the empty body
+        // makes ureq send it.
         let params = vec![("resource".to_string(), "directory".to_string())];
         match self
             .core
-            .request(Method::Put, &normalized, &params, &[], None)
+            .request(Method::Put, &normalized, &params, &[], Some(&[]))
         {
             Ok(_) => Ok(()),
             Err(ReqError::Http(boxed)) => match *boxed {
@@ -1384,13 +1475,15 @@ mod tests {
 
     #[test]
     fn list_json_parses_to_entries() {
+        // The field shapes Azure sends: every value is a string, and
+        // `isDirectory` is absent for a file.
         let json = r#"{
             "paths": [
-                {"name": "dir", "isDirectory": true,
+                {"name": "dir", "isDirectory": "true", "contentLength": "0",
                  "lastModified": "Wed, 15 Nov 2023 12:45:26 GMT"},
-                {"name": "dir/sub.txt", "contentLength": 123,
+                {"name": "dir/sub.txt", "contentLength": "123",
                  "lastModified": "Thu, 16 Nov 2023 08:00:00 GMT"},
-                {"name": ".hidden", "contentLength": 1}
+                {"name": ".hidden", "contentLength": "1"}
             ]
         }"#;
         let opts = ListOptions::default();
@@ -1423,9 +1516,76 @@ mod tests {
     }
 
     #[test]
+    fn list_json_also_accepts_json_typed_fields() {
+        // A lenient server may send a JSON boolean and number instead
+        // of Azure's strings. Both forms must parse the same way.
+        let json = r#"{
+            "paths": [
+                {"name": "dir", "isDirectory": true},
+                {"name": "file.bin", "contentLength": 42},
+                {"name": "odd", "isDirectory": "false", "contentLength": "not a number"}
+            ]
+        }"#;
+        let entries = AdlsBackend::parse_list_page(json, &ListOptions::default()).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert!(entries[0].is_dir);
+        assert!(!entries[1].is_dir);
+        assert_eq!(entries[1].size, 42);
+        assert!(!entries[2].is_dir);
+        assert_eq!(entries[2].size, 0);
+    }
+
+    #[test]
+    fn path_properties_read_azure_headers() {
+        let file = path_properties_from_headers(
+            Some("file"),
+            Some("123"),
+            Some("Wed, 15 Nov 2023 12:45:26 GMT"),
+        );
+        assert!(!file.is_dir);
+        assert_eq!(file.size, 123);
+        assert_eq!(
+            file.modified_ms,
+            parse_rfc1123_to_ms("Wed, 15 Nov 2023 12:45:26 GMT").unwrap()
+        );
+
+        // A directory reports zero bytes even when the header carries
+        // a value, so a directory row never shows a size.
+        let dir = path_properties_from_headers(Some("directory"), Some("7"), None);
+        assert!(dir.is_dir);
+        assert_eq!(dir.size, 0);
+        assert_eq!(dir.modified_ms, 0);
+
+        // Missing headers degrade to an empty file, never an error.
+        let bare = path_properties_from_headers(None, None, None);
+        assert!(!bare.is_dir);
+        assert_eq!(bare.size, 0);
+        assert_eq!(bare.modified_ms, 0);
+    }
+
+    #[test]
+    fn canonicalized_resource_includes_the_append_position() {
+        // `position` is part of the signed query, so a signature over
+        // an append must cover it or Azure rejects the request.
+        let resource = canonicalized_resource(
+            "myaccount",
+            "fs",
+            "/f.bin",
+            &[
+                ("position".to_string(), "4096".to_string()),
+                ("action".to_string(), "append".to_string()),
+            ],
+        );
+        assert_eq!(
+            resource,
+            "/myaccount/fs/f.bin\naction:append\nposition:4096"
+        );
+    }
+
+    #[test]
     fn pagination_follows_continuation_tokens() {
-        let page_one = r#"{"paths":[{"name":"a","contentLength":1}]}"#;
-        let page_two = r#"{"paths":[{"name":"b","contentLength":2}]}"#;
+        let page_one = r#"{"paths":[{"name":"a","contentLength":"1"}]}"#;
+        let page_two = r#"{"paths":[{"name":"b","contentLength":"2"}]}"#;
         let mut calls: Vec<Option<String>> = Vec::new();
         let entries = list_all_pages(|continuation| {
             calls.push(continuation.map(|c| c.to_string()));

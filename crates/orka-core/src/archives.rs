@@ -463,7 +463,7 @@ mod tests {
         make_tree(&src);
         let dest = tmp.path().join("out.zip");
         create_archive(
-            &[src.clone()],
+            std::slice::from_ref(&src),
             &dest,
             ArchiveFormat::Zip,
             &mut no_progress,
@@ -488,7 +488,7 @@ mod tests {
         make_tree(&src);
         let dest = tmp.path().join("out.tar");
         create_archive(
-            &[src.clone()],
+            std::slice::from_ref(&src),
             &dest,
             ArchiveFormat::Tar,
             &mut no_progress,
@@ -509,7 +509,7 @@ mod tests {
         make_tree(&src);
         let dest = tmp.path().join("out.tar.gz");
         create_archive(
-            &[src.clone()],
+            std::slice::from_ref(&src),
             &dest,
             ArchiveFormat::TarGz,
             &mut no_progress,

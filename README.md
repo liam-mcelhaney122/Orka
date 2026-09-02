@@ -108,6 +108,8 @@ just release
 just test
 ```
 
+`just test` runs the unit tests and the connector benches against local fake servers. No cloud account is needed. See [docs/TESTING.md](docs/TESTING.md) for the opt-in daemon tier and the manual live checks.
+
 ## License
 
 Orka is available under the [MIT License](LICENSE).

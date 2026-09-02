@@ -226,6 +226,17 @@ fn split_bucket_key(path: &str) -> (String, String) {
     }
 }
 
+/// Turns a key into a folder prefix for a delimited listing: an
+/// empty key stays empty (the bucket root), any other key ends in
+/// exactly one `/`.
+fn folder_prefix(key: &str) -> String {
+    if key.is_empty() {
+        String::new()
+    } else {
+        format!("{}/", key.trim_end_matches('/'))
+    }
+}
+
 /// Resolves credentials for a named AWS profile, honoring the file
 /// credential chain the AWS CLI and SDKs document: static keys,
 /// `credential_process`, `role_arn` + `source_profile` (STS
@@ -1176,6 +1187,10 @@ impl FsBackend for S3Backend {
 
     fn list_dir(&self, path: &str, opts: &ListOptions) -> Result<Vec<Entry>, String> {
         let (bucket, prefix) = split_bucket_key(path);
+        // A folder prefix must end in `/`. Without it, `delimiter=/`
+        // folds the whole folder into one common prefix equal to the
+        // folder itself, and the listing comes back empty.
+        let prefix = folder_prefix(&prefix);
         let mut entries = if bucket.is_empty() {
             self.core.list_buckets()?
         } else {
@@ -1680,6 +1695,14 @@ mod tests {
     }
 
     // --- bucket/key path parsing ------------------------------------
+
+    #[test]
+    fn folder_prefix_adds_exactly_one_trailing_slash() {
+        assert_eq!(folder_prefix(""), "");
+        assert_eq!(folder_prefix("dir"), "dir/");
+        assert_eq!(folder_prefix("dir/"), "dir/");
+        assert_eq!(folder_prefix("a/b//"), "a/b/");
+    }
 
     #[test]
     fn split_bucket_key_handles_root_and_bucket_only() {
@@ -2328,15 +2351,8 @@ mod tests {
                     secret_key: "secret".to_string(),
                     session_token: None,
                 };
-                let body = sigv4_get(
-                    &agent().unwrap(),
-                    &origin,
-                    "us-east-1",
-                    "sts",
-                    &creds,
-                    &[],
-                )
-                .expect("must reach the overridden STS origin");
+                let body = sigv4_get(&agent().unwrap(), &origin, "us-east-1", "sts", &creds, &[])
+                    .expect("must reach the overridden STS origin");
                 assert_eq!(body, "ok");
             },
         );

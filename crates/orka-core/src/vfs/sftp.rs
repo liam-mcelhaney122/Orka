@@ -1205,7 +1205,7 @@ mod tests {
         cfg.port = port as u32;
         let result = copy_native_impl(SftpMode::Rsync, &cfg, "/src/a", "/dst/b")
             .expect("rsync mode with key auth must open the gate");
-        let err = result.err().expect("a refused dial must fail");
+        let err = result.expect_err("a refused dial must fail");
         assert!(err.contains("remote copy failed"), "got: {err}");
     }
 
@@ -1256,8 +1256,7 @@ mod tests {
         let mut cmd = Command::new("/bin/sleep");
         cmd.arg("30");
         let err = run_with_timeout(cmd, Duration::from_millis(200))
-            .err()
-            .expect("a 30s sleep must hit a 200ms deadline");
+            .expect_err("a 30s sleep must hit a 200ms deadline");
         assert!(err.contains("timed out"), "got: {err}");
         assert!(start.elapsed() < Duration::from_secs(5));
     }

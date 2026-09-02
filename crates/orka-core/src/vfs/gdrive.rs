@@ -347,7 +347,10 @@ fn build_signed_jwt(key: &ServiceAccountKey, now_secs: u64) -> Result<String, St
     let claims = jwt_claims_json(&key.client_email, DRIVE_SCOPE, &key.token_uri, now_secs);
     let signing_input = jwt_signing_input(&claims);
     let signature = sign_rs256(&key.private_key_pem, signing_input.as_bytes())?;
-    Ok(format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(signature)))
+    Ok(format!(
+        "{signing_input}.{}",
+        URL_SAFE_NO_PAD.encode(signature)
+    ))
 }
 
 /// Exchanges a signed JWT for an access token. Returns the token and
@@ -492,9 +495,8 @@ impl Transport {
 
     /// Authenticated GET that returns the whole JSON body.
     fn get_json(&self, url: &str) -> Result<String, String> {
-        let response = self.with_auth_retry(|header| {
-            self.agent.get(url).set("Authorization", header).call()
-        })?;
+        let response =
+            self.with_auth_retry(|header| self.agent.get(url).set("Authorization", header).call())?;
         Ok(http::read_body_string(response))
     }
 
@@ -525,7 +527,10 @@ impl Transport {
 
     /// Full metadata for one id.
     fn get_file(&self, id: &str) -> Result<DriveItem, String> {
-        let url = format!("{}/files/{id}?fields=id,name,mimeType,size,modifiedTime", self.api_base);
+        let url = format!(
+            "{}/files/{id}?fields=id,name,mimeType,size,modifiedTime",
+            self.api_base
+        );
         parse_file_resource(&self.get_json(&url)?)
     }
 
@@ -534,9 +539,8 @@ impl Transport {
     /// covers only opening the stream, not bytes already in flight.
     fn download(&self, id: &str) -> Result<Box<dyn Read + Send>, String> {
         let url = format!("{}/files/{id}?alt=media", self.api_base);
-        let response = self.with_auth_retry(|header| {
-            self.agent.get(&url).set("Authorization", header).call()
-        })?;
+        let response = self
+            .with_auth_retry(|header| self.agent.get(&url).set("Authorization", header).call())?;
         Ok(http::response_reader(response))
     }
 
@@ -598,9 +602,7 @@ impl Transport {
     /// server-side, so no client-side recursion is needed.
     fn delete_file(&self, id: &str) -> Result<(), String> {
         let url = format!("{}/files/{id}", self.api_base);
-        self.with_auth_retry(|header| {
-            self.agent.delete(&url).set("Authorization", header).call()
-        })?;
+        self.with_auth_retry(|header| self.agent.delete(&url).set("Authorization", header).call())?;
         Ok(())
     }
 
@@ -1236,13 +1238,17 @@ mod tests {
     #[test]
     fn google_token_override_wins_over_the_keys_own_token_uri() {
         use crate::vfs::endpoints::test_support::with_var;
-        with_var("ORKA_ENDPOINT_GOOGLE_TOKEN", "http://127.0.0.1:9011/token", || {
-            let key = parse_service_account_key(
+        with_var(
+            "ORKA_ENDPOINT_GOOGLE_TOKEN",
+            "http://127.0.0.1:9011/token",
+            || {
+                let key = parse_service_account_key(
                 r#"{"client_email":"a@b.com","private_key":"PEM","token_uri":"https://token.example.com"}"#,
             )
             .unwrap();
-            assert_eq!(key.token_uri, "http://127.0.0.1:9011/token");
-        });
+                assert_eq!(key.token_uri, "http://127.0.0.1:9011/token");
+            },
+        );
     }
 
     #[test]
@@ -1255,12 +1261,20 @@ mod tests {
             URL_SAFE_NO_PAD.decode(header_part).unwrap(),
             br#"{"alg":"RS256","typ":"JWT"}"#
         );
-        assert_eq!(URL_SAFE_NO_PAD.decode(claims_part).unwrap(), claims.as_bytes());
+        assert_eq!(
+            URL_SAFE_NO_PAD.decode(claims_part).unwrap(),
+            claims.as_bytes()
+        );
     }
 
     #[test]
     fn jwt_claims_carry_the_drive_scope_and_a_one_hour_lifetime() {
-        let json = jwt_claims_json("svc@proj.iam.gserviceaccount.com", DRIVE_SCOPE, DEFAULT_TOKEN_URI, 1_000);
+        let json = jwt_claims_json(
+            "svc@proj.iam.gserviceaccount.com",
+            DRIVE_SCOPE,
+            DEFAULT_TOKEN_URI,
+            1_000,
+        );
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(value["iss"], "svc@proj.iam.gserviceaccount.com");
         assert_eq!(value["scope"], DRIVE_SCOPE);
@@ -1273,7 +1287,10 @@ mod tests {
     fn signing_with_a_malformed_key_reports_no_key_material() {
         let err = sign_rs256("not a pem key", b"data").unwrap_err();
         assert!(err.contains("not a valid PKCS8 PEM key"), "got: {err}");
-        assert!(!err.contains("not a pem key"), "must not echo the input: {err}");
+        assert!(
+            !err.contains("not a pem key"),
+            "must not echo the input: {err}"
+        );
     }
 
     #[test]
@@ -1312,8 +1329,13 @@ mod tests {
             assert!(!url.contains("pageToken"), "url: {url}");
             // Quotes and spaces must be percent-encoded, never raw.
             assert!(!url.contains("My Docs"), "url: {url}");
-            let paged =
-                files_list_url(&api_base, &q, RESOLVE_FIELDS, RESOLVE_PAGE_SIZE, Some("tok/en"));
+            let paged = files_list_url(
+                &api_base,
+                &q,
+                RESOLVE_FIELDS,
+                RESOLVE_PAGE_SIZE,
+                Some("tok/en"),
+            );
             assert!(
                 paged.contains(&format!("pageToken={}", http::url_encode("tok/en"))),
                 "url: {paged}"

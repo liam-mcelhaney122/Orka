@@ -84,8 +84,9 @@ impl MountFactory {
         let binary = find_binary("mount_nfs")
             .ok_or_else(|| "mount_nfs not found on this system".to_string())?;
         let kerberos = config.auth == AuthMethod::Kerberos;
+        let port = nfs_port(config.port)?;
         let mut command = Command::new(binary);
-        for arg in nfs_argv(target, &dir, kerberos) {
+        for arg in nfs_argv(target, &dir, kerberos, port) {
             command.arg(arg);
         }
         let outcome = run_with_timeout(command, MOUNT_TIMEOUT)?;
@@ -327,15 +328,42 @@ fn smb_argv(url: &str, dir: &Path, kerberos: bool) -> Vec<std::ffi::OsString> {
 /// Builds the `mount_nfs` argv (excluding the binary itself).
 /// `sec=krb5` tells mount_nfs to authenticate the mount with the
 /// caller's Kerberos ticket instead of the default `sys` scheme.
-fn nfs_argv(target: &str, dir: &Path, kerberos: bool) -> Vec<std::ffi::OsString> {
+fn nfs_argv(
+    target: &str,
+    dir: &Path,
+    kerberos: bool,
+    port: Option<u16>,
+) -> Vec<std::ffi::OsString> {
     let mut argv: Vec<std::ffi::OsString> = Vec::new();
+    let mut options: Vec<String> = Vec::new();
     if kerberos {
+        options.push("sec=krb5".to_string());
+    }
+    // A server on a non-standard port has no portmapper entry, so
+    // both the NFS port and the mount port must be given explicitly.
+    if let Some(port) = port {
+        options.push(format!("port={port}"));
+        options.push(format!("mountport={port}"));
+    }
+    if !options.is_empty() {
         argv.push("-o".into());
-        argv.push("sec=krb5".into());
+        argv.push(options.join(",").into());
     }
     argv.push(target.into());
     argv.push(dir.as_os_str().to_os_string());
     argv
+}
+
+/// Maps the connection's port field to an explicit NFS port. Zero
+/// means the default, which `mount_nfs` resolves through the
+/// portmapper on its own.
+fn nfs_port(port: u32) -> Result<Option<u16>, String> {
+    if port == 0 {
+        return Ok(None);
+    }
+    u16::try_from(port)
+        .map(Some)
+        .map_err(|_| format!("invalid nfs port {port}"))
 }
 
 /// Validates the auth method for an NFS mount. `None` (the default,
@@ -615,14 +643,14 @@ mod tests {
     fn nfs_argv_adds_sec_krb5_only_for_kerberos() {
         let dir = Path::new("/tmp/mnt");
         assert_eq!(
-            nfs_argv("server:/export", dir, false),
+            nfs_argv("server:/export", dir, false, None),
             vec![
                 std::ffi::OsString::from("server:/export"),
                 std::ffi::OsString::from("/tmp/mnt"),
             ]
         );
         assert_eq!(
-            nfs_argv("server:/export", dir, true),
+            nfs_argv("server:/export", dir, true, None),
             vec![
                 std::ffi::OsString::from("-o"),
                 std::ffi::OsString::from("sec=krb5"),
@@ -630,6 +658,32 @@ mod tests {
                 std::ffi::OsString::from("/tmp/mnt"),
             ]
         );
+    }
+
+    #[test]
+    fn nfs_argv_passes_an_explicit_port_as_port_and_mountport() {
+        let dir = Path::new("/tmp/mnt");
+        assert_eq!(
+            nfs_argv("server:/export", dir, false, Some(23890)),
+            vec![
+                std::ffi::OsString::from("-o"),
+                std::ffi::OsString::from("port=23890,mountport=23890"),
+                std::ffi::OsString::from("server:/export"),
+                std::ffi::OsString::from("/tmp/mnt"),
+            ]
+        );
+        assert_eq!(
+            nfs_argv("server:/export", dir, true, Some(2049)),
+            vec![
+                std::ffi::OsString::from("-o"),
+                std::ffi::OsString::from("sec=krb5,port=2049,mountport=2049"),
+                std::ffi::OsString::from("server:/export"),
+                std::ffi::OsString::from("/tmp/mnt"),
+            ]
+        );
+        assert_eq!(nfs_port(0), Ok(None));
+        assert_eq!(nfs_port(2049), Ok(Some(2049)));
+        assert!(nfs_port(70000).is_err());
     }
 
     #[test]

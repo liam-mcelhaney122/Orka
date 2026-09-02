@@ -775,8 +775,7 @@ mod tests {
             .unwrap()
             .post(&format!("http://127.0.0.1:{port}/x"))
             .send_string("{}")
-            .err()
-            .expect("must fail")
+            .expect_err("must fail")
     }
 
     #[test]
@@ -910,7 +909,8 @@ mod tests {
     #[test]
     fn api_base_override_is_used_for_metadata_requests() {
         use crate::vfs::endpoints::test_support::with_var;
-        let body = r#"{".tag":"file","name":"a.txt","size":3,"server_modified":"2023-05-31T15:14:23Z"}"#;
+        let body =
+            r#"{".tag":"file","name":"a.txt","size":3,"server_modified":"2023-05-31T15:14:23Z"}"#;
         let port = serve_once("HTTP/1.1 200 OK", body);
         with_var(
             "ORKA_ENDPOINT_DROPBOX_API",

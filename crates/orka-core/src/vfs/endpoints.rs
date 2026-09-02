@@ -46,7 +46,8 @@ pub fn sso_portal_endpoint(region: &str) -> String {
 /// The Google API base origin. Drive builds `{base}/drive/v3` and
 /// `{base}/upload/drive/v3` on top of this.
 pub fn google_api_base() -> String {
-    env_override("ORKA_ENDPOINT_GOOGLE_API").unwrap_or_else(|| "https://www.googleapis.com".to_string())
+    env_override("ORKA_ENDPOINT_GOOGLE_API")
+        .unwrap_or_else(|| "https://www.googleapis.com".to_string())
 }
 
 /// The Google OAuth token endpoint. A service-account key file can
@@ -66,7 +67,8 @@ pub fn google_auth_endpoint() -> String {
 /// The Dropbox RPC API base origin (`list_folder`, `get_metadata`, and
 /// the other JSON endpoints).
 pub fn dropbox_api_base() -> String {
-    env_override("ORKA_ENDPOINT_DROPBOX_API").unwrap_or_else(|| "https://api.dropboxapi.com".to_string())
+    env_override("ORKA_ENDPOINT_DROPBOX_API")
+        .unwrap_or_else(|| "https://api.dropboxapi.com".to_string())
 }
 
 /// The Dropbox content API base origin (`download` and the upload
@@ -139,7 +141,9 @@ pub(crate) mod test_support {
     /// goes through this lock observes a half-set variable or reads a
     /// stale default while this one is active.
     pub(crate) fn with_var<T>(name: &str, value: &str, f: impl FnOnce() -> T) -> T {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // SAFETY: the lock above serializes every test in this crate
         // that touches the environment.
         unsafe {
@@ -157,7 +161,9 @@ pub(crate) mod test_support {
     /// present) behavior, so a concurrent [`with_var`] elsewhere
     /// cannot make that variable appear set mid-check.
     pub(crate) fn with_no_overrides<T>(f: impl FnOnce() -> T) -> T {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         f()
     }
 }
@@ -190,14 +196,20 @@ mod tests {
     #[test]
     fn sts_endpoint_defaults_to_the_derived_host() {
         with_no_overrides(|| {
-            assert_eq!(sts_endpoint("sts.amazonaws.com"), "https://sts.amazonaws.com");
+            assert_eq!(
+                sts_endpoint("sts.amazonaws.com"),
+                "https://sts.amazonaws.com"
+            );
         });
     }
 
     #[test]
     fn sts_endpoint_override_replaces_the_whole_origin() {
         with_var("ORKA_ENDPOINT_STS", "http://127.0.0.1:9000", || {
-            assert_eq!(sts_endpoint("sts.eu-west-1.amazonaws.com"), "http://127.0.0.1:9000");
+            assert_eq!(
+                sts_endpoint("sts.eu-west-1.amazonaws.com"),
+                "http://127.0.0.1:9000"
+            );
         });
     }
 
@@ -222,7 +234,10 @@ mod tests {
     fn google_endpoints_default_to_production() {
         with_no_overrides(|| {
             assert_eq!(google_api_base(), "https://www.googleapis.com");
-            assert_eq!(google_token_endpoint(), "https://oauth2.googleapis.com/token");
+            assert_eq!(
+                google_token_endpoint(),
+                "https://oauth2.googleapis.com/token"
+            );
             assert_eq!(
                 google_auth_endpoint(),
                 "https://accounts.google.com/o/oauth2/v2/auth"

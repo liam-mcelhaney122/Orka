@@ -114,27 +114,47 @@ impl TokenStore {
     }
 
     fn add_access_token(&self, token: &str) {
-        self.inner.lock().unwrap().valid_access_tokens.insert(token.to_string());
+        self.inner
+            .lock()
+            .unwrap()
+            .valid_access_tokens
+            .insert(token.to_string());
     }
 
     fn add_refresh_token(&self, token: &str) {
-        self.inner.lock().unwrap().valid_refresh_tokens.insert(token.to_string());
+        self.inner
+            .lock()
+            .unwrap()
+            .valid_refresh_tokens
+            .insert(token.to_string());
     }
 
     fn remove_refresh_token(&self, token: &str) {
-        self.inner.lock().unwrap().valid_refresh_tokens.remove(token);
+        self.inner
+            .lock()
+            .unwrap()
+            .valid_refresh_tokens
+            .remove(token);
     }
 
     /// True when `token` is a refresh token this fake has issued and
     /// not yet invalidated.
     fn refresh_token_is_valid(&self, token: &str) -> bool {
-        self.inner.lock().unwrap().valid_refresh_tokens.contains(token)
+        self.inner
+            .lock()
+            .unwrap()
+            .valid_refresh_tokens
+            .contains(token)
     }
 
     /// True when `token` is an access token this fake has issued and
     /// [`FakeOAuth::expire_access_token`] has not since revoked it.
     pub fn is_valid_access_token(&self, token: &str) -> bool {
-        self.inner.lock().unwrap().valid_access_tokens.contains(token)
+        self.inner
+            .lock()
+            .unwrap()
+            .valid_access_tokens
+            .contains(token)
     }
 
     /// Marks an access token invalid immediately, without waiting for
@@ -146,7 +166,13 @@ impl TokenStore {
     }
 
     fn all_access_tokens(&self) -> Vec<String> {
-        self.inner.lock().unwrap().valid_access_tokens.iter().cloned().collect()
+        self.inner
+            .lock()
+            .unwrap()
+            .valid_access_tokens
+            .iter()
+            .cloned()
+            .collect()
     }
 }
 
@@ -197,7 +223,9 @@ impl FakeOAuth {
         // the token URL a JWT-bearer assertion must be audienced to
         // can only be recorded here, after the handler closure above
         // already captured `state` by reference.
-        let _ = state.own_token_url.set(format!("{}/token", server.base_url()));
+        let _ = state
+            .own_token_url
+            .set(format!("{}/token", server.base_url()));
         FakeOAuth { server, state }
     }
 
@@ -377,13 +405,20 @@ fn handle_token(req: &Request, state: &Arc<OAuthState>, tenant: Option<&str>) ->
         "refresh_token" => handle_refresh_token_grant(state, get),
         "client_credentials" => handle_client_credentials_grant(state, get, tenant),
         "urn:ietf:params:oauth:grant-type:jwt-bearer" => handle_jwt_bearer_grant(state, get),
-        _ => invalid_request(400, "unsupported_grant_type", "grant_type is not recognized"),
+        _ => invalid_request(
+            400,
+            "unsupported_grant_type",
+            "grant_type is not recognized",
+        ),
     }
 }
 
 /// A `400` error body in the shape every grant handler below uses.
 fn invalid_request(status: u16, error: &str, description: &str) -> Response {
-    Response::json(status, &serde_json::json!({"error": error, "error_description": description}))
+    Response::json(
+        status,
+        &serde_json::json!({"error": error, "error_description": description}),
+    )
 }
 
 fn handle_authorization_code_grant<'a>(
@@ -405,17 +440,29 @@ fn handle_authorization_code_grant<'a>(
     // provider never lets an authorization code be redeemed twice.
     let issued = state.codes.lock().unwrap().remove(code);
     let Some(issued) = issued else {
-        return invalid_request(400, "invalid_grant", "authorization code is unknown or already used");
+        return invalid_request(
+            400,
+            "invalid_grant",
+            "authorization code is unknown or already used",
+        );
     };
     if issued.used {
         return invalid_request(400, "invalid_grant", "authorization code was already used");
     }
     if issued.redirect_uri != redirect_uri {
-        return invalid_request(400, "invalid_grant", "redirect_uri does not match the authorize request");
+        return invalid_request(
+            400,
+            "invalid_grant",
+            "redirect_uri does not match the authorize request",
+        );
     }
     if let Some(challenge) = &issued.code_challenge {
         if !pkce_challenge_matches(challenge, code_verifier) {
-            return invalid_request(400, "invalid_grant", "code_verifier does not match code_challenge");
+            return invalid_request(
+                400,
+                "invalid_grant",
+                "code_verifier does not match code_challenge",
+            );
         }
     }
     if let Some(error) = check_client_secret(state, &get) {
@@ -520,7 +567,11 @@ fn handle_jwt_bearer_grant<'a>(
         return invalid_request(400, "invalid_request", "assertion is required");
     };
     let Some(public_key_pem) = &state.config.service_account_public_key_pem else {
-        return invalid_request(400, "invalid_grant", "no service account public key is configured");
+        return invalid_request(
+            400,
+            "invalid_grant",
+            "no service account public key is configured",
+        );
     };
     let expected_aud = state.own_token_url.get().map(String::as_str).unwrap_or("");
     match verify_jwt_bearer(assertion, public_key_pem, expected_aud) {
@@ -563,7 +614,10 @@ fn verify_jwt_bearer(jwt: &str, public_key_pem: &str, expected_aud: &str) -> Res
     if scope.is_empty() {
         return Err("assertion scope is missing or empty".to_string());
     }
-    let exp = claims.get("exp").and_then(|v| v.as_u64()).ok_or("assertion exp is missing")?;
+    let exp = claims
+        .get("exp")
+        .and_then(|v| v.as_u64())
+        .ok_or("assertion exp is missing")?;
     if exp <= now_secs() {
         return Err("assertion has expired".to_string());
     }
@@ -595,9 +649,11 @@ fn check_client_secret<'a>(
     get: &impl Fn(&str) -> Option<&'a str>,
 ) -> Option<Response> {
     match &state.config.client_secret {
-        Some(expected) if get("client_secret") != Some(expected.as_str()) => {
-            Some(invalid_request(400, "invalid_client", "client_secret does not match"))
-        }
+        Some(expected) if get("client_secret") != Some(expected.as_str()) => Some(invalid_request(
+            400,
+            "invalid_client",
+            "client_secret does not match",
+        )),
         _ => None,
     }
 }
@@ -628,7 +684,10 @@ fn random_token(byte_len: usize) -> String {
 }
 
 fn now_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Percent-encodes a query or redirect parameter value. Escapes
@@ -669,14 +728,22 @@ mod tests {
             Sha256::digest(verifier.as_bytes())
         };
         let challenge = URL_SAFE_NO_PAD.encode(digest);
-        Pkce { verifier, challenge }
+        Pkce {
+            verifier,
+            challenge,
+        }
     }
 
     /// Runs the authorize step and returns the authorization code from
     /// the redirect, following it manually so the query string is
     /// inspected directly rather than trusting `ureq` to chase a
     /// cross-origin redirect on its own.
-    fn authorize_and_get_code(oauth: &FakeOAuth, pkce: &Pkce, redirect_uri: &str, state: &str) -> String {
+    fn authorize_and_get_code(
+        oauth: &FakeOAuth,
+        pkce: &Pkce,
+        redirect_uri: &str,
+        state: &str,
+    ) -> String {
         let url = format!(
             "{}?client_id={}&redirect_uri={}&response_type=code&state={}&code_challenge={}&code_challenge_method=S256",
             oauth.authorize_url(),
@@ -690,7 +757,11 @@ mod tests {
         // what this helper needs: the `Location` header, unfollowed.
         let agent = ureq::AgentBuilder::new().redirects(0).build();
         let response = agent.get(&url).call().unwrap();
-        assert_eq!(response.status(), 302, "expected a redirect from /authorize");
+        assert_eq!(
+            response.status(),
+            302,
+            "expected a redirect from /authorize"
+        );
         let location = response.header("Location").unwrap().to_string();
         let query = location.split_once('?').unwrap().1;
         let params: HashMap<_, _> = query
@@ -698,7 +769,10 @@ mod tests {
             .filter_map(|pair| pair.split_once('='))
             .collect();
         assert_eq!(params.get("state").copied(), Some(state));
-        params.get("code").expect("redirect must carry a code").to_string()
+        params
+            .get("code")
+            .expect("redirect must carry a code")
+            .to_string()
     }
 
     impl FakeOAuth {
@@ -754,7 +828,8 @@ mod tests {
 
     #[test]
     fn refresh_with_rotation_invalidates_the_old_token() {
-        let oauth = FakeOAuth::start(OAuthConfig::new("test-client").with_rotate_refresh_tokens(true));
+        let oauth =
+            FakeOAuth::start(OAuthConfig::new("test-client").with_rotate_refresh_tokens(true));
         let pkce = generate_pkce();
         let redirect_uri = "http://127.0.0.1:9/callback";
         let code = authorize_and_get_code(&oauth, &pkce, redirect_uri, "xyz");
@@ -772,28 +847,40 @@ mod tests {
         let old_refresh = first["refresh_token"].as_str().unwrap().to_string();
 
         let second: serde_json::Value = ureq::post(&oauth.token_url())
-            .send_form(&[("grant_type", "refresh_token"), ("refresh_token", &old_refresh)])
+            .send_form(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", &old_refresh),
+            ])
             .unwrap()
             .into_json()
             .unwrap();
-        let new_refresh = second["refresh_token"].as_str().expect("rotation must return a new refresh token");
+        let new_refresh = second["refresh_token"]
+            .as_str()
+            .expect("rotation must return a new refresh token");
         assert_ne!(new_refresh, old_refresh);
 
         // The old refresh token must no longer work.
         let err = ureq::post(&oauth.token_url())
-            .send_form(&[("grant_type", "refresh_token"), ("refresh_token", &old_refresh)])
+            .send_form(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", &old_refresh),
+            ])
             .unwrap_err();
         assert!(matches!(err, ureq::Error::Status(400, _)));
 
         // The new one must.
         ureq::post(&oauth.token_url())
-            .send_form(&[("grant_type", "refresh_token"), ("refresh_token", new_refresh)])
+            .send_form(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", new_refresh),
+            ])
             .unwrap();
     }
 
     #[test]
     fn refresh_without_rotation_keeps_the_same_refresh_token_working() {
-        let oauth = FakeOAuth::start(OAuthConfig::new("test-client").with_rotate_refresh_tokens(false));
+        let oauth =
+            FakeOAuth::start(OAuthConfig::new("test-client").with_rotate_refresh_tokens(false));
         let pkce = generate_pkce();
         let redirect_uri = "http://127.0.0.1:9/callback";
         let code = authorize_and_get_code(&oauth, &pkce, redirect_uri, "xyz");
@@ -811,15 +898,24 @@ mod tests {
         let refresh_token = first["refresh_token"].as_str().unwrap().to_string();
 
         let second: serde_json::Value = ureq::post(&oauth.token_url())
-            .send_form(&[("grant_type", "refresh_token"), ("refresh_token", &refresh_token)])
+            .send_form(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", &refresh_token),
+            ])
             .unwrap()
             .into_json()
             .unwrap();
-        assert!(second.get("refresh_token").is_none(), "a non-rotating refresh must omit refresh_token");
+        assert!(
+            second.get("refresh_token").is_none(),
+            "a non-rotating refresh must omit refresh_token"
+        );
 
         // The same refresh token still works a second time.
         ureq::post(&oauth.token_url())
-            .send_form(&[("grant_type", "refresh_token"), ("refresh_token", &refresh_token)])
+            .send_form(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", &refresh_token),
+            ])
             .unwrap();
     }
 
@@ -869,18 +965,29 @@ mod tests {
         let signing_input = format!("{header}.{claims}");
         let signing_key = SigningKey::<Sha256>::new(private_key.clone());
         let signature = signing_key.sign(signing_input.as_bytes());
-        format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(signature.to_bytes()))
+        format!(
+            "{signing_input}.{}",
+            URL_SAFE_NO_PAD.encode(signature.to_bytes())
+        )
     }
 
     #[test]
     fn jwt_bearer_grant_accepts_a_correctly_signed_assertion() {
         let private_key = RsaPrivateKey::new(&mut rand_core::OsRng, 2048).unwrap();
-        let public_key_pem = private_key.to_public_key().to_public_key_pem(Default::default()).unwrap();
+        let public_key_pem = private_key
+            .to_public_key()
+            .to_public_key_pem(Default::default())
+            .unwrap();
         let oauth = FakeOAuth::start(
             OAuthConfig::new("svc").with_service_account_public_key_pem(public_key_pem),
         );
 
-        let jwt = build_jwt(&private_key, &oauth.token_url(), "https://www.googleapis.com/auth/drive", now_secs() + 3600);
+        let jwt = build_jwt(
+            &private_key,
+            &oauth.token_url(),
+            "https://www.googleapis.com/auth/drive",
+            now_secs() + 3600,
+        );
         let response: serde_json::Value = ureq::post(&oauth.token_url())
             .send_form(&[
                 ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
@@ -895,13 +1002,21 @@ mod tests {
     #[test]
     fn jwt_bearer_grant_rejects_a_wrong_signing_key() {
         let private_key = RsaPrivateKey::new(&mut rand_core::OsRng, 2048).unwrap();
-        let public_key_pem = private_key.to_public_key().to_public_key_pem(Default::default()).unwrap();
+        let public_key_pem = private_key
+            .to_public_key()
+            .to_public_key_pem(Default::default())
+            .unwrap();
         let oauth = FakeOAuth::start(
             OAuthConfig::new("svc").with_service_account_public_key_pem(public_key_pem),
         );
 
         let other_key = RsaPrivateKey::new(&mut rand_core::OsRng, 2048).unwrap();
-        let jwt = build_jwt(&other_key, &oauth.token_url(), "https://www.googleapis.com/auth/drive", now_secs() + 3600);
+        let jwt = build_jwt(
+            &other_key,
+            &oauth.token_url(),
+            "https://www.googleapis.com/auth/drive",
+            now_secs() + 3600,
+        );
         let err = ureq::post(&oauth.token_url())
             .send_form(&[
                 ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),

@@ -109,14 +109,23 @@ pub fn exercise_backend_with(backend: &dyn FsBackend, root: &str, opts: &Conform
         .iter()
         .find(|e| e.name == "file1.txt")
         .unwrap_or_else(|| panic!("listing at {root} is missing file1.txt: {listing:?}"));
-    assert!(!file_entry.is_dir, "file1.txt entry must report is_dir=false");
-    assert!(!file_entry.path.is_empty(), "file1.txt entry path must be non-empty");
+    assert!(
+        !file_entry.is_dir,
+        "file1.txt entry must report is_dir=false"
+    );
+    assert!(
+        !file_entry.path.is_empty(),
+        "file1.txt entry path must be non-empty"
+    );
     let dir_entry = listing
         .iter()
         .find(|e| e.name == "dir1")
         .unwrap_or_else(|| panic!("listing at {root} is missing dir1: {listing:?}"));
     assert!(dir_entry.is_dir, "dir1 entry must report is_dir=true");
-    assert!(!dir_entry.path.is_empty(), "dir1 entry path must be non-empty");
+    assert!(
+        !dir_entry.path.is_empty(),
+        "dir1 entry path must be non-empty"
+    );
 
     if opts.expect_hidden_filtering {
         step_hidden_filtering(backend, root);
@@ -218,7 +227,9 @@ fn step_hidden_filtering(backend: &dyn FsBackend, root: &str) {
     let hidden_entry = with_hidden
         .iter()
         .find(|e| e.name == ".secret")
-        .unwrap_or_else(|| panic!("include_hidden=true must show .secret at {root}: {with_hidden:?}"));
+        .unwrap_or_else(|| {
+            panic!("include_hidden=true must show .secret at {root}: {with_hidden:?}")
+        });
     assert!(
         hidden_entry.is_hidden,
         ".secret entry must report is_hidden=true at {root}"
@@ -290,10 +301,18 @@ fn step_rename(backend: &dyn FsBackend, root: &str) {
 
     // A directory rename carries its contents along.
     let dir_src = join(root, "rename_dir_src");
-    expect_ok(backend.mkdir(&dir_src), "mkdir the rename source directory", &dir_src);
+    expect_ok(
+        backend.mkdir(&dir_src),
+        "mkdir the rename source directory",
+        &dir_src,
+    );
     write_text(backend, &join(&dir_src, "inner.txt"), b"inner");
     let dir_dst = join(root, "rename_dir_dst");
-    expect_ok(backend.rename(&dir_src, &dir_dst), "rename the directory", &dir_src);
+    expect_ok(
+        backend.rename(&dir_src, &dir_dst),
+        "rename the directory",
+        &dir_src,
+    );
     let listing = expect_ok(
         backend.list_dir(&dir_dst, &ListOptions::default()),
         "list the renamed directory",
@@ -360,7 +379,11 @@ fn step_nested_tree(backend: &dyn FsBackend, root: &str) {
         );
     }
 
-    expect_ok(backend.delete(&level1, true), "delete the tree recursively", &level1);
+    expect_ok(
+        backend.delete(&level1, true),
+        "delete the tree recursively",
+        &level1,
+    );
     let missing = backend.stat(&level1);
     assert!(
         missing.is_err(),
@@ -382,7 +405,18 @@ fn step_delete_file(backend: &dyn FsBackend, root: &str) {
 fn step_missing_path_errors(backend: &dyn FsBackend, root: &str) {
     let missing = join(root, "does_not_exist.txt");
     expect_err(backend.stat(&missing), "stat a missing path", &missing);
-    expect_err(backend.open_read(&missing), "open_read a missing path", &missing);
+    // A backend may open lazily and report the missing file on the
+    // first read instead of at open. Either point is acceptable; a
+    // successful read of any bytes is not.
+    if let Ok(mut reader) = backend.open_read(&missing) {
+        let mut buf = Vec::new();
+        let read = reader.read_to_end(&mut buf);
+        assert!(
+            read.is_err(),
+            "open_read then read of a missing path must fail at {missing}, got {} bytes",
+            buf.len()
+        );
+    }
 }
 
 /// Writes `content` to `path` through `create_write`, then `finish`.
@@ -428,10 +462,7 @@ fn expect_ok<T>(result: Result<T, String>, step: &str, path: &str) -> T {
 /// Asserts that `result` is an `Err`, with a message that names the
 /// step and the path.
 fn expect_err<T>(result: Result<T, String>, step: &str, path: &str) {
-    assert!(
-        result.is_err(),
-        "{step} unexpectedly succeeded for {path}"
-    );
+    assert!(result.is_err(), "{step} unexpectedly succeeded for {path}");
 }
 
 /// Sweeps every entry directly under `root` on drop, so a panic

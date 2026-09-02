@@ -1,0 +1,39 @@
+# sshd configuration for the opt-in SFTP/SSH bench.
+#
+# This is a template: every @BENCH_RUN@ placeholder is a directory
+# `just bench-up` substitutes with an absolute path (bench/run/sshd)
+# before starting sshd. `just bench-up` generates a fresh host key
+# into that directory (never a real system host key) and an
+# `authorized_keys` file from a bench-only key pair it also generates,
+# so this daemon never touches real user accounts or real SSH trust.
+#
+# Port 2222 needs no privilege to bind, so this daemon runs as the
+# same unprivileged user as every other bench daemon.
+#
+# No SFTP bench test lives in this file's owning task (`bench_mounts.rs`
+# covers SMB, NFS, and implicit FTPS only); this config exists so
+# `just bench-up`'s sshd step has something to start, ready for an
+# SFTP bench added later. See docs/TESTING.md.
+
+Port 2222
+ListenAddress 127.0.0.1
+Protocol 2
+HostKey @BENCH_RUN@/ssh_host_ed25519_key
+
+PidFile @BENCH_RUN@/sshd.pid
+LogLevel ERROR
+
+PasswordAuthentication no
+PubkeyAuthentication yes
+AuthorizedKeysFile @BENCH_RUN@/authorized_keys
+PermitRootLogin no
+StrictModes no
+UsePAM no
+Subsystem sftp internal-sftp
+
+# Bench connections use whichever account starts sshd; this only
+# narrows what that account's session can do once authenticated, not
+# who can authenticate.
+X11Forwarding no
+AllowAgentForwarding no
+AllowTcpForwarding no

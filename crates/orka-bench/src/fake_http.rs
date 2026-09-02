@@ -135,7 +135,11 @@ impl Response {
 
     /// A plain-text response.
     pub fn text(status: u16, body: &str) -> Response {
-        Response::bytes(status, "text/plain; charset=utf-8", body.as_bytes().to_vec())
+        Response::bytes(
+            status,
+            "text/plain; charset=utf-8",
+            body.as_bytes().to_vec(),
+        )
     }
 
     /// A response with the given status and no body.
@@ -159,20 +163,28 @@ impl Response {
     }
 
     /// Writes the status line, headers, and body over `transport`.
-    /// `Content-Length` and `Connection: close` are always sent, so a
-    /// caller never sets them: every response here closes the
-    /// connection once it is written, which keeps the parser on the
-    /// other end simple and matches how `ureq` treats a fake server.
+    /// `Connection: close` is always sent: every response here closes
+    /// the connection once it is written, which keeps the parser on
+    /// the other end simple and matches how `ureq` treats a fake
+    /// server. `Content-Length` is the body length unless the handler
+    /// set one itself, which a `HEAD` answer does to report the size
+    /// of a body it does not send.
     fn write_to<W: Write>(&self, transport: &mut W) -> std::io::Result<()> {
         let reason = reason_phrase(self.status);
         let mut head = format!("HTTP/1.1 {} {reason}\r\n", self.status);
+        let mut has_length = false;
         for (name, value) in &self.headers {
+            if name.eq_ignore_ascii_case("content-length") {
+                has_length = true;
+            }
             head.push_str(name);
             head.push_str(": ");
             head.push_str(value);
             head.push_str("\r\n");
         }
-        head.push_str(&format!("Content-Length: {}\r\n", self.body.len()));
+        if !has_length {
+            head.push_str(&format!("Content-Length: {}\r\n", self.body.len()));
+        }
         head.push_str("Connection: close\r\n\r\n");
         transport.write_all(head.as_bytes())?;
         transport.write_all(&self.body)?;
@@ -234,7 +246,11 @@ impl Server {
             .local_addr()
             .expect("bound socket has no local address")
             .port();
-        let scheme = if tls_config.is_some() { "https" } else { "http" };
+        let scheme = if tls_config.is_some() {
+            "https"
+        } else {
+            "http"
+        };
         let requests = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -259,7 +275,11 @@ impl Server {
     /// Alternative Names include it, and `ureq`'s TLS verifier checks
     /// the hostname it connected to against those names.
     pub fn base_url(&self) -> String {
-        let host = if self.scheme == "https" { "localhost" } else { "127.0.0.1" };
+        let host = if self.scheme == "https" {
+            "localhost"
+        } else {
+            "127.0.0.1"
+        };
         format!("{}://{host}:{}", self.scheme, self.port)
     }
 
@@ -414,7 +434,10 @@ fn read_request<T: Read + Write>(reader: &mut BufReader<&mut T>) -> Result<Reque
     let request_line = read_line(reader)?;
     let mut parts = request_line.split_whitespace();
     let method = parts.next().ok_or("empty request line")?.to_string();
-    let target = parts.next().ok_or("request line has no target")?.to_string();
+    let target = parts
+        .next()
+        .ok_or("request line has no target")?
+        .to_string();
     let (path, query) = split_path_and_query(&target);
 
     let mut headers = Vec::new();
@@ -601,7 +624,9 @@ mod tests {
                 assert_eq!(req.bearer_token(), Some("secret-token"));
             } else {
                 let form = req.form();
-                assert!(form.iter().any(|(k, v)| k == "grant_type" && v == "refresh_token"));
+                assert!(form
+                    .iter()
+                    .any(|(k, v)| k == "grant_type" && v == "refresh_token"));
             }
             Response::empty(200)
         }));

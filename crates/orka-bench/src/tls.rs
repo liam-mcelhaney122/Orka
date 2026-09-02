@@ -165,7 +165,10 @@ mod tests {
     #[test]
     fn a_client_trusting_the_ca_connects_successfully() {
         let tls = ServerTls::generate().unwrap();
-        let server = Server::start_tls(&tls, StdArc::new(|_req: &Request| Response::text(200, "ok")));
+        let server = Server::start_tls(
+            &tls,
+            StdArc::new(|_req: &Request| Response::text(200, "ok")),
+        );
 
         let mut root_certs = rustls::RootCertStore::empty();
         for cert in rustls_pemfile::certs(&mut tls.ca_pem.as_bytes()) {
@@ -174,21 +177,34 @@ mod tests {
         let tls_config = rustls::ClientConfig::builder()
             .with_root_certificates(root_certs)
             .with_no_client_auth();
-        let agent = ureq::AgentBuilder::new().tls_config(Arc::new(tls_config)).build();
+        let agent = ureq::AgentBuilder::new()
+            .tls_config(Arc::new(tls_config))
+            .build();
 
-        let body = agent.get(&server.base_url()).call().unwrap().into_string().unwrap();
+        let body = agent
+            .get(&server.base_url())
+            .call()
+            .unwrap()
+            .into_string()
+            .unwrap();
         assert_eq!(body, "ok");
     }
 
     #[test]
     fn a_client_without_the_ca_is_rejected() {
         let tls = ServerTls::generate().unwrap();
-        let server = Server::start_tls(&tls, StdArc::new(|_req: &Request| Response::text(200, "ok")));
+        let server = Server::start_tls(
+            &tls,
+            StdArc::new(|_req: &Request| Response::text(200, "ok")),
+        );
 
         // The default agent trusts only public roots, none of which
         // signed this test's throwaway CA.
         let agent = ureq::AgentBuilder::new().build();
         let result = agent.get(&server.base_url()).call();
-        assert!(result.is_err(), "a client with no matching trust root must fail the handshake");
+        assert!(
+            result.is_err(),
+            "a client with no matching trust root must fail the handshake"
+        );
     }
 }

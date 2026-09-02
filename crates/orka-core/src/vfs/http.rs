@@ -63,8 +63,8 @@ fn build_root_store_with(extra_ca_path: Option<&str>) -> Result<rustls::RootCert
     let Some(path) = extra_ca_path else {
         return Ok(store);
     };
-    let file = std::fs::File::open(path)
-        .map_err(|e| format!("cannot read extra CA file {path}: {e}"))?;
+    let file =
+        std::fs::File::open(path).map_err(|e| format!("cannot read extra CA file {path}: {e}"))?;
     let mut reader = std::io::BufReader::new(file);
     let mut added = 0usize;
     for cert in rustls_pemfile::certs(&mut reader) {
@@ -333,7 +333,10 @@ UPqx4AeLu7z6MAGkA9c1G9Wbsw==\n\
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             listener.local_addr().unwrap().port()
         };
-        let result = agent().unwrap().get(&format!("http://127.0.0.1:{port}/x")).call();
+        let result = agent()
+            .unwrap()
+            .get(&format!("http://127.0.0.1:{port}/x"))
+            .call();
         let message = match result {
             Ok(_) => panic!("must fail"),
             Err(e) => error_string(e),

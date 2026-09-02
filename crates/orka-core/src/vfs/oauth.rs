@@ -92,10 +92,7 @@ impl Provider {
     fn extra_authorize_params(&self) -> Vec<(&'static str, String)> {
         match self {
             Provider::Google => vec![
-                (
-                    "scope",
-                    "https://www.googleapis.com/auth/drive".to_string(),
-                ),
+                ("scope", "https://www.googleapis.com/auth/drive".to_string()),
                 ("access_type", "offline".to_string()),
                 ("prompt", "consent".to_string()),
             ],
@@ -413,18 +410,16 @@ fn percent_decode(value: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
-            b'%' if i + 3 <= bytes.len() => {
-                match u8::from_str_radix(&value[i + 1..i + 3], 16) {
-                    Ok(byte) => {
-                        out.push(byte);
-                        i += 3;
-                    }
-                    Err(_) => {
-                        out.push(bytes[i]);
-                        i += 1;
-                    }
+            b'%' if i + 3 <= bytes.len() => match u8::from_str_radix(&value[i + 1..i + 3], 16) {
+                Ok(byte) => {
+                    out.push(byte);
+                    i += 3;
                 }
-            }
+                Err(_) => {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            },
             b'+' => {
                 out.push(b' ');
                 i += 1;
@@ -548,7 +543,10 @@ fn token_set_from_json(
         .and_then(|v| v.as_str())
         .map(str::to_string)
         .or_else(|| existing_refresh_token.map(str::to_string));
-    let expires_in = value.get("expires_in").and_then(|v| v.as_u64()).unwrap_or(3600);
+    let expires_in = value
+        .get("expires_in")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(3600);
     let expires_at_ms = now_ms().saturating_add(expires_in.saturating_mul(1000));
     Ok(TokenSet {
         access_token,
@@ -873,9 +871,8 @@ mod tests {
     fn open_status_result_fails_clearly_on_a_nonzero_exit() {
         use std::os::unix::process::ExitStatusExt;
         assert!(open_status_result(std::process::ExitStatus::from_raw(0)).is_ok());
-        let err = open_status_result(std::process::ExitStatus::from_raw(1 << 8))
-            .err()
-            .expect("must fail");
+        let err =
+            open_status_result(std::process::ExitStatus::from_raw(1 << 8)).expect_err("must fail");
         assert!(err.contains("cannot open the browser"), "got: {err}");
     }
 
@@ -970,9 +967,8 @@ mod tests {
                 "s",
                 "ch",
             );
-            assert!(url.starts_with(
-                "https://login.microsoftonline.com/my-tenant/oauth2/v2.0/authorize?"
-            ));
+            assert!(url
+                .starts_with("https://login.microsoftonline.com/my-tenant/oauth2/v2.0/authorize?"));
             assert!(url.contains(&http::url_encode(
                 "https://storage.azure.com/user_impersonation offline_access"
             )));
@@ -1018,24 +1014,21 @@ mod tests {
             tenant_id: String::new(),
         }
         .validate()
-        .err()
-        .expect("must fail");
+        .expect_err("must fail");
         assert!(err.contains("invalid Azure tenant ID"), "got: {err}");
 
         let err = Provider::Azure {
             tenant_id: "tenant/../evil".to_string(),
         }
         .validate()
-        .err()
-        .expect("must fail");
+        .expect_err("must fail");
         assert!(err.contains("invalid Azure tenant ID"), "got: {err}");
 
         let err = Provider::Azure {
             tenant_id: "tenant?whoami".to_string(),
         }
         .validate()
-        .err()
-        .expect("must fail");
+        .expect_err("must fail");
         assert!(err.contains("invalid Azure tenant ID"), "got: {err}");
     }
 
@@ -1057,9 +1050,7 @@ mod tests {
         let bad = Provider::Azure {
             tenant_id: "tenant/../evil".to_string(),
         };
-        let err = ensure_fresh_token(bad, "client", "conn", &secrets)
-            .err()
-            .expect("must fail");
+        let err = ensure_fresh_token(bad, "client", "conn", &secrets).expect_err("must fail");
         assert!(err.contains("invalid Azure tenant ID"), "got: {err}");
     }
 
@@ -1083,9 +1074,8 @@ mod tests {
 
     #[test]
     fn redirect_line_extracts_error_and_no_code() {
-        let params = parse_redirect_request_line(
-            "GET /callback?error=access_denied&state=xyz HTTP/1.1\r\n",
-        );
+        let params =
+            parse_redirect_request_line("GET /callback?error=access_denied&state=xyz HTTP/1.1\r\n");
         assert_eq!(params.error.as_deref(), Some("access_denied"));
         assert_eq!(params.code, None);
     }
@@ -1564,7 +1554,8 @@ mod tests {
                     Ok(0) => break,
                     Ok(_) if line == "\r\n" || line == "\n" => break,
                     Ok(_) => {
-                        if let Some(rest) = line.to_ascii_lowercase().strip_prefix("content-length:")
+                        if let Some(rest) =
+                            line.to_ascii_lowercase().strip_prefix("content-length:")
                         {
                             content_length = rest.trim().parse().unwrap_or(0);
                         }
