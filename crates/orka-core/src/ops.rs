@@ -434,7 +434,11 @@ impl OpsEngine {
         };
         // The same predicate `run_job` dispatches on, so a job's lane and
         // its execution path can never disagree.
-        let sender = if is_local { &self.tx } else { &self.transfer_tx };
+        let sender = if is_local {
+            &self.tx
+        } else {
+            &self.transfer_tx
+        };
         let _ = sender.send(WorkerMessage::Run(job));
         id
     }

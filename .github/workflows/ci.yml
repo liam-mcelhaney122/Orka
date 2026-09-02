@@ -28,6 +28,39 @@ jobs:
       - name: Test workspace
         run: cargo test --workspace
 
+  # Opt-in daemon bench tier: SMB (Homebrew samba) and the NFS bench
+  # server, driven through `cargo test --test bench_mounts` under
+  # ORKA_BENCH=1. This tier is slower than the main `rust` job (it
+  # starts and stops real daemons) and is not a merge gate:
+  # `continue-on-error: true` means a failure here shows up
+  # as a warning, not a red build, while the tier is still new.
+  bench:
+    name: Opt-in daemon bench
+    runs-on: macos-26
+    continue-on-error: true
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install just and samba
+        run: brew install just samba
+
+      - name: Start the bench daemons
+        run: just bench-up
+
+      - name: Run every opt-in bench, including bench_mounts
+        run: just bench
+
+      - name: Stop the bench daemons and sweep leftover mounts
+        if: always()
+        run: just bench-down
+
   # Builds and tests the macOS SwiftUI app.
   #
   # Runner/Xcode choice (researched 2026-08-30):

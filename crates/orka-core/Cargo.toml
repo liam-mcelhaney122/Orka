@@ -18,6 +18,13 @@ ssh2 = { version = "0.9.6", features = ["vendored-openssl"] }
 suppaftp = { version = "6", default-features = false, features = ["rustls", "deprecated"] }
 # Trust roots for the FTPS TLS connector.
 webpki-roots = "1"
+# Builds the shared TLS root store (ftp.rs and http.rs) that adds an
+# extra CA file on top of webpki-roots. Pinned to the "ring" backend,
+# matching the version and provider ureq and suppaftp already pull
+# in, so only one rustls build lands in the dependency tree.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# Parses the PEM certificates in ORKA_EXTRA_CA_FILE.
+rustls-pemfile = "2"
 # REST file-server backends (Dropbox, Google Drive, ADLS) and their JSON.
 ureq = { version = "2", features = ["json", "tls"] }
 # Only for reading the URL a ureq transport error carries, so the
@@ -44,4 +51,19 @@ tar = "0.4"
 flate2 = "1"
 
 [dev-dependencies]
+anyhow = "1.0.104"
+async-trait = "0.1.92"
+hyper-util = { version = "0.1.20", features = ["server-auto", "http1", "tokio"] }
+libunftp = { version = "0.23", default-features = false, features = ["ring"] }
+nfsserve = "0.11"
+orka-bench = { path = "../orka-bench" }
+rand = "0.10.2"
+rand_core = { version = "0.6", features = ["getrandom"] }
+russh = { version = "0.63", default-features = false, features = ["ring", "flate2", "rsa"] }
+russh-sftp = "2.4"
+s3s = "0.15"
+s3s-fs = "0.15"
 tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
+unftp-core = "0.1.0"
+unftp-sbe-fs = "0.4"

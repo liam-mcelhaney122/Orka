@@ -9,6 +9,13 @@
 //! after an HTTP 401. A refresh writes the updated [`TokenSet`] back
 //! through [`SecretProvider::set_secret`].
 //!
+//! [`sign_in`] is a thin wrapper over [`sign_in_with_opener`], which
+//! takes the browser-launch step as a function. A test passes a fake
+//! opener to drive the loopback flow with no real browser. The
+//! authorize and token endpoints for every provider go through
+//! [`super::endpoints`], so a test can also point them at a local
+//! server.
+//!
 //! [`TokenSource`] gives every REST backend (gdrive, dropbox, ADLS)
 //! one shared place to resolve a bearer token lazily and cache it in
 //! memory. [`call_with_auth_retry`] (and [`call_with_auth_retry_and`],
@@ -57,20 +64,24 @@ pub enum Provider {
 impl Provider {
     fn authorize_endpoint(&self) -> String {
         match self {
-            Provider::Google => "https://accounts.google.com/o/oauth2/v2/auth".to_string(),
-            Provider::Dropbox => "https://www.dropbox.com/oauth2/authorize".to_string(),
+            Provider::Google => super::endpoints::google_auth_endpoint(),
+            Provider::Dropbox => super::endpoints::dropbox_auth_endpoint(),
             Provider::Azure { tenant_id } => format!(
-                "https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/authorize"
+                "{}/{tenant_id}/oauth2/v2.0/authorize",
+                super::endpoints::azure_login_base()
             ),
         }
     }
 
     fn token_endpoint(&self) -> String {
         match self {
-            Provider::Google => "https://oauth2.googleapis.com/token".to_string(),
-            Provider::Dropbox => "https://api.dropboxapi.com/oauth2/token".to_string(),
+            Provider::Google => super::endpoints::google_token_endpoint(),
+            Provider::Dropbox => super::endpoints::dropbox_token_endpoint(),
             Provider::Azure { tenant_id } => {
-                format!("https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token")
+                format!(
+                    "{}/{tenant_id}/oauth2/v2.0/token",
+                    super::endpoints::azure_login_base()
+                )
             }
         }
     }
@@ -81,10 +92,7 @@ impl Provider {
     fn extra_authorize_params(&self) -> Vec<(&'static str, String)> {
         match self {
             Provider::Google => vec![
-                (
-                    "scope",
-                    "https://www.googleapis.com/auth/drive".to_string(),
-                ),
+                ("scope", "https://www.googleapis.com/auth/drive".to_string()),
                 ("access_type", "offline".to_string()),
                 ("prompt", "consent".to_string()),
             ],
@@ -402,18 +410,16 @@ fn percent_decode(value: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
-            b'%' if i + 3 <= bytes.len() => {
-                match u8::from_str_radix(&value[i + 1..i + 3], 16) {
-                    Ok(byte) => {
-                        out.push(byte);
-                        i += 3;
-                    }
-                    Err(_) => {
-                        out.push(bytes[i]);
-                        i += 1;
-                    }
+            b'%' if i + 3 <= bytes.len() => match u8::from_str_radix(&value[i + 1..i + 3], 16) {
+                Ok(byte) => {
+                    out.push(byte);
+                    i += 3;
                 }
-            }
+                Err(_) => {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            },
             b'+' => {
                 out.push(b' ');
                 i += 1;
@@ -537,7 +543,10 @@ fn token_set_from_json(
         .and_then(|v| v.as_str())
         .map(str::to_string)
         .or_else(|| existing_refresh_token.map(str::to_string));
-    let expires_in = value.get("expires_in").and_then(|v| v.as_u64()).unwrap_or(3600);
+    let expires_in = value
+        .get("expires_in")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(3600);
     let expires_at_ms = now_ms().saturating_add(expires_in.saturating_mul(1000));
     Ok(TokenSet {
         access_token,
@@ -567,7 +576,7 @@ fn exchange_code(
     if let Some(secret) = client_secret {
         form.push(("client_secret", secret));
     }
-    let response = http::agent()
+    let response = http::agent()?
         .post(&provider.token_endpoint())
         .send_form(&form)
         .map_err(http::error_string)?;
@@ -586,6 +595,22 @@ pub fn sign_in(
     client_id: &str,
     client_secret: Option<&str>,
 ) -> Result<TokenSet, String> {
+    sign_in_with_opener(provider, client_id, client_secret, &open_in_browser)
+}
+
+/// [`sign_in`] with the browser launch replaced by `opener`, so a test
+/// can drive the flow without a real browser.
+///
+/// `opener` must return promptly: the loopback listener only starts
+/// accepting the redirect after `opener` returns, so a test opener
+/// that answers the redirect itself must do that HTTP work on a
+/// separate thread rather than before returning.
+pub fn sign_in_with_opener(
+    provider: Provider,
+    client_id: &str,
+    client_secret: Option<&str>,
+    opener: &dyn Fn(&str) -> Result<(), String>,
+) -> Result<TokenSet, String> {
     provider.validate()?;
     let listener = TcpListener::bind("127.0.0.1:0")
         .map_err(|e| format!("cannot open a local port for sign-in: {e}"))?;
@@ -598,7 +623,7 @@ pub fn sign_in(
     let state = random_url_safe_token(16)?;
     let url = authorize_url(&provider, client_id, &redirect_uri, &state, &pkce.challenge);
 
-    open_in_browser(&url)?;
+    opener(&url)?;
 
     let params = accept_redirect(&listener, LOOPBACK_TIMEOUT)?;
     if let Some(error) = params.error {
@@ -729,7 +754,7 @@ fn ensure_fresh_token_with(
     if let Some(secret) = &token_set.client_secret {
         form.push(("client_secret", secret));
     }
-    let response = http::agent()
+    let response = http::agent()?
         .post(&provider.token_endpoint())
         .send_form(&form)
         .map_err(http::error_string)?;
@@ -846,9 +871,8 @@ mod tests {
     fn open_status_result_fails_clearly_on_a_nonzero_exit() {
         use std::os::unix::process::ExitStatusExt;
         assert!(open_status_result(std::process::ExitStatus::from_raw(0)).is_ok());
-        let err = open_status_result(std::process::ExitStatus::from_raw(1 << 8))
-            .err()
-            .expect("must fail");
+        let err =
+            open_status_result(std::process::ExitStatus::from_raw(1 << 8)).expect_err("must fail");
         assert!(err.contains("cannot open the browser"), "got: {err}");
     }
 
@@ -929,32 +953,40 @@ mod tests {
 
     #[test]
     fn azure_authorize_url_uses_the_tenant_and_storage_scope() {
-        let url = authorize_url(
-            &Provider::Azure {
-                tenant_id: "my-tenant".to_string(),
-            },
-            "c",
-            "http://127.0.0.1:1/cb",
-            "s",
-            "ch",
-        );
-        assert!(url.starts_with(
-            "https://login.microsoftonline.com/my-tenant/oauth2/v2.0/authorize?"
-        ));
-        assert!(url.contains(&http::url_encode(
-            "https://storage.azure.com/user_impersonation offline_access"
-        )));
+        // Asserts the production login.microsoftonline.com host, so
+        // this holds the environment lock: a concurrent test that
+        // overrides ORKA_ENDPOINT_AZURE_LOGIN must not run at the
+        // same time (see vfs::endpoints::test_support).
+        crate::vfs::endpoints::test_support::with_no_overrides(|| {
+            let url = authorize_url(
+                &Provider::Azure {
+                    tenant_id: "my-tenant".to_string(),
+                },
+                "c",
+                "http://127.0.0.1:1/cb",
+                "s",
+                "ch",
+            );
+            assert!(url
+                .starts_with("https://login.microsoftonline.com/my-tenant/oauth2/v2.0/authorize?"));
+            assert!(url.contains(&http::url_encode(
+                "https://storage.azure.com/user_impersonation offline_access"
+            )));
+        });
     }
 
     #[test]
     fn azure_token_endpoint_uses_the_tenant() {
-        let provider = Provider::Azure {
-            tenant_id: "my-tenant".to_string(),
-        };
-        assert_eq!(
-            provider.token_endpoint(),
-            "https://login.microsoftonline.com/my-tenant/oauth2/v2.0/token"
-        );
+        // See the comment on the sibling authorize-URL test above.
+        crate::vfs::endpoints::test_support::with_no_overrides(|| {
+            let provider = Provider::Azure {
+                tenant_id: "my-tenant".to_string(),
+            };
+            assert_eq!(
+                provider.token_endpoint(),
+                "https://login.microsoftonline.com/my-tenant/oauth2/v2.0/token"
+            );
+        });
     }
 
     #[test]
@@ -982,24 +1014,21 @@ mod tests {
             tenant_id: String::new(),
         }
         .validate()
-        .err()
-        .expect("must fail");
+        .expect_err("must fail");
         assert!(err.contains("invalid Azure tenant ID"), "got: {err}");
 
         let err = Provider::Azure {
             tenant_id: "tenant/../evil".to_string(),
         }
         .validate()
-        .err()
-        .expect("must fail");
+        .expect_err("must fail");
         assert!(err.contains("invalid Azure tenant ID"), "got: {err}");
 
         let err = Provider::Azure {
             tenant_id: "tenant?whoami".to_string(),
         }
         .validate()
-        .err()
-        .expect("must fail");
+        .expect_err("must fail");
         assert!(err.contains("invalid Azure tenant ID"), "got: {err}");
     }
 
@@ -1021,9 +1050,7 @@ mod tests {
         let bad = Provider::Azure {
             tenant_id: "tenant/../evil".to_string(),
         };
-        let err = ensure_fresh_token(bad, "client", "conn", &secrets)
-            .err()
-            .expect("must fail");
+        let err = ensure_fresh_token(bad, "client", "conn", &secrets).expect_err("must fail");
         assert!(err.contains("invalid Azure tenant ID"), "got: {err}");
     }
 
@@ -1047,9 +1074,8 @@ mod tests {
 
     #[test]
     fn redirect_line_extracts_error_and_no_code() {
-        let params = parse_redirect_request_line(
-            "GET /callback?error=access_denied&state=xyz HTTP/1.1\r\n",
-        );
+        let params =
+            parse_redirect_request_line("GET /callback?error=access_denied&state=xyz HTTP/1.1\r\n");
         assert_eq!(params.error.as_deref(), Some("access_denied"));
         assert_eq!(params.code, None);
     }
@@ -1425,6 +1451,7 @@ mod tests {
         let result: Result<String, String> = call_with_auth_retry(&tokens, |_token| {
             calls += 1;
             http::agent()
+                .unwrap()
                 .get(&format!("http://127.0.0.1:{port}/"))
                 .call()
                 .map(http::read_body_string)
@@ -1441,11 +1468,141 @@ mod tests {
         let result: Result<String, String> = call_with_auth_retry(&tokens, |_token| {
             calls += 1;
             http::agent()
+                .unwrap()
                 .get(&format!("http://127.0.0.1:{port}/"))
                 .call()
                 .map(http::read_body_string)
         });
         assert_eq!(calls, 2, "must not retry a second time");
         assert!(result.unwrap_err().contains("401"));
+    }
+
+    // --- sign_in_with_opener ----------------------------------------------
+
+    /// Splits `key=value` query pairs out of a URL's query string and
+    /// percent-decodes each value, reusing the same decoder the real
+    /// loopback redirect handler uses.
+    fn query_pairs(url: &str) -> HashMap<String, String> {
+        let query = url.split_once('?').map(|(_, q)| q).unwrap_or("");
+        query
+            .split('&')
+            .filter_map(|pair| pair.split_once('='))
+            .map(|(k, v)| (k.to_string(), percent_decode(v)))
+            .collect()
+    }
+
+    /// A fake browser: reads `redirect_uri` and `state` off the
+    /// authorize URL, then answers the loopback redirect on a
+    /// separate thread with `code`, exactly as [`sign_in_with_opener`]
+    /// requires (the opener itself must return before the listener
+    /// accepts a connection).
+    fn fake_browser_opener(code: &'static str) -> impl Fn(&str) -> Result<(), String> {
+        move |url: &str| {
+            let params = query_pairs(url);
+            let redirect_uri = params
+                .get("redirect_uri")
+                .cloned()
+                .ok_or_else(|| "authorize URL has no redirect_uri".to_string())?;
+            let state = params
+                .get("state")
+                .cloned()
+                .ok_or_else(|| "authorize URL has no state".to_string())?;
+            let authority = redirect_uri
+                .trim_start_matches("http://")
+                .split('/')
+                .next()
+                .unwrap_or("")
+                .to_string();
+            std::thread::spawn(move || {
+                let Ok(mut stream) = TcpStream::connect(&authority) else {
+                    return;
+                };
+                let request = format!(
+                    "GET /callback?state={state}&code={code} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(request.as_bytes());
+                let mut drain = Vec::new();
+                let _ = std::io::Read::read_to_end(&mut stream, &mut drain);
+            });
+            Ok(())
+        }
+    }
+
+    /// Serves one JSON token response on a local port and returns the
+    /// port. Used as a fake `ORKA_ENDPOINT_GOOGLE_TOKEN` target so the
+    /// code-exchange step in [`sign_in_with_opener`] has somewhere to
+    /// reach.
+    fn serve_token_response(body: &'static str) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut reader = BufReader::new(stream.try_clone().expect("clone the stream"));
+            let mut request_line = String::new();
+            let _ = reader.read_line(&mut request_line);
+            // The client is still writing its form-encoded body; a
+            // response sent before that body is fully read can reset
+            // the connection before the client reads the response.
+            // Reading the exact Content-Length keeps both sides in
+            // step.
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) if line == "\r\n" || line == "\n" => break,
+                    Ok(_) => {
+                        if let Some(rest) =
+                            line.to_ascii_lowercase().strip_prefix("content-length:")
+                        {
+                            content_length = rest.trim().parse().unwrap_or(0);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let mut drained = vec![0u8; content_length];
+            let _ = std::io::Read::read_exact(&mut reader, &mut drained);
+            let mut stream = stream;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        });
+        port
+    }
+
+    #[test]
+    fn sign_in_with_opener_reaches_the_code_exchange() {
+        use crate::vfs::endpoints::test_support::with_var;
+        let body = r#"{"access_token":"tok-abc","refresh_token":"refresh-1","expires_in":3600}"#;
+        let port = serve_token_response(body);
+        let result = with_var(
+            "ORKA_ENDPOINT_GOOGLE_TOKEN",
+            &format!("http://127.0.0.1:{port}/token"),
+            || {
+                let opener = fake_browser_opener("abc");
+                sign_in_with_opener(Provider::Google, "client-id", None, &opener)
+            },
+        );
+        let token = result.expect("sign-in must reach and complete the code exchange");
+        assert_eq!(token.access_token, "tok-abc");
+        assert_eq!(token.refresh_token.as_deref(), Some("refresh-1"));
+    }
+
+    #[test]
+    fn sign_in_with_opener_returns_an_opener_error_as_is() {
+        // TokenSet carries no Debug impl (its client_secret is a
+        // secret), so unwrap_err() is not available here.
+        let opener = |_: &str| Err("browser is not available".to_string());
+        let err = sign_in_with_opener(Provider::Google, "client-id", None, &opener)
+            .err()
+            .expect("must fail");
+        assert_eq!(err, "browser is not available");
     }
 }
