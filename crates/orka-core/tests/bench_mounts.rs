@@ -365,12 +365,35 @@ fn smb_guest_share_connects_with_no_auth() {
 
     let id = "bench-smb-guest";
     let config = smb_config(id, "guest", "", AuthMethod::None);
-    let backend = MountFactory
-        .connect(&config, no_secret())
-        .expect("guest access to the guest-ok share must connect");
+    // The macOS SMB client can transiently reject a guest mount right
+    // after an authenticated session to the same server, because it
+    // reuses the kernel session for a moment. Retry a few times.
+    let backend = connect_with_retry(&config, no_secret(), "guest access to the guest-ok share");
     let _ = backend.list_dir("/", &orka_core::ListOptions::default());
     drop(backend);
     let _ = std::fs::remove_dir_all(expected_mount_dir(id));
+}
+
+/// Connects through `MountFactory`, retrying a transient authentication
+/// error from the macOS SMB client. The client can reuse a kernel
+/// session to the same server for a moment after a prior mount, so a
+/// guest mount right after an authenticated one is briefly refused.
+fn connect_with_retry(
+    config: &ConnectionConfig,
+    secrets: Arc<dyn SecretProvider>,
+    what: &str,
+) -> Arc<dyn orka_core::vfs::FsBackend> {
+    let mut last = String::new();
+    for attempt in 0..5 {
+        match MountFactory.connect(config, secrets.clone()) {
+            Ok(backend) => return backend,
+            Err(e) => {
+                last = e;
+                std::thread::sleep(Duration::from_millis(500 * (attempt + 1)));
+            }
+        }
+    }
+    panic!("{what} must connect: {last:?}");
 }
 
 /// A wrong password must fail promptly with the daemon's own
@@ -513,22 +536,4 @@ fn ftps_implicit_bench_connects_and_meets_conformance() {
         .connect(&config, no_secret())
         .expect("implicit-TLS FTPS anonymous login must connect");
     support::conformance::exercise_backend(&*backend, "/");
-}
-
-/// The repository root, found from this test binary's own path
-/// (`target/.../deps/bench_mounts-<hash>`) by walking up to the
-/// nearest ancestor containing `Cargo.lock`. Avoids depending on the
-/// process's current directory, which `cargo test` does not
-/// guarantee is the repository root.
-fn repo_root() -> PathBuf {
-    let mut dir = std::env::current_exe().expect("read this test binary's own path");
-    loop {
-        dir = dir
-            .parent()
-            .expect("a test binary path must have a repository root above it")
-            .to_path_buf();
-        if dir.join("Cargo.lock").exists() {
-            return dir;
-        }
-    }
 }
