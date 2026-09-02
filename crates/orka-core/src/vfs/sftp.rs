@@ -114,8 +114,27 @@ enum PasswordAuthStep {
 /// offered; keyboard-interactive is the fallback, since many servers
 /// wrap a single password prompt behind it. Pure, so tests cover the
 /// decision without a live session.
-fn password_auth_plan(methods: &str) -> Vec<PasswordAuthStep> {
-    let offers = |name: &str| methods.split(',').any(|m| m.trim().eq_ignore_ascii_case(name));
+///
+/// `methods` is `None` when the server's list is unknown: `auth_methods`
+/// failed, or returned an empty list. In that case this tries both
+/// steps unconditionally, since skipping the attempt on an unknown
+/// list would silently give up on a server that does support one of
+/// them.
+fn password_auth_plan(methods: Option<&str>) -> Vec<PasswordAuthStep> {
+    let methods = match methods {
+        Some(methods) => methods,
+        None => {
+            return vec![
+                PasswordAuthStep::Password,
+                PasswordAuthStep::KeyboardInteractive,
+            ]
+        }
+    };
+    let offers = |name: &str| {
+        methods
+            .split(',')
+            .any(|m| m.trim().eq_ignore_ascii_case(name))
+    };
     let mut plan = Vec::new();
     if offers("password") {
         plan.push(PasswordAuthStep::Password);
@@ -147,15 +166,26 @@ impl KeyboardInteractivePrompt for PasswordPrompter<'_> {
 
 /// Runs the password auth plan against `session`. Tries each step in
 /// order and stops at the first success. The final error names the
-/// methods the server offers, never the password: the password never
-/// appears in a formatted string in this function.
+/// methods the server offers and the last ssh2 error, never the
+/// password: the password never appears in a formatted string in this
+/// function.
+///
+/// A NULL method list with no ssh2 error means libssh2 already
+/// authenticated the session with "none" auth; `auth_methods` reports
+/// that as an empty list, so this checks `session.authenticated()`
+/// first and returns early rather than reading it as "no methods
+/// available" and failing a session that is already authenticated.
 fn userauth_password_with_fallback(
     session: &Session,
     user: &str,
     password: &str,
 ) -> Result<(), String> {
-    let methods = session.auth_methods(user).unwrap_or("").to_string();
-    let plan = password_auth_plan(&methods);
+    let methods = session.auth_methods(user).ok().filter(|m| !m.is_empty());
+    if methods.is_none() && session.authenticated() {
+        return Ok(());
+    }
+    let plan = password_auth_plan(methods);
+    let mut last_error = None;
     for step in &plan {
         let result = match step {
             PasswordAuthStep::Password => session.userauth_password(user, password),
@@ -164,18 +194,22 @@ fn userauth_password_with_fallback(
                 session.userauth_keyboard_interactive(user, &mut prompter)
             }
         };
-        if result.is_ok() {
-            return Ok(());
+        match result {
+            Ok(()) => return Ok(()),
+            Err(e) => last_error = Some(e),
         }
     }
-    let offered = if methods.is_empty() {
-        "none".to_string()
-    } else {
-        methods
-    };
-    Err(format!(
-        "password auth failed: server offers only: {offered}"
-    ))
+    let offered = methods
+        .map(str::to_string)
+        .unwrap_or_else(|| "unknown".to_string());
+    match last_error {
+        Some(e) => Err(format!(
+            "password and keyboard-interactive auth failed: {e}; server offers: {offered}"
+        )),
+        None => Err(format!(
+            "password auth failed: server offers only: {offered}"
+        )),
+    }
 }
 
 /// Dials, authenticates, and opens the SFTP subsystem for one config.
@@ -873,7 +907,7 @@ mod tests {
     #[test]
     fn password_auth_plan_prefers_password_then_keyboard_interactive() {
         assert_eq!(
-            password_auth_plan("publickey,password,keyboard-interactive"),
+            password_auth_plan(Some("publickey,password,keyboard-interactive")),
             vec![
                 PasswordAuthStep::Password,
                 PasswordAuthStep::KeyboardInteractive
@@ -881,7 +915,7 @@ mod tests {
         );
         // Case and surrounding whitespace must not matter.
         assert_eq!(
-            password_auth_plan(" PASSWORD , Keyboard-Interactive "),
+            password_auth_plan(Some(" PASSWORD , Keyboard-Interactive ")),
             vec![
                 PasswordAuthStep::Password,
                 PasswordAuthStep::KeyboardInteractive
@@ -892,7 +926,7 @@ mod tests {
     #[test]
     fn password_auth_plan_covers_password_only_servers() {
         assert_eq!(
-            password_auth_plan("publickey,password"),
+            password_auth_plan(Some("publickey,password")),
             vec![PasswordAuthStep::Password]
         );
     }
@@ -900,15 +934,30 @@ mod tests {
     #[test]
     fn password_auth_plan_covers_keyboard_interactive_only_servers() {
         assert_eq!(
-            password_auth_plan("publickey,keyboard-interactive"),
+            password_auth_plan(Some("publickey,keyboard-interactive")),
             vec![PasswordAuthStep::KeyboardInteractive]
         );
     }
 
     #[test]
     fn password_auth_plan_is_empty_when_server_offers_neither() {
-        assert_eq!(password_auth_plan("publickey"), Vec::new());
-        assert_eq!(password_auth_plan(""), Vec::new());
+        assert_eq!(password_auth_plan(Some("publickey")), Vec::new());
+        assert_eq!(password_auth_plan(Some("")), Vec::new());
+    }
+
+    #[test]
+    fn password_auth_plan_tries_both_steps_when_the_list_is_unknown() {
+        // `None` stands for an unknown list: `auth_methods` failed, or
+        // the session already authenticated with "none" auth. Skipping
+        // the attempt here would give up without ever trying a server
+        // that does support one of these methods.
+        assert_eq!(
+            password_auth_plan(None),
+            vec![
+                PasswordAuthStep::Password,
+                PasswordAuthStep::KeyboardInteractive
+            ]
+        );
     }
 
     #[test]
